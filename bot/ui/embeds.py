@@ -130,9 +130,9 @@ def create_profile_embed(
         color=COLOR_PRIMARY
     )
 
-    # Place profile image in the thumbnail spot on the top-right
+    # Render profile image as large embedded image
     if avatar_url:
-        embed.set_thumbnail(url=avatar_url)
+        embed.set_image(url=avatar_url)
 
     desc_lines = []
     bio = getattr(profile, "bio", None)
