@@ -91,13 +91,28 @@ def create_game_embed(
     embed.set_footer(text="Data from Backloggd • Use /link to connect your profile")
     return embed
 
-def create_profile_embed(profile: Any, stats: Optional[Any] = None) -> discord.Embed:
-    """Construct embed for /profile command."""
+def create_profile_embed(
+    profile: Any,
+    avg_rating: Optional[float] = None,
+    rated_count: Optional[int] = None
+) -> discord.Embed:
+    """Construct embed for /profile command with clean formatting."""
     user_url = build_backloggd_user_url(profile.username)
-    badge_str = f" [{' | '.join(profile.badges)}]" if profile.badges else ""
+    
+    # Filter special role badges for title (VIP, Patron, Supporter, Founder, Mod)
+    special_roles = {"vip": "VIP", "patron": "Patron", "supporter": "Supporter", "founder": "Founder", "mod": "Mod"}
+    title_badges = []
+    if profile.badges:
+        for b in profile.badges:
+            b_clean = str(b).lower().replace("-", "_")
+            for role_key, role_label in special_roles.items():
+                if role_key in b_clean and role_label not in title_badges:
+                    title_badges.append(role_label)
+
+    badge_suffix = f" [{ ' | '.join(title_badges) }]" if title_badges else ""
 
     embed = discord.Embed(
-        title=f"{profile.username}{badge_str}",
+        title=f"{profile.username}{badge_suffix}",
         url=user_url,
         color=COLOR_PRIMARY
     )
@@ -105,8 +120,16 @@ def create_profile_embed(profile: Any, stats: Optional[Any] = None) -> discord.E
     if profile.avatar_url:
         embed.set_thumbnail(url=profile.avatar_url)
 
+    desc_lines = []
     if profile.bio:
-        embed.description = f"> {profile.bio}"
+        desc_lines.append(f"> {profile.bio}")
+
+    # Show badges count cleanly if any achievements earned
+    if profile.badges:
+        desc_lines.append(f"🏆 **{len(profile.badges)}** Badges Earned")
+
+    if desc_lines:
+        embed.description = "\n\n".join(desc_lines)
 
     # Activity Counter Fields
     played = profile.played_count or 0
@@ -125,11 +148,12 @@ def create_profile_embed(profile: Any, stats: Optional[Any] = None) -> discord.E
         inline=True
     )
 
-    # Average rating if computed or present in stats
-    if stats and stats.average_rating is not None:
+    # Average rating if cached/computed
+    if avg_rating is not None:
+        count_text = f"\n*({rated_count} rated games)*" if rated_count else ""
         embed.add_field(
             name="⭐ Average Rating",
-            value=f"{rating_to_stars(stats.average_rating)}\n**{stats.average_rating:.2f}** / 5.0\n*({stats.rated_count} rated games)*",
+            value=f"{rating_to_stars(avg_rating)}\n**{avg_rating:.2f}** / 5.0{count_text}",
             inline=True
         )
 
@@ -141,7 +165,7 @@ def create_profile_embed(profile: Any, stats: Optional[Any] = None) -> discord.E
             fav_lines.append(f"**{i}.** {title}")
         embed.add_field(name="⭐ Favorite Games", value="\n".join(fav_lines), inline=False)
 
-    embed.set_footer(text="Backloggd Profile Overview")
+    embed.set_footer(text="Backloggd Profile Overview • Connect yours with /link")
     return embed
 
 def create_compare_embed(

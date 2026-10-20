@@ -128,6 +128,14 @@ class Database:
         ) as cursor:
             return await cursor.fetchone()
 
+    async def get_linked_user_by_username(self, username: str) -> Optional[aiosqlite.Row]:
+        """Fetch linked user record by Backloggd username (case-insensitive)."""
+        async with self._conn.execute(
+            "SELECT discord_id, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE LOWER(backloggd_username) = LOWER(?);",
+            (username.strip(),)
+        ) as cursor:
+            return await cursor.fetchone()
+
     async def get_all_linked_users(self) -> List[aiosqlite.Row]:
         """Fetch all linked users."""
         async with self._conn.execute("SELECT discord_id, backloggd_username, avatar_url FROM linked_users;") as cursor:
@@ -203,6 +211,25 @@ class Database:
         params = list(guild_member_ids) + [game_slug]
         async with self._conn.execute(query, params) as cursor:
             return await cursor.fetchall()
+
+    async def get_user_stats(self, discord_id: int) -> dict:
+        """Fetch user's aggregate stats from cached ratings."""
+        query = """
+            SELECT COUNT(*) as total_games,
+                   COUNT(rating) as rated_count,
+                   AVG(rating) as average_rating
+            FROM user_ratings
+            WHERE discord_id = ?;
+        """
+        async with self._conn.execute(query, (discord_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row["total_games"]:
+                return {"total_games": 0, "rated_count": 0, "average_rating": None}
+            return {
+                "total_games": row["total_games"],
+                "rated_count": row["rated_count"],
+                "average_rating": round(row["average_rating"], 2) if row["average_rating"] is not None else None
+            }
 
     async def get_user_backlog(self, discord_id: int) -> List[aiosqlite.Row]:
         """Retrieve all games logged as backlog for a user."""

@@ -21,11 +21,14 @@ class UsersCog(commands.Cog, name="Users"):
         await interaction.response.defer()
 
         target_username = None
+        target_discord_id = None
+
         # 1. Check if user is a mention or discord ID
         if user:
             clean_arg = user.strip().lstrip("<@!").rstrip(">")
             if clean_arg.isdigit():
-                linked = await self.bot.db.get_linked_user(int(clean_arg))
+                target_discord_id = int(clean_arg)
+                linked = await self.bot.db.get_linked_user(target_discord_id)
                 if linked:
                     target_username = linked["backloggd_username"]
                 else:
@@ -36,9 +39,13 @@ class UsersCog(commands.Cog, name="Users"):
                     return
             else:
                 target_username = user.strip().lstrip("@")
+                linked = await self.bot.db.get_linked_user_by_username(target_username)
+                if linked:
+                    target_discord_id = linked["discord_id"]
         else:
             # Check caller's own linked account
-            linked = await self.bot.db.get_linked_user(interaction.user.id)
+            target_discord_id = interaction.user.id
+            linked = await self.bot.db.get_linked_user(target_discord_id)
             if linked:
                 target_username = linked["backloggd_username"]
             else:
@@ -57,10 +64,16 @@ class UsersCog(commands.Cog, name="Users"):
                 )
                 return
 
-            # Compute stats if available
-            stats = profile_data.get_stats() if hasattr(profile_data, "get_stats") else None
+            # Fetch cached ratings stats from database if user is linked
+            avg_rating = None
+            rated_count = None
+            if target_discord_id:
+                stats = await self.bot.db.get_user_stats(target_discord_id)
+                if stats and stats.get("rated_count", 0) > 0:
+                    avg_rating = stats.get("average_rating")
+                    rated_count = stats.get("rated_count")
 
-            embed = create_profile_embed(profile_data, stats)
+            embed = create_profile_embed(profile_data, avg_rating=avg_rating, rated_count=rated_count)
             view = LinkButtonView(label="View Profile on Backloggd", url=build_backloggd_user_url(profile_data.username))
 
             await interaction.followup.send(embed=embed, view=view)
