@@ -17,7 +17,9 @@ from bot.ui.helpers import (
     format_number,
     format_status,
     build_backloggd_game_url,
-    build_backloggd_user_url
+    build_backloggd_user_url,
+    clean_image_url,
+    DEFAULT_BACKLOGGD_AVATAR
 )
 
 def create_game_embed(
@@ -35,8 +37,9 @@ def create_game_embed(
         color=COLOR_PRIMARY
     )
 
-    if game.cover_url:
-        embed.set_thumbnail(url=game.cover_url)
+    cover = clean_image_url(getattr(game, "cover_url", None))
+    if cover:
+        embed.set_thumbnail(url=cover)
 
     # Community rating & metadata description
     desc_lines = []
@@ -128,13 +131,8 @@ def create_profile_embed(
     badge_suffix = f" [{ ' | '.join(title_badges) }]" if title_badges else ""
 
     # Normalize profile avatar URL or use fallback / default Backloggd avatar
-    DEFAULT_BACKLOGGD_AVATAR = "https://backloggd.b-cdn.net/no_avatar.jpg"
-    avatar_url = getattr(profile, "avatar_url", None) or fallback_avatar_url or DEFAULT_BACKLOGGD_AVATAR
-    if avatar_url:
-        if avatar_url.startswith("//"):
-            avatar_url = f"https:{avatar_url}"
-        elif avatar_url.startswith("/"):
-            avatar_url = f"https://backloggd.com{avatar_url}"
+    raw_avatar = getattr(profile, "avatar_url", None) or fallback_avatar_url or DEFAULT_BACKLOGGD_AVATAR
+    avatar_url = clean_image_url(raw_avatar) or DEFAULT_BACKLOGGD_AVATAR
 
     embed = discord.Embed(
         title=f"{profile.username}{badge_suffix}",
@@ -311,8 +309,9 @@ def create_roulette_embed(username: str, game: Any, remaining_backlog: int) -> d
         color=COLOR_GOLD
     )
 
-    if getattr(game, "cover_url", None):
-        embed.set_thumbnail(url=game.cover_url)
+    cover = clean_image_url(getattr(game, "cover_url", None))
+    if cover:
+        embed.set_thumbnail(url=cover)
 
     desc_lines = [
         f"### [{title}]({game_url})"

@@ -72,3 +72,20 @@ def build_backloggd_game_url(slug: str) -> str:
 def build_backloggd_user_url(username: str) -> str:
     """Return full URL to user profile on Backloggd."""
     return f"https://www.backloggd.com/u/{username}/"
+
+DEFAULT_BACKLOGGD_AVATAR = "https://backloggd.b-cdn.net/no_avatar.jpg"
+
+def clean_image_url(url: Optional[str]) -> Optional[str]:
+    """Ensure image URLs are well-formed absolute URLs for Discord embeds."""
+    if not url:
+        return None
+    cleaned = str(url).strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("//"):
+        return f"https:{cleaned}"
+    if cleaned.startswith("/"):
+        return f"https://backloggd.com{cleaned}"
+    if not cleaned.startswith("http://") and not cleaned.startswith("https://"):
+        return f"https://{cleaned}"
+    return cleaned

@@ -3,7 +3,13 @@
 import discord
 from typing import Any
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
-from bot.ui.helpers import rating_to_stars, build_backloggd_game_url, build_backloggd_user_url
+from bot.ui.helpers import (
+    rating_to_stars,
+    build_backloggd_game_url,
+    build_backloggd_user_url,
+    clean_image_url,
+    DEFAULT_BACKLOGGD_AVATAR
+)
 
 def create_journal_feed_embed(
     username: str,
@@ -21,13 +27,12 @@ def create_journal_feed_embed(
         color=COLOR_PLAYED
     )
 
-    if avatar_url:
-        embed.set_author(name=username, icon_url=avatar_url, url=user_url)
-    else:
-        embed.set_author(name=username, url=user_url)
+    clean_avatar = clean_image_url(avatar_url) or DEFAULT_BACKLOGGD_AVATAR
+    embed.set_author(name=username, icon_url=clean_avatar, url=user_url)
 
-    if getattr(entry, "cover_url", None):
-        embed.set_thumbnail(url=entry.cover_url)
+    cover = clean_image_url(getattr(entry, "cover_url", None))
+    if cover:
+        embed.set_thumbnail(url=cover)
 
     details = []
     if entry.rating is not None:

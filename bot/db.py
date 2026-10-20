@@ -199,6 +199,8 @@ class Database:
 
     async def link_user(self, discord_id: int, username: str, avatar_url: Optional[str] = None) -> None:
         """Insert or update linked Backloggd username for a Discord user."""
+        from bot.ui.helpers import clean_image_url
+        clean_avatar = clean_image_url(avatar_url)
         query = """
             INSERT INTO linked_users (discord_id, backloggd_username, avatar_url, last_synced_at)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -207,7 +209,7 @@ class Database:
                 avatar_url = COALESCE(excluded.avatar_url, linked_users.avatar_url),
                 last_synced_at = CURRENT_TIMESTAMP;
         """
-        await self._execute(query, (discord_id, username, avatar_url))
+        await self._execute(query, (discord_id, username, clean_avatar))
 
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove a linked user and cascade-delete their cached ratings."""
@@ -253,6 +255,8 @@ class Database:
         community_rating: Optional[float] = None
     ) -> None:
         """Insert or update metadata for a game in cache."""
+        from bot.ui.helpers import clean_image_url
+        clean_cover = clean_image_url(cover_url)
         query = """
             INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
             VALUES (?, ?, ?, ?, ?)
@@ -262,7 +266,7 @@ class Database:
                 release_year = COALESCE(excluded.release_year, cached_games.release_year),
                 community_rating = COALESCE(excluded.community_rating, cached_games.community_rating);
         """
-        await self._execute(query, (slug, title, cover_url, release_year, community_rating))
+        await self._execute(query, (slug, title, clean_cover, release_year, community_rating))
 
     async def upsert_user_rating(
         self,
