@@ -20,42 +20,54 @@ def patched_parse_user_profile_page(html: str, username: str) -> UserProfile:
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Avatar URL with exhaustive selectors and data-src support
+    # 1. Avatar URL: check OpenGraph/Twitter meta tags first (Backloggd standard), then HTML selectors
     avatar_url: Optional[str] = None
-    avatar_selectors = [
-        "img.profile-avatar",
-        ".profile-avatar img",
-        ".user-avatar img",
-        "img.user-avatar",
-        "#profile-header img",
-        ".avatar img",
-        "img.avatar",
-        "[class*='avatar'] img",
-        "img[class*='avatar']",
-        "img[src*='avatar']",
-        "img[src*='avatars']",
-        "img[src*='backloggd-avatars']",
-        ".profile-pic img",
-        "img.profile-pic",
-        "img[alt*='avatar']",
-        "img[alt*='profile']",
-        ".user-details img"
-    ]
-    for selector in avatar_selectors:
-        avatar_img = soup.select_one(selector)
-        if avatar_img:
-            src = avatar_img.get("src") or avatar_img.get("data-src") or avatar_img.get("data-original")
-            if src and not any(k in src for k in ["no_avatar.jpg", "no_avatar.png", "default_avatar"]):
-                if src.startswith("//"):
-                    src = f"https:{src}"
-                elif src.startswith("/"):
-                    src = f"https://backloggd.com{src}"
-                avatar_url = src
-                break
+    og_image = soup.select_one("meta[property='og:image'], meta[name='og:image'], meta[property='twitter:image']")
+    if og_image and og_image.get("content"):
+        content_url = og_image["content"].strip()
+        if content_url and not any(k in content_url for k in ["no_avatar.jpg", "no_avatar.png", "default_avatar"]):
+            if content_url.startswith("//"):
+                content_url = f"https:{content_url}"
+            elif content_url.startswith("/"):
+                content_url = f"https://backloggd.com{content_url}"
+            avatar_url = content_url
 
-    # 2. Bio text with exhaustive selectors and newline spacing
+    if not avatar_url:
+        avatar_selectors = [
+            "#profile-header img",
+            "img.profile-avatar",
+            ".profile-avatar img",
+            ".user-avatar img",
+            "img.user-avatar",
+            ".avatar img",
+            "img.avatar",
+            "[class*='avatar'] img",
+            "img[class*='avatar']",
+            "img[src*='avatar']",
+            "img[src*='avatars']",
+            "img[src*='backloggd-avatars']",
+            ".profile-pic img",
+            "img.profile-pic",
+            "img[alt*='avatar']",
+            "img[alt*='profile']",
+            ".user-details img"
+        ]
+        for selector in avatar_selectors:
+            avatar_img = soup.select_one(selector)
+            if avatar_img:
+                src = avatar_img.get("src") or avatar_img.get("data-src") or avatar_img.get("data-original")
+                if src and not any(k in src for k in ["no_avatar.jpg", "no_avatar.png", "default_avatar"]):
+                    if src.startswith("//"):
+                        src = f"https:{src}"
+                    elif src.startswith("/"):
+                        src = f"https://backloggd.com{src}"
+                    avatar_url = src
+                    break
+
+    # 2. Bio text: check #bio-body first (Backloggd DOM container), then other profile bio selectors
     bio: Optional[str] = None
     bio_selectors = [
+        "#bio-body",
         "#profile-bio",
         "#bio",
         ".profile-bio",
@@ -87,7 +99,7 @@ def patched_parse_user_profile_page(html: str, username: str) -> UserProfile:
                 cleaned = re.sub(r"([a-zA-Z0-9]),([a-zA-Z])", r"\1, \2", cleaned)
                 cleaned = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", cleaned)
                 cleaned = re.sub(r"\s+", " ", cleaned).strip()
-                if cleaned and not any(k in cleaned.lower() for k in ["edit profile", "settings", "followers", "following"]):
+                if cleaned and cleaned.lower() not in ["nothing here!", "nothing here."] and not any(k in cleaned.lower() for k in ["edit profile", "settings", "followers", "following"]):
                     bio = cleaned
                     break
 
