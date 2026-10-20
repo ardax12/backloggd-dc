@@ -124,15 +124,14 @@ def create_profile_embed(
             avatar_url = f"https://backloggd.com{avatar_url}"
 
     embed = discord.Embed(
+        title=f"{profile.username}{badge_suffix}",
+        url=user_url,
         color=COLOR_PRIMARY
     )
 
-    # Place profile avatar and username on the top-left header
-    embed.set_author(
-        name=f"{profile.username}{badge_suffix}",
-        url=user_url,
-        icon_url=avatar_url if avatar_url else None
-    )
+    # Place profile image in the thumbnail spot on the top-right
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
 
     desc_lines = []
     bio = getattr(profile, "bio", None)

@@ -184,8 +184,8 @@ class VerificationSuite:
             recent_played=[DummyJournalEntry()],
             latest_review=DummyReview()
         )
-        assert "NoxTheGamer" in profile_embed.author.name
-        assert profile_embed.author.icon_url == "https://example.com/avatar.jpg"
+        assert "NoxTheGamer" in profile_embed.title
+        assert profile_embed.thumbnail.url == "https://example.com/avatar.jpg"
         assert any("Favorite Games" in f.name and "Elden Ring" in f.value for f in profile_embed.fields)
         assert any("Recently Played" in f.name and "Sea of Stars" in f.value for f in profile_embed.fields)
         assert any("Latest Review" in f.name and "Metaphor" in f.value for f in profile_embed.fields)
