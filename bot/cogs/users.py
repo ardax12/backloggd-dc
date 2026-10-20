@@ -89,6 +89,8 @@ class UsersCog(commands.Cog, name="Users"):
                 if not recent_played:
                     recent_played = await self.bot.db.get_user_recent_ratings(target_discord_id, limit=5)
 
+            latest_review = user_reviews[0] if user_reviews else None
+
             # Determine fallback avatar from Discord if available
             fallback_avatar = None
             if target_discord_id and interaction.guild:
