@@ -33,6 +33,10 @@ env/
 # Environment Variables & Secrets
 .env
 .env.local
+cookies.json
+cookies.local.json
+*.cookie
+*.cookies
 
 # Database & SQLite files
 data/*.db
