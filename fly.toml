@@ -1,0 +1,19 @@
+# Fly.io configuration for Backloggd Discord Bot
+# Note: Discord bots run as persistent background daemons, so [http_service] is omitted.
+
+app = "backloggd-dc"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATABASE_PATH = "/app/data/backloggd.db"
+
+[mounts]
+  source = "backloggd_data"
+  destination = "/app/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
