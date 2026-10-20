@@ -115,8 +115,9 @@ def create_profile_embed(
 
     badge_suffix = f" [{ ' | '.join(title_badges) }]" if title_badges else ""
 
-    # Normalize profile avatar URL or use fallback
-    avatar_url = getattr(profile, "avatar_url", None) or fallback_avatar_url
+    # Normalize profile avatar URL or use fallback / default Backloggd avatar
+    DEFAULT_BACKLOGGD_AVATAR = "https://backloggd.b-cdn.net/no_avatar.jpg"
+    avatar_url = getattr(profile, "avatar_url", None) or fallback_avatar_url or DEFAULT_BACKLOGGD_AVATAR
     if avatar_url:
         if avatar_url.startswith("//"):
             avatar_url = f"https:{avatar_url}"

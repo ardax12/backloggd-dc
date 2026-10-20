@@ -64,6 +64,9 @@ def patched_parse_user_profile_page(html: str, username: str) -> UserProfile:
                     avatar_url = src
                     break
 
+        if not avatar_url:
+            avatar_url = "https://backloggd.b-cdn.net/no_avatar.jpg"
+
     # 2. Bio text: check #bio-body first (Backloggd DOM container), then other profile bio selectors
     bio: Optional[str] = None
     bio_selectors = [
