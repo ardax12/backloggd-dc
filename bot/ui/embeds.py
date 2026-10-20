@@ -57,13 +57,25 @@ def create_game_embed(
 
     # Global Stats Field
     if hasattr(game, "stats") and game.stats:
-        stats_text = (
-            f"🎮 **{format_number(game.stats.played_count)}** Played  •  "
-            f"▶️ **{format_number(game.stats.playing_count)}** Playing  •  "
-            f"⏳ **{format_number(game.stats.backlog_count)}** Backlog  •  "
-            f"💖 **{format_number(game.stats.wishlist_count)}** Wishlist"
-        )
-        embed.add_field(name="Global Stats", value=stats_text, inline=False)
+        stats_parts = []
+        plays = getattr(game.stats, "plays_count", None) or getattr(game.stats, "played_count", None)
+        if plays is not None:
+            stats_parts.append(f"🎮 **{format_number(plays)}** Played")
+
+        playing = getattr(game.stats, "playing_count", None)
+        if playing is not None:
+            stats_parts.append(f"▶️ **{format_number(playing)}** Playing")
+
+        backlogs = getattr(game.stats, "backlogs_count", None) or getattr(game.stats, "backlog_count", None)
+        if backlogs is not None:
+            stats_parts.append(f"⏳ **{format_number(backlogs)}** Backlog")
+
+        wishlists = getattr(game.stats, "wishlists_count", None) or getattr(game.stats, "wishlist_count", None)
+        if wishlists is not None:
+            stats_parts.append(f"💖 **{format_number(wishlists)}** Wishlist")
+
+        if stats_parts:
+            embed.add_field(name="Global Stats", value="  •  ".join(stats_parts), inline=False)
 
     # Server Member Ratings Field
     if server_ratings:

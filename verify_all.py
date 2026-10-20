@@ -32,11 +32,9 @@ class DummyGame:
     cover_url = "https://example.com/cover.jpg"
 
     class Stats:
-        total_ratings = 142000
-        played_count = 98000
-        playing_count = 14000
-        backlog_count = 62000
-        wishlist_count = 35000
+        plays_count = 98000
+        backlogs_count = 62000
+        wishlists_count = 35000
 
     stats = Stats()
 
