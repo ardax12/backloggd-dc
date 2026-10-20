@@ -231,6 +231,19 @@ class Database:
                 "average_rating": round(row["average_rating"], 2) if row["average_rating"] is not None else None
             }
 
+    async def get_user_recent_ratings(self, discord_id: int, limit: int = 5) -> List[aiosqlite.Row]:
+        """Fetch user's most recently logged ratings from SQLite."""
+        query = """
+            SELECT g.title as game_title, g.slug as game_slug, r.rating, r.status, r.updated_at
+            FROM user_ratings r
+            JOIN cached_games g ON r.game_slug = g.slug
+            WHERE r.discord_id = ?
+            ORDER BY r.updated_at DESC
+            LIMIT ?;
+        """
+        async with self._conn.execute(query, (discord_id, limit)) as cursor:
+            return await cursor.fetchall()
+
     async def get_user_backlog(self, discord_id: int) -> List[aiosqlite.Row]:
         """Retrieve all games logged as backlog for a user."""
         query = """

@@ -5,10 +5,13 @@ from discord.ui import View, Button
 from typing import Optional, Callable, Coroutine, Any
 
 class LinkButtonView(View):
-    """Simple view with a single URL button linking to Backloggd."""
-    def __init__(self, label: str, url: str):
+    """View with URL button(s) linking to Backloggd."""
+    def __init__(self, label: str, url: str, extra_buttons: Optional[list[tuple[str, str]]] = None):
         super().__init__(timeout=None)
         self.add_item(Button(label=label, url=url, style=discord.ButtonStyle.link))
+        if extra_buttons:
+            for extra_label, extra_url in extra_buttons:
+                self.add_item(Button(label=extra_label, url=extra_url, style=discord.ButtonStyle.link))
 
 class RouletteView(View):
     """Interactive view for Backlog Roulette with a Reroll button."""

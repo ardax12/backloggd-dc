@@ -94,7 +94,9 @@ def create_game_embed(
 def create_profile_embed(
     profile: Any,
     avg_rating: Optional[float] = None,
-    rated_count: Optional[int] = None
+    rated_count: Optional[int] = None,
+    recent_played: Optional[List[Any]] = None,
+    latest_review: Optional[Any] = None,
 ) -> discord.Embed:
     """Construct embed for /profile command with clean formatting."""
     user_url = build_backloggd_user_url(profile.username)
@@ -117,12 +119,19 @@ def create_profile_embed(
         color=COLOR_PRIMARY
     )
 
-    if profile.avatar_url:
-        embed.set_thumbnail(url=profile.avatar_url)
+    # Profile avatar thumbnail
+    avatar_url = getattr(profile, "avatar_url", None)
+    if avatar_url:
+        if avatar_url.startswith("//"):
+            avatar_url = f"https:{avatar_url}"
+        elif avatar_url.startswith("/"):
+            avatar_url = f"https://backloggd.com{avatar_url}"
+        embed.set_thumbnail(url=avatar_url)
 
     desc_lines = []
-    if profile.bio:
-        desc_lines.append(f"> {profile.bio}")
+    bio = getattr(profile, "bio", None)
+    if bio and bio.strip():
+        desc_lines.append(f"> {bio.strip()}")
 
     # Show badges count cleanly if any achievements earned
     if profile.badges:
@@ -132,10 +141,10 @@ def create_profile_embed(
         embed.description = "\n\n".join(desc_lines)
 
     # Activity Counter Fields
-    played = profile.played_count or 0
-    playing = profile.playing_count or 0
-    backlog = profile.backlog_count or 0
-    wishlist = profile.wishlist_count or 0
+    played = getattr(profile, "played_count", 0) or 0
+    playing = getattr(profile, "playing_count", 0) or 0
+    backlog = getattr(profile, "backlog_count", 0) or 0
+    wishlist = getattr(profile, "wishlist_count", 0) or 0
 
     embed.add_field(
         name="📊 Library Overview",
@@ -157,13 +166,58 @@ def create_profile_embed(
             inline=True
         )
 
-    # Pinned Favorite Games
+    # 1. Pinned Favorite Games (up to 5)
     if profile.favorite_games:
         fav_lines = []
-        for i, fav in enumerate(profile.favorite_games[:4], 1):
-            title = getattr(fav, "title", str(fav))
+        for i, fav in enumerate(profile.favorite_games[:5], 1):
+            if isinstance(fav, str):
+                title = fav
+            elif hasattr(fav, "title"):
+                val = fav.title
+                title = val() if callable(val) else val
+            else:
+                title = str(fav)
             fav_lines.append(f"**{i}.** {title}")
         embed.add_field(name="⭐ Favorite Games", value="\n".join(fav_lines), inline=False)
+
+    # 2. Recently Played (up to 5)
+    if recent_played:
+        recent_lines = []
+        for entry in recent_played[:5]:
+            title = getattr(entry, "game_title", None) or getattr(entry, "title", "Unknown Game")
+            rating = getattr(entry, "rating", None)
+            date_str = getattr(entry, "played_date", None)
+            replay = " 🔄" if getattr(entry, "is_replay", False) else ""
+
+            stars = f" — {rating_to_stars(rating)}" if rating is not None else ""
+            date_suffix = f" *({date_str})*" if date_str else ""
+            recent_lines.append(f"• **{title}**{stars}{replay}{date_suffix}")
+        if recent_lines:
+            embed.add_field(name="🕹️ Recently Played", value="\n".join(recent_lines), inline=False)
+
+    # 3. Latest Review (if present)
+    if latest_review and getattr(latest_review, "game_title", None):
+        r_title = latest_review.game_title
+        r_rating = rating_to_stars(latest_review.rating) if latest_review.rating is not None else ""
+        likes_count = getattr(latest_review, "like_count", 0)
+        likes_text = f" • ❤️ {likes_count}" if likes_count > 0 else ""
+
+        header = f"**{r_title}** ({r_rating}){likes_text}" if r_rating else f"**{r_title}**{likes_text}"
+
+        review_text = getattr(latest_review, "review_text", "") or ""
+        if review_text:
+            clean_text = review_text.replace("\n", " ").strip()
+            if len(clean_text) > 200:
+                clean_text = clean_text[:197].rsplit(" ", 1)[0] + "..."
+
+            if getattr(latest_review, "has_spoilers", False):
+                review_content = f"{header}\n|| > \"{clean_text}\" ||"
+            else:
+                review_content = f"{header}\n> \"{clean_text}\""
+        else:
+            review_content = header
+
+        embed.add_field(name="📝 Latest Review", value=review_content, inline=False)
 
     embed.set_footer(text="Backloggd Profile Overview • Connect yours with /link")
     return embed

@@ -49,7 +49,18 @@ class DummyProfile:
     playing_count = 3
     backlog_count = 118
     wishlist_count = 45
-    favorite_games = ["Bloodborne", "Chrono Trigger", "Hollow Knight", "Outer Wilds"]
+    favorite_games = ["Bloodborne", "Chrono Trigger", "Hollow Knight", "Outer Wilds", "Elden Ring"]
+
+class DummyReview:
+    review_id = "123"
+    game_title = "Metaphor: ReFantazio"
+    game_slug = "metaphor-refantazio"
+    author = "NoxTheGamer"
+    rating = 4.5
+    review_text = "An incredible journey that combines the best elements of Atlus's previous works."
+    created_at = "Oct 15, 2026"
+    like_count = 12
+    has_spoilers = False
 
 class DummyJournalEntry:
     entry_id = "test_log_12345"
@@ -166,8 +177,17 @@ class VerificationSuite:
         print("✅ Game Embed built successfully")
 
         # 2. Profile Embed
-        profile_embed = create_profile_embed(DummyProfile())
+        profile_embed = create_profile_embed(
+            DummyProfile(),
+            avg_rating=4.25,
+            rated_count=120,
+            recent_played=[DummyJournalEntry()],
+            latest_review=DummyReview()
+        )
         assert "NoxTheGamer" in profile_embed.title
+        assert any("Favorite Games" in f.name and "Elden Ring" in f.value for f in profile_embed.fields)
+        assert any("Recently Played" in f.name and "Sea of Stars" in f.value for f in profile_embed.fields)
+        assert any("Latest Review" in f.name and "Metaphor" in f.value for f in profile_embed.fields)
         print("✅ Profile Embed built successfully")
 
         # 3. Compare Embed
