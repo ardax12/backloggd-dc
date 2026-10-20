@@ -1,5 +1,6 @@
 """Constructors for all Backloggd Discord Embeds."""
 
+import re
 import discord
 from typing import List, Optional, Any
 from bot.config import (
@@ -97,8 +98,9 @@ def create_profile_embed(
     rated_count: Optional[int] = None,
     recent_played: Optional[List[Any]] = None,
     latest_review: Optional[Any] = None,
+    fallback_avatar_url: Optional[str] = None,
 ) -> discord.Embed:
-    """Construct embed for /profile command with clean formatting."""
+    """Construct embed for /profile command with clean formatting and top-left avatar."""
     user_url = build_backloggd_user_url(profile.username)
     
     # Filter special role badges for title (VIP, Patron, Supporter, Founder, Mod)
@@ -113,25 +115,37 @@ def create_profile_embed(
 
     badge_suffix = f" [{ ' | '.join(title_badges) }]" if title_badges else ""
 
-    embed = discord.Embed(
-        title=f"{profile.username}{badge_suffix}",
-        url=user_url,
-        color=COLOR_PRIMARY
-    )
-
-    # Profile avatar thumbnail
-    avatar_url = getattr(profile, "avatar_url", None)
+    # Normalize profile avatar URL or use fallback
+    avatar_url = getattr(profile, "avatar_url", None) or fallback_avatar_url
     if avatar_url:
         if avatar_url.startswith("//"):
             avatar_url = f"https:{avatar_url}"
         elif avatar_url.startswith("/"):
             avatar_url = f"https://backloggd.com{avatar_url}"
-        embed.set_thumbnail(url=avatar_url)
+
+    embed = discord.Embed(
+        color=COLOR_PRIMARY
+    )
+
+    # Place profile avatar and username on the top-left header
+    embed.set_author(
+        name=f"{profile.username}{badge_suffix}",
+        url=user_url,
+        icon_url=avatar_url if avatar_url else None
+    )
 
     desc_lines = []
     bio = getattr(profile, "bio", None)
-    if bio and bio.strip():
-        desc_lines.append(f"> {bio.strip()}")
+    if bio and str(bio).strip():
+        # Replace newlines with spaces so words do not combine, and separate glued words
+        clean_bio = re.sub(r"[\r\n]+", " ", str(bio))
+        clean_bio = re.sub(r"([a-zA-Z0-9]),([a-zA-Z])", r"\1, \2", clean_bio)
+        clean_bio = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", clean_bio)
+        clean_bio = re.sub(r"\s+", " ", clean_bio).strip()
+        # Enforce character limit for bio
+        if len(clean_bio) > 250:
+            clean_bio = clean_bio[:247].rsplit(" ", 1)[0] + "..."
+        desc_lines.append(f"> {clean_bio}")
 
     # Show badges count cleanly if any achievements earned
     if profile.badges:
@@ -206,7 +220,12 @@ def create_profile_embed(
 
         review_text = getattr(latest_review, "review_text", "") or ""
         if review_text:
-            clean_text = review_text.replace("\n", " ").strip()
+            # Replace newlines with spaces so words do not combine, and separate glued words
+            clean_text = re.sub(r"[\r\n]+", " ", str(review_text))
+            clean_text = re.sub(r"([a-zA-Z0-9]),([a-zA-Z])", r"\1, \2", clean_text)
+            clean_text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", clean_text)
+            clean_text = re.sub(r"\s+", " ", clean_text).strip()
+
             if len(clean_text) > 200:
                 clean_text = clean_text[:197].rsplit(" ", 1)[0] + "..."
 

@@ -184,7 +184,8 @@ class VerificationSuite:
             recent_played=[DummyJournalEntry()],
             latest_review=DummyReview()
         )
-        assert "NoxTheGamer" in profile_embed.title
+        assert "NoxTheGamer" in profile_embed.author.name
+        assert profile_embed.author.icon_url == "https://example.com/avatar.jpg"
         assert any("Favorite Games" in f.name and "Elden Ring" in f.value for f in profile_embed.fields)
         assert any("Recently Played" in f.name and "Sea of Stars" in f.value for f in profile_embed.fields)
         assert any("Latest Review" in f.name and "Metaphor" in f.value for f in profile_embed.fields)
@@ -216,6 +217,22 @@ class VerificationSuite:
         feed_embed = create_journal_feed_embed("Nox", "https://example.com/nox.png", DummyJournalEntry())
         assert "Sea of Stars" in feed_embed.title
         print("✅ Journal Feed Embed built successfully")
+
+        # 8. Test Runtime Patches
+        from bot.patches import patched_parse_user_profile_page, patched_parse_review_card
+        from bs4 import BeautifulSoup
+        test_profile_html = '<div id="profile-header"><img class="profile-avatar" src="/avatars/test.jpg"><p class="profile-bio">First line.<br>Second line.</p></div>'
+        patched_p = patched_parse_user_profile_page(test_profile_html, "testuser")
+        assert patched_p.avatar_url == "https://backloggd.com/avatars/test.jpg"
+        assert patched_p.bio == "First line. Second line."
+
+        test_card_soup = BeautifulSoup(
+            '<div class="user-reviews"><div class="game-name"><a href="/games/hades/">Hades</a></div><div class="review-text"><p>Great game,</p><p>loved the combat!</p></div></div>',
+            "html.parser"
+        )
+        patched_r = patched_parse_review_card(test_card_soup)
+        assert patched_r.review_text == "Great game, loved the combat!"
+        print("✅ Runtime parser patches verified successfully!")
 
         print("\n=== [4] Testing Bot Client Cog Suite ===")
         bot = BackloggdBot()

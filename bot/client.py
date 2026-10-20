@@ -6,11 +6,15 @@ import logging
 from backloggd import BackloggdClient
 from bot.db import Database
 from bot.config import DATABASE_PATH, DEV_GUILD_ID
+from bot.patches import apply_patches
 
 logger = logging.getLogger("backloggd.bot")
 
 class BackloggdBot(commands.Bot):
     def __init__(self):
+        # Apply runtime patches for avatar, bio, and review spacing
+        apply_patches()
+
         intents = discord.Intents.default()
         intents.members = True          # Required for server-specific member queries
         intents.message_content = True  # Required for link unfurling and chat helpers

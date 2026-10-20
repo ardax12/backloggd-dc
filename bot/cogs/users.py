@@ -89,14 +89,22 @@ class UsersCog(commands.Cog, name="Users"):
                 if not recent_played:
                     recent_played = await self.bot.db.get_user_recent_ratings(target_discord_id, limit=5)
 
-            latest_review = user_reviews[0] if user_reviews else None
+            # Determine fallback avatar from Discord if available
+            fallback_avatar = None
+            if target_discord_id and interaction.guild:
+                member = interaction.guild.get_member(target_discord_id)
+                if member and member.display_avatar:
+                    fallback_avatar = member.display_avatar.url
+            if not fallback_avatar and target_discord_id == interaction.user.id and interaction.user.display_avatar:
+                fallback_avatar = interaction.user.display_avatar.url
 
             embed = create_profile_embed(
                 profile_data,
                 avg_rating=avg_rating,
                 rated_count=rated_count,
                 recent_played=recent_played,
-                latest_review=latest_review
+                latest_review=latest_review,
+                fallback_avatar_url=fallback_avatar
             )
 
             extra_buttons = []
