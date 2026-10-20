@@ -1,6 +1,6 @@
 """Formatting helpers for stars, status badges, numbers, and Backloggd URLs."""
 
-from typing import Optional
+from typing import Any, Optional
 
 def rating_to_stars(rating: Optional[float], max_stars: int = 5) -> str:
     """
@@ -23,14 +23,34 @@ def rating_to_stars(rating: Optional[float], max_stars: int = 5) -> str:
         stars += "☆" * empty_stars
     return stars
 
-def format_number(val: Optional[int]) -> str:
-    """Format large numbers into compact strings (e.g. 14200 -> 14.2k)."""
+def format_number(val: Optional[Any]) -> str:
+    """Format large numbers or count strings into compact representations (e.g. 14200 -> 14.2k, '24K' -> 24K)."""
     if val is None:
         return "0"
-    if val >= 1_000_000:
-        return f"{val / 1_000_000:.1f}M"
-    if val >= 1_000:
-        return f"{val / 1_000:.1f}k"
+
+    if isinstance(val, str):
+        cleaned = val.strip()
+        if not cleaned:
+            return "0"
+        # If it already has unit suffix like 24K, 1.2M, etc.
+        if cleaned[-1].upper() in ("K", "M", "B"):
+            return cleaned
+        # Try parsing numeric string
+        try:
+            num = float(cleaned.replace(",", ""))
+            if num.is_integer():
+                num = int(num)
+            val = num
+        except ValueError:
+            return cleaned
+
+    if isinstance(val, (int, float)):
+        if val >= 1_000_000:
+            return f"{val / 1_000_000:.1f}M"
+        if val >= 1_000:
+            return f"{val / 1_000:.1f}k"
+        return str(int(val)) if isinstance(val, float) and val.is_integer() else str(val)
+
     return str(val)
 
 def format_status(status: str) -> str:
