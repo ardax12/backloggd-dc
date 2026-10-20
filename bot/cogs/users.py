@@ -1,6 +1,7 @@
 """UsersCog: Handles /profile command displaying stats, metrics, and favorite games."""
 
 import asyncio
+import io
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -109,6 +110,28 @@ class UsersCog(commands.Cog, name="Users"):
                 fallback_avatar_url=fallback_avatar
             )
 
+            # Fetch and upscale avatar to render large in Discord chat
+            avatar_file = None
+            resolved_avatar = getattr(profile_data, "avatar_url", None) or fallback_avatar or "https://backloggd.b-cdn.net/no_avatar.jpg"
+            if resolved_avatar:
+                try:
+                    client = self.bot.backloggd._get_client()
+                    resp = await client.get(resolved_avatar)
+                    if resp.status_code == 200:
+                        from PIL import Image
+                        img = Image.open(io.BytesIO(resp.content))
+                        # Upscale 2x/3x if small so it displays sharp and large in Discord
+                        if img.width < 700:
+                            factor = 2 if img.width >= 350 else 3
+                            new_size = (img.width * factor, img.height * factor)
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        buf.seek(0)
+                        avatar_file = discord.File(fp=buf, filename="profile_avatar.png")
+                except Exception as e:
+                    logger.warning("Could not upscale avatar image: %s", e)
+
             extra_buttons = []
             if latest_review and getattr(latest_review, "review_id", None):
                 review_url = f"https://backloggd.com/u/{profile_data.username}/review/{latest_review.review_id}/"
@@ -120,7 +143,10 @@ class UsersCog(commands.Cog, name="Users"):
                 extra_buttons=extra_buttons if extra_buttons else None
             )
 
-            await interaction.followup.send(embed=embed, view=view)
+            if avatar_file:
+                await interaction.followup.send(embed=embed, file=avatar_file, view=view)
+            else:
+                await interaction.followup.send(embed=embed, view=view)
 
         except Exception as e:
             logger.error("Error looking up profile for '%s': %s", target_username, e, exc_info=True)
