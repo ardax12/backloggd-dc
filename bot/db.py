@@ -1,100 +1,183 @@
-"""Asynchronous SQLite Database Manager for Backloggd Discord Bot."""
+"""Database Manager for Backloggd Discord Bot.
+
+Supports both local SQLite (aiosqlite) and Turso / libSQL Cloud Database (libsql-client).
+"""
+
+import logging
+from pathlib import Path
+from typing import Any, List, Optional
 
 import aiosqlite
-import logging
-from typing import Optional, List, Tuple
-from pathlib import Path
+import libsql_client
+
+from bot.config import DATABASE_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
 
 logger = logging.getLogger("backloggd.db")
 
+
 class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        turso_url: Optional[str] = None,
+        turso_token: Optional[str] = None,
+    ):
+        self.db_path = db_path or DATABASE_PATH
+        if turso_url is not None:
+            self.turso_url = turso_url.strip()
+        elif db_path is not None and db_path != DATABASE_PATH:
+            # Custom db_path provided (e.g. test_db.db), do not default to cloud Turso
+            self.turso_url = ""
+        else:
+            self.turso_url = TURSO_DATABASE_URL.strip()
+
+        self.turso_token = (
+            turso_token if turso_token is not None else TURSO_AUTH_TOKEN
+        ).strip()
         self._conn: Optional[aiosqlite.Connection] = None
+        self._client: Optional[libsql_client.Client] = None
+
+    @property
+    def is_turso(self) -> bool:
+        """Check whether using Turso cloud backend."""
+        return bool(self.turso_url)
 
     async def connect(self) -> None:
         """Establish connection and create database tables if they do not exist."""
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.db_path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA foreign_keys = ON;")
-        await self._create_tables()
-        logger.info("Connected to SQLite database at %s", self.db_path)
+        if self.is_turso:
+            logger.info("Connecting to Turso cloud database (%s)...", self.turso_url)
+            self._client = libsql_client.create_client(
+                url=self.turso_url,
+                auth_token=self.turso_token or None,
+            )
+            await self._create_tables()
+            logger.info("Connected to Turso cloud database.")
+        else:
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            self._conn = await aiosqlite.connect(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            await self._conn.execute("PRAGMA foreign_keys = ON;")
+            await self._create_tables()
+            logger.info("Connected to local SQLite database at %s", self.db_path)
 
     @property
     def is_connected(self) -> bool:
         """Check if database connection is active."""
+        if self.is_turso:
+            return self._client is not None and not getattr(self._client, "_closed", False)
         return self._conn is not None and getattr(self._conn, "_running", False)
 
     async def close(self) -> None:
-        """Close SQLite connection."""
+        """Close active database connection."""
+        if self._client:
+            await self._client.close()
+            self._client = None
+            logger.info("Closed Turso client connection.")
         if self._conn:
             await self._conn.close()
             self._conn = None
             logger.info("Closed SQLite connection.")
 
+    # =========================================================================
+    # Internal Query Helpers (Unified backend abstraction)
+    # =========================================================================
+
+    async def _execute(self, query: str, params: tuple | list = ()) -> None:
+        """Execute a write statement (INSERT/UPDATE/CREATE/DELETE)."""
+        if self.is_turso:
+            await self._client.execute(query, list(params))
+        else:
+            await self._conn.execute(query, params)
+            await self._conn.commit()
+
+    async def _fetchone(self, query: str, params: tuple | list = ()) -> Optional[Any]:
+        """Fetch a single row."""
+        if self.is_turso:
+            rs = await self._client.execute(query, list(params))
+            return rs.rows[0] if rs.rows else None
+        else:
+            async with self._conn.execute(query, params) as cursor:
+                return await cursor.fetchone()
+
+    async def _fetchall(self, query: str, params: tuple | list = ()) -> List[Any]:
+        """Fetch all rows."""
+        if self.is_turso:
+            rs = await self._client.execute(query, list(params))
+            return list(rs.rows)
+        else:
+            async with self._conn.execute(query, params) as cursor:
+                return await cursor.fetchall()
+
+    async def _rowcount_execute(self, query: str, params: tuple | list = ()) -> int:
+        """Execute a write statement and return affected rows count."""
+        if self.is_turso:
+            rs = await self._client.execute(query, list(params))
+            return rs.rows_affected
+        else:
+            async with self._conn.cursor() as cursor:
+                await cursor.execute(query, params)
+                await self._conn.commit()
+                return cursor.rowcount
+
     async def _create_tables(self) -> None:
         """Initialize all required schemas and indexes."""
-        async with self._conn.cursor() as cursor:
-            # 1. Linked users
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS linked_users (
-                    discord_id INTEGER PRIMARY KEY,
-                    backloggd_username TEXT NOT NULL UNIQUE,
-                    avatar_url TEXT,
-                    last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
+        # 1. Linked users
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS linked_users (
+                discord_id INTEGER PRIMARY KEY,
+                backloggd_username TEXT NOT NULL UNIQUE,
+                avatar_url TEXT,
+                last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
 
-            # 2. Cached games
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS cached_games (
-                    slug TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    cover_url TEXT,
-                    release_year INTEGER,
-                    community_rating REAL
-                );
-            """)
+        # 2. Cached games
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS cached_games (
+                slug TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cover_url TEXT,
+                release_year INTEGER,
+                community_rating REAL
+            );
+        """)
 
-            # 3. User ratings and status logs
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_ratings (
-                    discord_id INTEGER NOT NULL,
-                    game_slug TEXT NOT NULL,
-                    rating REAL,
-                    status TEXT NOT NULL,
-                    is_liked BOOLEAN DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (discord_id, game_slug),
-                    FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
-                    FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
-                );
-            """)
+        # 3. User ratings and status logs
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS user_ratings (
+                discord_id INTEGER NOT NULL,
+                game_slug TEXT NOT NULL,
+                rating REAL,
+                status TEXT NOT NULL,
+                is_liked BOOLEAN DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (discord_id, game_slug),
+                FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
+                FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
+            );
+        """)
 
-            # Indexes for fast lookup
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_ratings_slug ON user_ratings(game_slug);")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_ratings_user ON user_ratings(discord_id);")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_ratings_status ON user_ratings(status);")
+        # Indexes for fast lookup
+        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_slug ON user_ratings(game_slug);")
+        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_user ON user_ratings(discord_id);")
+        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_status ON user_ratings(status);")
 
-            # 4. Guild settings for automatic feed
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id INTEGER PRIMARY KEY,
-                    feed_channel_id INTEGER NOT NULL
-                );
-            """)
+        # 4. Guild settings for automatic feed
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                feed_channel_id INTEGER NOT NULL
+            );
+        """)
 
-            # 5. Seen journal logs deduplication
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS seen_journal_logs (
-                    entry_id TEXT PRIMARY KEY,
-                    discord_id INTEGER NOT NULL,
-                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            await self._conn.commit()
+        # 5. Seen journal logs deduplication
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS seen_journal_logs (
+                entry_id TEXT PRIMARY KEY,
+                discord_id INTEGER NOT NULL,
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
 
     # =========================================================================
     # User Account Linking
@@ -110,45 +193,38 @@ class Database:
                 avatar_url = COALESCE(excluded.avatar_url, linked_users.avatar_url),
                 last_synced_at = CURRENT_TIMESTAMP;
         """
-        await self._conn.execute(query, (discord_id, username, avatar_url))
-        await self._conn.commit()
+        await self._execute(query, (discord_id, username, avatar_url))
 
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove a linked user and cascade-delete their cached ratings."""
-        async with self._conn.cursor() as cursor:
-            await cursor.execute("DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,))
-            await self._conn.commit()
-            return cursor.rowcount > 0
+        deleted = await self._rowcount_execute("DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,))
+        return deleted > 0
 
-    async def get_linked_user(self, discord_id: int) -> Optional[aiosqlite.Row]:
+    async def get_linked_user(self, discord_id: int) -> Optional[Any]:
         """Fetch linked user record by Discord ID."""
-        async with self._conn.execute(
+        return await self._fetchone(
             "SELECT discord_id, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE discord_id = ?;",
             (discord_id,)
-        ) as cursor:
-            return await cursor.fetchone()
+        )
 
-    async def get_linked_user_by_username(self, username: str) -> Optional[aiosqlite.Row]:
+    async def get_linked_user_by_username(self, username: str) -> Optional[Any]:
         """Fetch linked user record by Backloggd username (case-insensitive)."""
-        async with self._conn.execute(
+        return await self._fetchone(
             "SELECT discord_id, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE LOWER(backloggd_username) = LOWER(?);",
             (username.strip(),)
-        ) as cursor:
-            return await cursor.fetchone()
+        )
 
-    async def get_all_linked_users(self) -> List[aiosqlite.Row]:
+    async def get_all_linked_users(self) -> List[Any]:
         """Fetch all linked users."""
-        async with self._conn.execute("SELECT discord_id, backloggd_username, avatar_url FROM linked_users;") as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall("SELECT discord_id, backloggd_username, avatar_url FROM linked_users;")
 
-    async def get_guild_linked_users(self, member_ids: List[int]) -> List[aiosqlite.Row]:
+    async def get_guild_linked_users(self, member_ids: List[int]) -> List[Any]:
         """Fetch all linked users present in a specific guild."""
         if not member_ids:
             return []
         placeholders = ",".join("?" for _ in member_ids)
         query = f"SELECT discord_id, backloggd_username, avatar_url FROM linked_users WHERE discord_id IN ({placeholders});"
-        async with self._conn.execute(query, member_ids) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, member_ids)
 
     # =========================================================================
     # Cached Games & Ratings
@@ -172,8 +248,7 @@ class Database:
                 release_year = COALESCE(excluded.release_year, cached_games.release_year),
                 community_rating = COALESCE(excluded.community_rating, cached_games.community_rating);
         """
-        await self._conn.execute(query, (slug, title, cover_url, release_year, community_rating))
-        await self._conn.commit()
+        await self._execute(query, (slug, title, cover_url, release_year, community_rating))
 
     async def upsert_user_rating(
         self,
@@ -193,10 +268,9 @@ class Database:
                 is_liked = excluded.is_liked,
                 updated_at = CURRENT_TIMESTAMP;
         """
-        await self._conn.execute(query, (discord_id, game_slug, rating, status, is_liked))
-        await self._conn.commit()
+        await self._execute(query, (discord_id, game_slug, rating, status, is_liked))
 
-    async def get_server_ratings_for_game(self, guild_member_ids: List[int], game_slug: str) -> List[aiosqlite.Row]:
+    async def get_server_ratings_for_game(self, guild_member_ids: List[int], game_slug: str) -> List[Any]:
         """Fetch all ratings and statuses for a game from linked guild members."""
         if not guild_member_ids:
             return []
@@ -209,8 +283,7 @@ class Database:
             ORDER BY (r.rating IS NULL), r.rating DESC, u.backloggd_username ASC;
         """
         params = list(guild_member_ids) + [game_slug]
-        async with self._conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, params)
 
     async def get_user_stats(self, discord_id: int) -> dict:
         """Fetch user's aggregate stats from cached ratings."""
@@ -221,18 +294,17 @@ class Database:
             FROM user_ratings
             WHERE discord_id = ?;
         """
-        async with self._conn.execute(query, (discord_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row or not row["total_games"]:
-                return {"total_games": 0, "rated_count": 0, "average_rating": None}
-            return {
-                "total_games": row["total_games"],
-                "rated_count": row["rated_count"],
-                "average_rating": round(row["average_rating"], 2) if row["average_rating"] is not None else None
-            }
+        row = await self._fetchone(query, (discord_id,))
+        if not row or not row["total_games"]:
+            return {"total_games": 0, "rated_count": 0, "average_rating": None}
+        return {
+            "total_games": row["total_games"],
+            "rated_count": row["rated_count"],
+            "average_rating": round(row["average_rating"], 2) if row["average_rating"] is not None else None
+        }
 
-    async def get_user_recent_ratings(self, discord_id: int, limit: int = 5) -> List[aiosqlite.Row]:
-        """Fetch user's most recently logged ratings from SQLite."""
+    async def get_user_recent_ratings(self, discord_id: int, limit: int = 5) -> List[Any]:
+        """Fetch user's most recently logged ratings from database."""
         query = """
             SELECT g.title as game_title, g.slug as game_slug, r.rating, r.status, r.updated_at
             FROM user_ratings r
@@ -241,10 +313,9 @@ class Database:
             ORDER BY r.updated_at DESC
             LIMIT ?;
         """
-        async with self._conn.execute(query, (discord_id, limit)) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, (discord_id, limit))
 
-    async def get_user_backlog(self, discord_id: int) -> List[aiosqlite.Row]:
+    async def get_user_backlog(self, discord_id: int) -> List[Any]:
         """Retrieve all games logged as backlog for a user."""
         query = """
             SELECT g.slug, g.title, g.cover_url, g.release_year, g.community_rating, r.rating, r.is_liked
@@ -252,21 +323,19 @@ class Database:
             JOIN cached_games g ON r.game_slug = g.slug
             WHERE r.discord_id = ? AND r.status = 'backlog';
         """
-        async with self._conn.execute(query, (discord_id,)) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, (discord_id,))
 
     async def get_user_ratings_dict(self, discord_id: int) -> dict[str, Optional[float]]:
         """Return slug -> rating dictionary for similarity computation."""
         query = "SELECT game_slug, rating FROM user_ratings WHERE discord_id = ?;"
-        async with self._conn.execute(query, (discord_id,)) as cursor:
-            rows = await cursor.fetchall()
-            return {row["game_slug"]: row["rating"] for row in rows}
+        rows = await self._fetchall(query, (discord_id,))
+        return {row["game_slug"]: row["rating"] for row in rows}
 
     # =========================================================================
     # Server Leaderboards & Statistics
     # =========================================================================
 
-    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[aiosqlite.Row]:
+    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
         """Get top games by average rating among server members."""
         if not guild_member_ids:
             return []
@@ -284,10 +353,9 @@ class Database:
             LIMIT ?;
         """
         params = list(guild_member_ids) + [min_ratings, limit]
-        async with self._conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, params)
 
-    async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[aiosqlite.Row]:
+    async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
         """Get most completed games by server members."""
         if not guild_member_ids:
             return []
@@ -304,10 +372,9 @@ class Database:
             LIMIT ?;
         """
         params = list(guild_member_ids) + [limit]
-        async with self._conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, params)
 
-    async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[aiosqlite.Row]:
+    async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
         """Get games most frequently sitting unplayed in server members' backlogs."""
         if not guild_member_ids:
             return []
@@ -323,10 +390,9 @@ class Database:
             LIMIT ?;
         """
         params = list(guild_member_ids) + [limit]
-        async with self._conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, params)
 
-    async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[aiosqlite.Row]:
+    async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
         """Get games with the highest rating disparity/variance among server members."""
         if not guild_member_ids:
             return []
@@ -345,10 +411,9 @@ class Database:
             LIMIT ?;
         """
         params = list(guild_member_ids) + [min_ratings, limit]
-        async with self._conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, params)
 
-    async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[aiosqlite.Row]:
+    async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
         """Get high-scoring games (>= 4.5) played by only 1 or 2 server members."""
         if not guild_member_ids:
             return []
@@ -366,8 +431,7 @@ class Database:
             LIMIT ?;
         """
         params = list(guild_member_ids) + [limit]
-        async with self._conn.execute(query, params) as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall(query, params)
 
     async def get_server_stats(self, guild_member_ids: List[int]) -> dict:
         """Compute aggregate community metrics for a server."""
@@ -381,13 +445,13 @@ class Database:
             }
 
         placeholders = ",".join("?" for _ in guild_member_ids)
-        
+
         # 1. Linked members count
-        async with self._conn.execute(
+        link_row = await self._fetchone(
             f"SELECT COUNT(*) as count FROM linked_users WHERE discord_id IN ({placeholders});",
             guild_member_ids
-        ) as cursor:
-            linked_members = (await cursor.fetchone())["count"]
+        )
+        linked_members = link_row["count"] if link_row else 0
 
         # 2. Logs, Played count, and average rating
         query_metrics = f"""
@@ -397,11 +461,10 @@ class Database:
             FROM user_ratings
             WHERE discord_id IN ({placeholders});
         """
-        async with self._conn.execute(query_metrics, guild_member_ids) as cursor:
-            row = await cursor.fetchone()
-            total_logged = row["total_logged"] or 0
-            total_played = row["total_played"] or 0
-            avg_rating = round(row["avg_rating"], 2) if row["avg_rating"] is not None else None
+        row = await self._fetchone(query_metrics, guild_member_ids)
+        total_logged = (row["total_logged"] if row else 0) or 0
+        total_played = (row["total_played"] if row else 0) or 0
+        avg_rating = round(row["avg_rating"], 2) if row and row["avg_rating"] is not None else None
 
         # 3. Most popular game
         query_top_game = f"""
@@ -413,9 +476,8 @@ class Database:
             ORDER BY count DESC
             LIMIT 1;
         """
-        async with self._conn.execute(query_top_game, guild_member_ids) as cursor:
-            top_row = await cursor.fetchone()
-            top_game = f"{top_row['title']} ({top_row['count']} players)" if top_row else None
+        top_row = await self._fetchone(query_top_game, guild_member_ids)
+        top_game = f"{top_row['title']} ({top_row['count']} players)" if top_row else None
 
         return {
             "linked_members": linked_members,
@@ -436,36 +498,30 @@ class Database:
             VALUES (?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET feed_channel_id = excluded.feed_channel_id;
         """
-        await self._conn.execute(query, (guild_id, channel_id))
-        await self._conn.commit()
+        await self._execute(query, (guild_id, channel_id))
 
     async def unset_feed_channel(self, guild_id: int) -> bool:
         """Remove feed channel setting for a guild."""
-        async with self._conn.cursor() as cursor:
-            await cursor.execute("DELETE FROM guild_settings WHERE guild_id = ?;", (guild_id,))
-            await self._conn.commit()
-            return cursor.rowcount > 0
+        deleted = await self._rowcount_execute("DELETE FROM guild_settings WHERE guild_id = ?;", (guild_id,))
+        return deleted > 0
 
     async def get_feed_channel(self, guild_id: int) -> Optional[int]:
         """Get designated feed channel ID for a guild."""
-        async with self._conn.execute("SELECT feed_channel_id FROM guild_settings WHERE guild_id = ?;", (guild_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row["feed_channel_id"] if row else None
+        row = await self._fetchone("SELECT feed_channel_id FROM guild_settings WHERE guild_id = ?;", (guild_id,))
+        return row["feed_channel_id"] if row else None
 
-    async def get_all_guild_settings(self) -> List[aiosqlite.Row]:
+    async def get_all_guild_settings(self) -> List[Any]:
         """Retrieve all guilds with a configured feed channel."""
-        async with self._conn.execute("SELECT guild_id, feed_channel_id FROM guild_settings;") as cursor:
-            return await cursor.fetchall()
+        return await self._fetchall("SELECT guild_id, feed_channel_id FROM guild_settings;")
 
     async def is_journal_entry_seen(self, entry_id: str) -> bool:
         """Check if a playthrough journal entry was already recorded/posted."""
-        async with self._conn.execute("SELECT 1 FROM seen_journal_logs WHERE entry_id = ?;", (entry_id,)) as cursor:
-            return (await cursor.fetchone()) is not None
+        row = await self._fetchone("SELECT 1 FROM seen_journal_logs WHERE entry_id = ?;", (entry_id,))
+        return row is not None
 
     async def mark_journal_entry_seen(self, entry_id: str, discord_id: int) -> None:
         """Record a journal entry as seen to prevent duplicate posts."""
-        await self._conn.execute(
+        await self._execute(
             "INSERT OR IGNORE INTO seen_journal_logs (entry_id, discord_id) VALUES (?, ?);",
             (entry_id, discord_id)
         )
-        await self._conn.commit()

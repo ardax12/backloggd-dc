@@ -14,6 +14,8 @@ DEV_GUILD_ID = int(DEV_GUILD_ID_RAW) if DEV_GUILD_ID_RAW and DEV_GUILD_ID_RAW.is
 # Database
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATABASE_PATH = os.getenv("DATABASE_PATH", str(BASE_DIR / "data" / "backloggd.db"))
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 
 # Embed Colors (Backloggd Palette)
 COLOR_PRIMARY = 0x8E61F2    # Backloggd Violet
