@@ -24,16 +24,30 @@ class Database:
     ):
         self.db_path = db_path or DATABASE_PATH
         if turso_url is not None:
-            self.turso_url = turso_url.strip()
+            raw_url = turso_url.strip().strip("'\"")
         elif db_path is not None and db_path != DATABASE_PATH:
             # Custom db_path provided (e.g. test_db.db), do not default to cloud Turso
-            self.turso_url = ""
+            raw_url = ""
         else:
-            self.turso_url = TURSO_DATABASE_URL.strip()
+            raw_url = TURSO_DATABASE_URL.strip().strip("'\"")
+
+        # Normalize URL to HTTPS for reliable cloud API communication.
+        # Libsql WebSocket (hrana2) gets rejected by modern Turso cloud regions with HTTP 400,
+        # whereas Turso's HTTPS endpoint (/v1/execute) is fully supported and reliable.
+        if raw_url.startswith("libsql://"):
+            self.turso_url = "https://" + raw_url[len("libsql://"):].rstrip("/")
+        elif raw_url.startswith("wss://"):
+            self.turso_url = "https://" + raw_url[len("wss://"):].rstrip("/")
+        elif raw_url.startswith("ws://"):
+            self.turso_url = "http://" + raw_url[len("ws://"):].rstrip("/")
+        elif raw_url:
+            self.turso_url = raw_url.rstrip("/")
+        else:
+            self.turso_url = ""
 
         self.turso_token = (
             turso_token if turso_token is not None else TURSO_AUTH_TOKEN
-        ).strip()
+        ).strip().strip("'\"")
         self._conn: Optional[aiosqlite.Connection] = None
         self._client: Optional[libsql_client.Client] = None
 
