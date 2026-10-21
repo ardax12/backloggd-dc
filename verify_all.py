@@ -16,7 +16,8 @@ from bot.ui.embeds import (
     create_compare_embed,
     create_roulette_embed,
     create_server_top_embed,
-    create_server_stats_embed
+    create_server_stats_embed,
+    create_taste_twins_embed
 )
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.client import BackloggdBot
@@ -241,6 +242,26 @@ class VerificationSuite:
         assert "Sea of Stars" in feed_embed.title
         print("✅ Journal Feed Embed built successfully")
 
+        # 8. Taste Twins Embed
+        twins_data = [
+            {"username": "Kaelen", "match_pct": 86, "shared_count": 12, "top_fav": "Chrono Trigger"},
+            {"username": "Vesper", "match_pct": 74, "shared_count": 8, "top_fav": "Elden Ring"}
+        ]
+        nemesis_data = {"username": "GamerX", "match_pct": 32, "shared_count": 6, "top_disagree": "Hollow Knight", "delta": 3.0}
+        twins_embed = create_taste_twins_embed(
+            username="Nox",
+            avatar_url="https://example.com/nox.png",
+            guild_name="TestServer",
+            twins=twins_data,
+            nemesis=nemesis_data,
+            server_avg_match=80.0
+        )
+        assert "Nox's Server Taste Twins" in twins_embed.title
+        assert len(twins_embed.fields) == 2
+        assert any("Soulmates" in f.name and "Kaelen" in f.value for f in twins_embed.fields)
+        assert any("Nemesis" in f.name and "GamerX" in f.value for f in twins_embed.fields)
+        print("✅ Taste Twins Embed built successfully")
+
         # 8. Test Runtime Patches
         from bot.patches import patched_parse_user_profile_page, patched_parse_review_card
         from bs4 import BeautifulSoup
@@ -275,6 +296,14 @@ class VerificationSuite:
         await games_cog.game_autocomplete(mock_interaction, "zelda")
         assert len(games_cog._autocomplete_cache) <= 2, f"Cache not pruned: {len(games_cog._autocomplete_cache)}"
         print("✅ Games autocomplete cache pruning verified successfully!")
+
+        # Verify SocialCog commands
+        social_cog = bot.get_cog("Social")
+        assert social_cog is not None
+        social_commands = [cmd.name for cmd in social_cog.get_app_commands()]
+        assert "taste-twins" in social_commands, f"taste-twins missing: {social_commands}"
+        assert "compare" in social_commands, f"compare missing: {social_commands}"
+        print(f"✅ SocialCog commands verified: {social_commands}")
 
         await bot.close()
         print(f"✅ All {len(cogs)} Cogs verified active: {cogs}")

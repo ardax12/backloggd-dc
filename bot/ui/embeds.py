@@ -392,3 +392,58 @@ def create_server_stats_embed(stats: dict, guild_name: str) -> discord.Embed:
 
     embed.set_footer(text="Community aggregate data from linked Backloggd profiles")
     return embed
+
+
+def create_taste_twins_embed(
+    username: str,
+    avatar_url: Optional[str],
+    guild_name: str,
+    twins: List[dict],
+    nemesis: Optional[dict] = None,
+    server_avg_match: Optional[float] = None
+) -> discord.Embed:
+    """Construct embed for /taste-twins command displaying closest taste twins and nemesis."""
+    embed = discord.Embed(
+        title=f"👥 {username}'s Server Taste Twins",
+        url=build_backloggd_user_url(username),
+        color=COLOR_PLAYED if twins and twins[0]["match_pct"] >= 75 else COLOR_PRIMARY
+    )
+    clean_avatar = clean_image_url(avatar_url) or DEFAULT_BACKLOGGD_AVATAR
+    if clean_avatar:
+        embed.set_thumbnail(url=clean_avatar)
+
+    desc_lines = [f"Comparing gaming taste across **{guild_name}**."]
+    if server_avg_match is not None:
+        desc_lines.append(f"**Community Compatibility:** `{int(round(server_avg_match))}%` average agreement")
+    embed.description = "\n".join(desc_lines)
+
+    # 1. Top Taste Twins
+    if twins:
+        twin_lines = []
+        medals = ["🥇", "🥈", "🥉"]
+        for i, t in enumerate(twins[:3]):
+            medal = medals[i] if i < len(medals) else f"**#{i+1}**"
+            fav_text = f" — *Loved: {t['top_fav']}*" if t.get("top_fav") else ""
+            twin_lines.append(
+                f"{medal} **[{t['username']}](https://www.backloggd.com/u/{t['username']}/)** "
+                f"(`{t['match_pct']}%` match, {t['shared_count']} shared){fav_text}"
+            )
+        embed.add_field(name="✨ Top Taste Soulmates", value="\n".join(twin_lines), inline=False)
+    else:
+        embed.add_field(
+            name="✨ Top Taste Soulmates",
+            value="*Not enough library overlap with other members yet.*",
+            inline=False
+        )
+
+    # 2. Taste Nemesis
+    if nemesis:
+        nem_fav = f" — *Divergence on: {nemesis['top_disagree']}* (`Δ {nemesis['delta']:.1f}`)" if nemesis.get("top_disagree") else ""
+        nem_line = (
+            f"⚡ **[{nemesis['username']}](https://www.backloggd.com/u/{nemesis['username']}/)** "
+            f"(`{nemesis['match_pct']}%` match, {nemesis['shared_count']} shared){nem_fav}"
+        )
+        embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=nem_line, inline=False)
+
+    embed.set_footer(text="Based on Backloggd library ratings • Use /compare to duel with any member")
+    return embed

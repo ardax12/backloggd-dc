@@ -39,3 +39,23 @@ class RouletteView(View):
             return
 
         await self.on_reroll(interaction)
+
+
+class TasteTwinsView(View):
+    """Interactive view for /taste-twins with link button and quick Duel button."""
+    def __init__(
+        self,
+        user_url: str,
+        top_twin_name: Optional[str] = None,
+        on_compare: Optional[Callable[[discord.Interaction], Coroutine[Any, Any, None]]] = None
+    ):
+        super().__init__(timeout=180)
+        self.add_item(Button(label="View Profile on Backloggd", url=user_url, style=discord.ButtonStyle.link))
+        if top_twin_name and on_compare:
+            compare_btn = Button(
+                label=f"Duel with {top_twin_name}",
+                emoji="⚔️",
+                style=discord.ButtonStyle.primary
+            )
+            compare_btn.callback = on_compare
+            self.add_item(compare_btn)
