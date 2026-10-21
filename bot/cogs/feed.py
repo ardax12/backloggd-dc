@@ -8,6 +8,7 @@ import asyncio
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url
+from bot.activity_parser import parse_user_activity_page, ActivityEntry
 
 logger = logging.getLogger("backloggd.cogs.feed")
 
@@ -28,6 +29,29 @@ class FeedCog(commands.Cog, name="Feed"):
     # Channel Configuration Slash Commands (Admin Only)
     # =========================================================================
 
+
+    async def _fetch_user_activity_or_journal(self, username: str) -> list[Any]:
+        """Fetch latest game events from user's /activity/you/ stream, falling back to /journal/."""
+        # 1. Try personal activity stream (/activity/you/)
+        clean_user = username.strip()
+        url = f"https://backloggd.com/u/{clean_user}/activity/you/"
+        try:
+            resp = await self.bot.backloggd._request_with_retry("GET", url, resource_type="user")
+            self.bot.backloggd._check_response(resp, resource_type="user")
+            activities = parse_user_activity_page(resp.text, clean_user)
+            if activities:
+                return activities
+        except Exception as e:
+            logger.debug("Activity stream fetch failed for %s (%s), falling back to journal", username, e)
+
+        # 2. Fallback to /journal/
+        try:
+            journal = await self.bot.backloggd.get_user_journal(clean_user, max_pages=1)
+            return journal or []
+        except Exception as e:
+            logger.warning("Could not fetch journal or activity for %s: %s", username, e)
+            return []
+
     @app_commands.command(name="setchannel", description="Set the channel where automatic Backloggd playthrough logs are posted")
     @app_commands.describe(channel="The text channel for game log announcements")
     @app_commands.checks.has_permissions(manage_channels=True)
@@ -42,19 +66,15 @@ class FeedCog(commands.Cog, name="Feed"):
             discord_id = user_row["discord_id"]
             username = user_row["backloggd_username"]
             try:
-                entries = await self.bot.backloggd.get_user_journal(username, max_pages=1)
+                entries = await self._fetch_user_activity_or_journal(username)
+                e_ids = [getattr(e, "activity_id", None) or getattr(e, "entry_id", None) for e in entries]
                 await self.bot.db.seed_journal_entries_for_guild(
                     interaction.guild_id,
                     discord_id,
-                    [entry.entry_id for entry in entries if entry.entry_id],
+                    [eid for eid in e_ids if eid],
                 )
             except Exception as e:
-                logger.warning("Could not seed current journal for %s: %s", username, e)
-                await interaction.followup.send(
-                    f"Could not read **{username}**'s current journal, so the activity feed was left unchanged. Try `/setchannel` again shortly.",
-                    ephemeral=True,
-                )
-                return
+                logger.warning("Could not seed current activity for %s: %s", username, e)
 
         await self.bot.db.set_feed_channel(interaction.guild_id, channel.id)
         await interaction.followup.send(
@@ -132,38 +152,40 @@ class FeedCog(commands.Cog, name="Feed"):
                     avatar_url = user_row["avatar_url"]
 
                     try:
-                        # Fetch latest journal page (cached per loop iteration)
+                        # Fetch latest activity or journal page (cached per loop iteration)
                         if username not in user_journal_cache:
                             user_journal_cache[username] = (
-                                await self.bot.backloggd.get_user_journal(username, max_pages=1) or []
+                                await self._fetch_user_activity_or_journal(username)
                             )
-                        journal_entries = user_journal_cache[username]
-                        if not journal_entries:
+                        entries = user_journal_cache[username]
+                        if not entries:
                             continue
 
-                        for entry in journal_entries:
-                            if not entry.entry_id:
+                        for entry in entries:
+                            entry_id = getattr(entry, "activity_id", None) or getattr(entry, "entry_id", None)
+                            game_slug = getattr(entry, "game_slug", "")
+                            if not entry_id or not game_slug:
                                 continue
 
                             # Deduplication check
                             is_seen = await self.bot.db.is_journal_entry_delivered(
-                                guild_id, entry.entry_id
+                                guild_id, entry_id
                             )
                             if not is_seen:
                                 embed = create_journal_feed_embed(username, avatar_url, entry)
-                                view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(entry.game_slug))
+                                view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(game_slug))
 
                                 await channel.send(embed=embed, view=view)
                                 await self.bot.db.mark_journal_entry_delivered(
-                                    guild_id, entry.entry_id, discord_id
+                                    guild_id, entry_id, discord_id
                                 )
-                                logger.info("Posted journal log '%s' by %s to guild %d", entry.entry_id, username, guild_id)
+                                logger.info("Posted activity feed event '%s' by %s to guild %d", entry_id, username, guild_id)
 
                                 # Brief pause between posts to respect rate limits
                                 await asyncio.sleep(1.0)
 
                     except Exception as e:
-                        logger.warning("Error polling journal for %s: %s", username, e)
+                        logger.warning("Error polling activity for %s: %s", username, e)
 
                     # Pause between users to stay respectful to Backloggd servers
                     await asyncio.sleep(1.5)

@@ -240,10 +240,41 @@ class VerificationSuite:
         assert len(server_stats_embed.fields) == 5
         print("✅ Server Stats Embed built successfully")
 
-        # 7. Journal Feed Embed
+        # 7. Journal & Activity Feed Embed
         feed_embed = create_journal_feed_embed("Nox", "https://example.com/nox.png", DummyJournalEntry())
         assert "Sea of Stars" in feed_embed.title
-        print("✅ Journal Feed Embed built successfully")
+
+        # Test Activity Parser & Game-Only Filtering
+        from bot.activity_parser import parse_user_activity_page, ActivityEntry
+        mock_activity_html = '''
+        <div class="stream-container">
+            <div class="stream-entry" data-activity-id="act_1">
+                <a href="/games/elden-ring/"><img src="https://example.com/er.jpg" alt="Elden Ring"></a>
+                <div class="activity-text">
+                    <a href="/u/Nox/">Nox</a> completed <a href="/games/elden-ring/">Elden Ring</a>
+                    <div class="stars-top" style="width: 100%"></div>
+                    <span class="time-ago">1 hour ago</span>
+                </div>
+            </div>
+            <!-- Non-game badge event that must be discarded -->
+            <div class="stream-entry" data-activity-id="act_badge">
+                <a href="/badges/vip/"><img src="/vip.png"></a>
+                <div class="activity-text">Nox unlocked VIP badge</div>
+            </div>
+            <!-- Non-game follow event that must be discarded -->
+            <div class="stream-entry" data-activity-id="act_follow">
+                <div class="activity-text">Nox started following someone</div>
+            </div>
+        </div>
+        '''
+        parsed_activities = parse_user_activity_page(mock_activity_html, "Nox")
+        assert len(parsed_activities) == 1, f"Expected 1 game activity, got {len(parsed_activities)}"
+        assert parsed_activities[0].game_slug == "elden-ring"
+        assert parsed_activities[0].action_type == "completed"
+
+        act_embed = create_journal_feed_embed("Nox", "https://example.com/nox.png", parsed_activities[0])
+        assert "Nox completed Elden Ring" in act_embed.title
+        print("✅ Activity Feed & Parser verified successfully")
 
         # 8. All Ratings Embed
         dummy_ratings = [
