@@ -31,12 +31,12 @@ class SocialCog(commands.Cog, name="Social"):
 
     async def _get_or_fetch_ratings(self, username: str) -> Dict[str, Optional[float]]:
         """Fetch user's library ratings mapping (slug -> score)."""
-        # Try finding linked user in DB first
-        for row in await self.bot.db.get_all_linked_users():
-            if row["backloggd_username"].lower() == username.lower():
-                cached = await self.bot.db.get_user_ratings_dict(row["discord_id"])
-                if cached:
-                    return cached
+        # Fast indexed lookup in DB first (O(1) instead of scanning all users)
+        linked = await self.bot.db.get_linked_user_by_username(username)
+        if linked:
+            cached = await self.bot.db.get_user_ratings_dict(linked["discord_id"])
+            if cached:
+                return cached
 
         # Otherwise fetch library via backloggd-py
         lib = await self.bot.backloggd.get_user_library(username)
@@ -85,8 +85,11 @@ class SocialCog(commands.Cog, name="Social"):
             return
 
         try:
-            ratings1 = await self._get_or_fetch_ratings(u1_name)
-            ratings2 = await self._get_or_fetch_ratings(u2_name)
+            import asyncio
+            ratings1, ratings2 = await asyncio.gather(
+                self._get_or_fetch_ratings(u1_name),
+                self._get_or_fetch_ratings(u2_name)
+            )
 
             if not ratings1 or not ratings2:
                 empty_user = u1_name if not ratings1 else u2_name

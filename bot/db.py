@@ -180,6 +180,8 @@ class Database:
         await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_slug ON user_ratings(game_slug);")
         await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_user ON user_ratings(discord_id);")
         await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_status ON user_ratings(status);")
+        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_user_status ON user_ratings(discord_id, status);")
+        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_slug_user ON user_ratings(game_slug, discord_id);")
 
         # 4. Guild settings for automatic feed
         await self._execute("""
@@ -471,6 +473,27 @@ class Database:
         query = "SELECT game_slug, rating FROM user_ratings WHERE discord_id = ?;"
         rows = await self._fetchall(query, (discord_id,))
         return {row["game_slug"]: row["rating"] for row in rows}
+
+    async def get_multi_user_ratings_dict(self, discord_ids: List[int]) -> dict[int, dict[str, Optional[float]]]:
+        """Return discord_id -> {slug: rating} for multiple users in a single batch query (eliminating N+1)."""
+        if not discord_ids:
+            return {}
+        placeholders = ",".join("?" for _ in discord_ids)
+        query = f"SELECT discord_id, game_slug, rating FROM user_ratings WHERE discord_id IN ({placeholders});"
+        rows = await self._fetchall(query, discord_ids)
+        result: dict[int, dict[str, Optional[float]]] = {uid: {} for uid in discord_ids}
+        for row in rows:
+            result[row["discord_id"]][row["game_slug"]] = row["rating"]
+        return result
+
+    async def get_games_by_slugs(self, slugs: List[str]) -> dict[str, Any]:
+        """Fetch cached game records by slugs in a single batch query."""
+        if not slugs:
+            return {}
+        placeholders = ",".join("?" for _ in slugs)
+        query = f"SELECT slug, title, cover_url, release_year, community_rating FROM cached_games WHERE slug IN ({placeholders});"
+        rows = await self._fetchall(query, slugs)
+        return {row["slug"]: row for row in rows}
 
     # =========================================================================
     # Server Leaderboards & Statistics

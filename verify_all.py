@@ -164,6 +164,17 @@ class VerificationSuite:
         await self.db.mark_journal_entry_seen("log_abc_123", 1001)
         assert await self.db.is_journal_entry_seen("log_abc_123")
 
+        # Test batch ratings lookup (N+1 optimization)
+        batch_ratings = await self.db.get_multi_user_ratings_dict([1001, 1002, 1003])
+        assert 1001 in batch_ratings and "elden-ring" in batch_ratings[1001]
+        assert batch_ratings[1001]["elden-ring"] == 5.0
+        assert batch_ratings[1002]["hollow-knight"] == 2.0
+
+        # Test batch game metadata lookup
+        games_batch = await self.db.get_games_by_slugs(["elden-ring", "chrono-trigger"])
+        assert "elden-ring" in games_batch and games_batch["elden-ring"]["title"] == "Elden Ring"
+        assert "chrono-trigger" in games_batch and games_batch["chrono-trigger"]["title"] == "Chrono Trigger"
+
         await self.db.close()
         assert not self.db.is_connected, "Database should report disconnected after close()"
 

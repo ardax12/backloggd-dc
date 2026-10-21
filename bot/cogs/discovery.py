@@ -116,12 +116,15 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
             return
 
-        # Calculate taste match with each server member
+        # Batch fetch ratings for all candidate server members in 1 single query (fixes N+1)
+        other_ids = [other["discord_id"] for other in other_linked]
+        all_other_ratings = await self.bot.db.get_multi_user_ratings_dict(other_ids)
+
         taste_matches = []
         for other in other_linked:
             other_id = other["discord_id"]
             other_username = other["backloggd_username"]
-            other_ratings = await self.bot.db.get_user_ratings_dict(other_id)
+            other_ratings = all_other_ratings.get(other_id, {})
 
             if len(other_ratings) < 5:
                 continue
@@ -143,21 +146,31 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         my_slugs = set(my_ratings.keys())
         recommendations = []
 
+        raw_candidates = []
         for other_id, other_name, match_score, other_ratings in taste_matches:
             match_pct = int(round(match_score))
             for slug, rating in other_ratings.items():
                 if rating is not None and rating >= 4.0 and slug not in my_slugs:
-                    recommendations.append({
-                        "slug": slug,
-                        "title": slug.replace("-", " ").title(),
-                        "rating": rating,
-                        "recommender": other_name,
-                        "match_pct": match_pct
-                    })
-                if len(recommendations) >= 5:
-                    break
-            if len(recommendations) >= 5:
+                    raw_candidates.append((slug, rating, other_name, match_pct))
+                    if len(raw_candidates) >= 5:
+                        break
+            if len(raw_candidates) >= 5:
                 break
+
+        # Batch resolve authentic game titles from cache
+        cand_slugs = [c[0] for c in raw_candidates]
+        cached_meta = await self.bot.db.get_games_by_slugs(cand_slugs) if cand_slugs else {}
+
+        for slug, rating, other_name, match_pct in raw_candidates:
+            meta = cached_meta.get(slug)
+            title = meta["title"] if meta and meta["title"] else slug.replace("-", " ").title()
+            recommendations.append({
+                "slug": slug,
+                "title": title,
+                "rating": rating,
+                "recommender": other_name,
+                "match_pct": match_pct
+            })
 
         if not recommendations:
             await interaction.followup.send(
