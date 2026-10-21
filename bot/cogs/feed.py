@@ -101,6 +101,9 @@ class FeedCog(commands.Cog, name="Feed"):
             if not guild_settings:
                 return
 
+            # Per-tick journal cache to avoid duplicate HTTP requests across multiple guilds
+            user_journal_cache: dict[str, list] = {}
+
             for setting in guild_settings:
                 guild_id = setting["guild_id"]
                 channel_id = setting["feed_channel_id"]
@@ -129,8 +132,12 @@ class FeedCog(commands.Cog, name="Feed"):
                     avatar_url = user_row["avatar_url"]
 
                     try:
-                        # Fetch latest journal page (lightweight 1 HTTP request)
-                        journal_entries = await self.bot.backloggd.get_user_journal(username, max_pages=1)
+                        # Fetch latest journal page (cached per loop iteration)
+                        if username not in user_journal_cache:
+                            user_journal_cache[username] = (
+                                await self.bot.backloggd.get_user_journal(username, max_pages=1) or []
+                            )
+                        journal_entries = user_journal_cache[username]
                         if not journal_entries:
                             continue
 

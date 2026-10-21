@@ -180,14 +180,14 @@ class AccountCog(commands.Cog, name="Account"):
             total_synced = await task
         except asyncio.CancelledError:
             await interaction.followup.send(
-                "âŒ This refresh was superseded by a newer account sync. Please try again.",
+                "❌ This refresh was superseded by a newer account sync. Please try again.",
                 ephemeral=True,
             )
             return
 
         if total_synced is None:
             await interaction.followup.send(
-                f"âŒ Could not refresh **{username}**. The previous cached library was kept; try again shortly.",
+                f"❌ Could not refresh **{username}**. The previous cached library was kept; try again shortly.",
                 ephemeral=True,
             )
             return

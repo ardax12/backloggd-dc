@@ -31,6 +31,10 @@ class GamesCog(commands.Cog, name="Games"):
         if clean_query.lower() in self._autocomplete_cache:
             return self._autocomplete_cache[clean_query.lower()]
 
+        # Prevent unbounded memory growth by pruning cache if it grows too large
+        if len(self._autocomplete_cache) > 500:
+            self._autocomplete_cache.clear()
+
         try:
             results = await self.bot.backloggd.search_games(clean_query)
             choices = []

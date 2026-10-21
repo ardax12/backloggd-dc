@@ -90,7 +90,9 @@ class VerificationSuite:
         print("\n=== [2] Testing SQLite Schema & Operations ===")
         if os.path.exists(TEST_DB_PATH):
             os.remove(TEST_DB_PATH)
+        assert not self.db.is_connected, "Database should report disconnected before connect()"
         await self.db.connect()
+        assert self.db.is_connected, "Database should report connected after connect()"
 
         # Link users
         await self.db.link_user(discord_id=1001, username="Nox", avatar_url="https://example.com/nox.png")
@@ -163,9 +165,21 @@ class VerificationSuite:
         assert await self.db.is_journal_entry_seen("log_abc_123")
 
         await self.db.close()
+        assert not self.db.is_connected, "Database should report disconnected after close()"
+
+        # Verify Turso is_connected detection with closed/active states
+        turso_test_db = Database(turso_url="libsql://dummy.turso.io", turso_token="dummy")
+        assert not turso_test_db.is_connected
+        class DummyTursoClient:
+            closed = False
+        turso_test_db._client = DummyTursoClient()
+        assert turso_test_db.is_connected, "Should be connected when Turso client is open"
+        turso_test_db._client.closed = True
+        assert not turso_test_db.is_connected, "Should be disconnected when Turso client closed=True"
+
         if os.path.exists(TEST_DB_PATH):
             os.remove(TEST_DB_PATH)
-        print("✅ SQLite database operations verified successfully!")
+        print("✅ Database operations and lifecycle state verified successfully!")
 
         print("\n=== [3] Testing Embed Constructors ===")
         # 1. Game Embed
@@ -238,6 +252,19 @@ class VerificationSuite:
         cogs = list(bot.cogs.keys())
         expected_cogs = ['Account', 'Games', 'Users', 'Social', 'Discovery', 'Stats', 'Feed']
         assert all(c in cogs for c in expected_cogs), f"Missing cogs! Got: {cogs}"
+        # Verify GamesCog autocomplete pruning
+        games_cog = bot.get_cog("Games")
+        assert games_cog is not None
+        for i in range(505):
+            games_cog._autocomplete_cache[f"query_{i}"] = []
+        assert len(games_cog._autocomplete_cache) == 505
+        # Simulate interaction
+        from unittest.mock import MagicMock
+        mock_interaction = MagicMock()
+        await games_cog.game_autocomplete(mock_interaction, "zelda")
+        assert len(games_cog._autocomplete_cache) <= 2, f"Cache not pruned: {len(games_cog._autocomplete_cache)}"
+        print("✅ Games autocomplete cache pruning verified successfully!")
+
         await bot.close()
         print(f"✅ All {len(cogs)} Cogs verified active: {cogs}")
 

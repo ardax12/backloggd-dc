@@ -80,7 +80,8 @@ class Database:
     def is_connected(self) -> bool:
         """Check if database connection is active."""
         if self.is_turso:
-            return self._client is not None and not getattr(self._client, "_closed", False)
+            is_closed = getattr(self._client, "closed", getattr(self._client, "_closed", False))
+            return self._client is not None and not is_closed
         return self._conn is not None and getattr(self._conn, "_running", False)
 
     async def close(self) -> None:
