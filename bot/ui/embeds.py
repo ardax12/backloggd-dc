@@ -83,17 +83,25 @@ def create_game_embed(
     # Server Member Ratings Field
     if server_ratings:
         server_lines = []
-        for r in server_ratings[:8]:  # Show top 8
+        display_limit = 12  # Display up to 12 server members cleanly
+        for r in server_ratings[:display_limit]:
             username = r["backloggd_username"]
-            status_str = format_status(r["status"])
+            raw_status = str(r["status"]).lower().strip()
             if r["rating"] is not None:
                 stars = rating_to_stars(r["rating"])
-                server_lines.append(f"• **{username}**: {stars} (`{r['rating']:.1f}`) — {status_str}")
+                # If status is unknown/played, keep it concise without redundant '- Unknown'
+                if raw_status in ("unknown", "played", "none", ""):
+                    server_lines.append(f"• **{username}**: {stars} (`{r['rating']:.1f}`)")
+                else:
+                    status_str = format_status(r["status"])
+                    server_lines.append(f"• **{username}**: {stars} (`{r['rating']:.1f}`) — {status_str}")
             else:
+                status_str = format_status(r["status"])
                 server_lines.append(f"• **{username}**: {status_str}")
 
-        if len(server_ratings) > 8:
-            server_lines.append(f"*+ {len(server_ratings) - 8} more server members*")
+        if len(server_ratings) > display_limit:
+            remaining = len(server_ratings) - display_limit
+            server_lines.append(f"*+ {remaining} more members (click 'View All Ratings' below)*")
 
         field_name = f"👥 {guild_name} Ratings ({len(server_ratings)})"
         embed.add_field(name=field_name, value="\n".join(server_lines), inline=False)
@@ -446,4 +454,48 @@ def create_taste_twins_embed(
         embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=nem_line, inline=False)
 
     embed.set_footer(text="Based on Backloggd library ratings • Use /compare to duel with any member")
+    return embed
+
+
+def create_all_ratings_embed(
+    game_title: str,
+    game_slug: str,
+    guild_name: str,
+    server_ratings: List[Any],
+    page: int = 1,
+    per_page: int = 15
+) -> discord.Embed:
+    """Construct a paginated modal/embed showing all server members who logged/rated a game."""
+    total_ratings = len(server_ratings)
+    total_pages = max(1, (total_ratings + per_page - 1) // per_page)
+    current_page = max(1, min(page, total_pages))
+
+    start_idx = (current_page - 1) * per_page
+    end_idx = start_idx + per_page
+    slice_ratings = server_ratings[start_idx:end_idx]
+
+    embed = discord.Embed(
+        title=f"👥 {game_title} — All {guild_name} Ratings",
+        url=build_backloggd_game_url(game_slug),
+        description=f"Showing **{start_idx + 1}–{min(end_idx, total_ratings)}** of **{total_ratings}** members who logged this game:\n",
+        color=COLOR_PRIMARY
+    )
+
+    lines = []
+    for r in slice_ratings:
+        username = r["backloggd_username"]
+        raw_status = str(r["status"]).lower().strip()
+        if r["rating"] is not None:
+            stars = rating_to_stars(r["rating"])
+            if raw_status in ("unknown", "played", "none", ""):
+                lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {stars} (`{r['rating']:.1f}`)")
+            else:
+                status_str = format_status(r["status"])
+                lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {stars} (`{r['rating']:.1f}`) — {status_str}")
+        else:
+            status_str = format_status(r["status"])
+            lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {status_str}")
+
+    embed.add_field(name="Member Ratings & Status", value="\n".join(lines) if lines else "*No ratings*", inline=False)
+    embed.set_footer(text=f"Page {current_page} of {total_pages} • Backloggd Discord Bot")
     return embed

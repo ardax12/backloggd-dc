@@ -59,3 +59,23 @@ class TasteTwinsView(View):
             )
             compare_btn.callback = on_compare
             self.add_item(compare_btn)
+
+
+class GameCardView(View):
+    """Interactive view for /game command with Backloggd link and optional 'View All Ratings' button."""
+    def __init__(
+        self,
+        game_url: str,
+        total_ratings: int,
+        on_view_all: Optional[Callable[[discord.Interaction], Coroutine[Any, Any, None]]] = None
+    ):
+        super().__init__(timeout=180)
+        self.add_item(Button(label="View on Backloggd", url=game_url, style=discord.ButtonStyle.link))
+        if total_ratings > 12 and on_view_all:
+            view_all_btn = Button(
+                label=f"View All Ratings ({total_ratings})",
+                emoji="👥",
+                style=discord.ButtonStyle.secondary
+            )
+            view_all_btn.callback = on_view_all
+            self.add_item(view_all_btn)

@@ -5,8 +5,8 @@ from discord import app_commands
 from discord.ext import commands
 import logging
 from typing import List
-from bot.ui.embeds import create_game_embed
-from bot.ui.views import LinkButtonView
+from bot.ui.embeds import create_game_embed, create_all_ratings_embed
+from bot.ui.views import LinkButtonView, GameCardView
 from bot.ui.helpers import build_backloggd_game_url
 
 logger = logging.getLogger("backloggd.cogs.games")
@@ -94,7 +94,22 @@ class GamesCog(commands.Cog, name="Games"):
 
             guild_name = interaction.guild.name if interaction.guild else "Server"
             embed = create_game_embed(game_data, server_ratings, guild_name=guild_name)
-            view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(game_data.slug))
+            game_url = build_backloggd_game_url(game_data.slug)
+
+            async def on_view_all(btn_interaction: discord.Interaction):
+                all_ratings_embed = create_all_ratings_embed(
+                    game_title=game_data.title,
+                    game_slug=game_data.slug,
+                    guild_name=guild_name,
+                    server_ratings=server_ratings
+                )
+                await btn_interaction.response.send_message(embed=all_ratings_embed, ephemeral=True)
+
+            view = GameCardView(
+                game_url=game_url,
+                total_ratings=len(server_ratings),
+                on_view_all=on_view_all if len(server_ratings) > 12 else None
+            )
 
             await interaction.followup.send(embed=embed, view=view)
 

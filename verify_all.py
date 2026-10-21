@@ -17,7 +17,8 @@ from bot.ui.embeds import (
     create_roulette_embed,
     create_server_top_embed,
     create_server_stats_embed,
-    create_taste_twins_embed
+    create_taste_twins_embed,
+    create_all_ratings_embed
 )
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.client import BackloggdBot
@@ -86,6 +87,8 @@ class VerificationSuite:
         assert format_number(1500000) == "1.5M", f"Expected '1.5M', got {format_number(1500000)}"
         assert format_status("played") == "🎮 Played"
         assert format_status("backlog") == "⏳ Backlog"
+        assert format_status("unknown") == "🎮 Played"
+        assert format_status(None) == "🎮 Played"
         print("✅ Helpers & formatters passed!")
 
         print("\n=== [2] Testing SQLite Schema & Operations ===")
@@ -242,7 +245,17 @@ class VerificationSuite:
         assert "Sea of Stars" in feed_embed.title
         print("✅ Journal Feed Embed built successfully")
 
-        # 8. Taste Twins Embed
+        # 8. All Ratings Embed
+        dummy_ratings = [
+            {"backloggd_username": f"User_{i}", "rating": 4.5 if i % 2 == 0 else None, "status": "played" if i % 3 == 0 else "unknown"}
+            for i in range(1, 20)
+        ]
+        all_ratings_emb = create_all_ratings_embed("Elden Ring", "elden-ring", "TestServer", dummy_ratings, page=1, per_page=15)
+        assert "All TestServer Ratings" in all_ratings_emb.title
+        assert len(all_ratings_emb.fields) == 1
+        print("✅ All Ratings Embed built successfully")
+
+        # 9. Taste Twins Embed
         twins_data = [
             {"username": "Kaelen", "match_pct": 86, "shared_count": 12, "top_fav": "Chrono Trigger"},
             {"username": "Vesper", "match_pct": 74, "shared_count": 8, "top_fav": "Elden Ring"}
