@@ -13,38 +13,54 @@ logger = logging.getLogger("backloggd.cogs.account")
 class AccountCog(commands.Cog, name="Account"):
     def __init__(self, bot):
         self.bot = bot
+        self._sync_tasks: dict[int, asyncio.Task] = {}
 
-    async def _sync_user_library(self, discord_id: int, username: str) -> int:
-        """Fetch full user library from Backloggd and sync games & ratings to SQLite."""
+    def cog_unload(self) -> None:
+        for task in self._sync_tasks.values():
+            task.cancel()
+        self._sync_tasks.clear()
+
+    def _start_sync_task(self, discord_id: int, username: str) -> asyncio.Task:
+        """Keep only the newest library sync active for each Discord account."""
+        previous = self._sync_tasks.get(discord_id)
+        if previous and not previous.done():
+            previous.cancel()
+
+        task = asyncio.create_task(self._sync_user_library(discord_id, username))
+        self._sync_tasks[discord_id] = task
+
+        def clear_task(completed: asyncio.Task) -> None:
+            if self._sync_tasks.get(discord_id) is completed:
+                self._sync_tasks.pop(discord_id, None)
+
+        task.add_done_callback(clear_task)
+        return task
+
+    def _cancel_sync_task(self, discord_id: int) -> None:
+        task = self._sync_tasks.pop(discord_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _sync_user_library(self, discord_id: int, username: str) -> Optional[int]:
+        """Fetch and atomically replace the linked user's cached library."""
         try:
-            profile = await self.bot.backloggd.get_user_profile(username, force_refresh=True)
-            avatar_url = profile.avatar_url if profile else None
-            await self.bot.db.link_user(discord_id, username, avatar_url)
-
-            # Fetch library (all pages)
             library = await self.bot.backloggd.get_user_library(username, force_refresh=True)
-            
-            # Save games & ratings in SQLite
-            for game in library:
-                await self.bot.db.upsert_game(
-                    slug=game.slug,
-                    title=game.title,
-                    cover_url=game.cover_url
-                )
-                await self.bot.db.upsert_user_rating(
-                    discord_id=discord_id,
-                    game_slug=game.slug,
-                    rating=game.rating,
-                    status=game.status.value if hasattr(game.status, "value") else str(game.status),
-                    is_liked=game.is_liked
-                )
+            replaced = await self.bot.db.replace_user_library(
+                discord_id, username, library
+            )
+            if not replaced:
+                logger.info("Discarded stale library sync for %s (%d)", username, discord_id)
+                return None
 
-            # Seed journal logs to avoid spamming past logs on auto feed
+            # Seed current journal entries for feeds this member belongs to.
             try:
                 journal = await self.bot.backloggd.get_user_journal(username, max_pages=1)
-                for entry in journal:
-                    if entry.entry_id:
-                        await self.bot.db.mark_journal_entry_seen(entry.entry_id, discord_id)
+                entry_ids = [entry.entry_id for entry in journal if entry.entry_id]
+                for guild in self.bot.guilds:
+                    if guild.get_member(discord_id) and await self.bot.db.get_feed_channel(guild.id):
+                        await self.bot.db.seed_journal_entries_for_guild(
+                            guild.id, discord_id, entry_ids
+                        )
             except Exception as e:
                 logger.warning("Failed to seed journal logs for %s: %s", username, e)
 
@@ -52,7 +68,7 @@ class AccountCog(commands.Cog, name="Account"):
             return len(library)
         except Exception as e:
             logger.error("Error syncing library for %s: %s", username, e, exc_info=True)
-            return 0
+            return None
 
     @app_commands.command(name="link", description="Link your Discord account to your Backloggd username")
     @app_commands.describe(username="Your Backloggd username (e.g. Gamer123)")
@@ -96,11 +112,12 @@ class AccountCog(commands.Cog, name="Account"):
 
         await interaction.followup.send(embed=embed)
 
-        # Background sync
-        asyncio.create_task(self._sync_user_library(interaction.user.id, profile.username))
+        # Background sync. An older in-flight sync cannot write after a relink.
+        self._start_sync_task(interaction.user.id, profile.username)
 
     @app_commands.command(name="unlink", description="Unlink your Backloggd account from Discord")
     async def unlink(self, interaction: discord.Interaction):
+        self._cancel_sync_task(interaction.user.id)
         success = await self.bot.db.unlink_user(interaction.user.id)
         if success:
             await interaction.response.send_message(
@@ -130,7 +147,22 @@ class AccountCog(commands.Cog, name="Account"):
             return
 
         username = linked["backloggd_username"]
-        total_synced = await self._sync_user_library(target_discord_id, username)
+        task = self._start_sync_task(target_discord_id, username)
+        try:
+            total_synced = await task
+        except asyncio.CancelledError:
+            await interaction.followup.send(
+                "âŒ This refresh was superseded by a newer account sync. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        if total_synced is None:
+            await interaction.followup.send(
+                f"âŒ Could not refresh **{username}**. The previous cached library was kept; try again shortly.",
+                ephemeral=True,
+            )
+            return
 
         embed = discord.Embed(
             title="🔄 Library Refreshed!",

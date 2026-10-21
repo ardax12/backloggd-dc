@@ -32,8 +32,32 @@ class FeedCog(commands.Cog, name="Feed"):
     @app_commands.describe(channel="The text channel for game log announcements")
     @app_commands.checks.has_permissions(manage_channels=True)
     async def setchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await interaction.response.defer(ephemeral=True)
+
+        # Seed each linked member's current journal before enabling the feed,
+        # so setup does not publish existing history as new activity.
+        member_ids = [member.id for member in interaction.guild.members]
+        linked_members = await self.bot.db.get_guild_linked_users(member_ids)
+        for user_row in linked_members:
+            discord_id = user_row["discord_id"]
+            username = user_row["backloggd_username"]
+            try:
+                entries = await self.bot.backloggd.get_user_journal(username, max_pages=1)
+                await self.bot.db.seed_journal_entries_for_guild(
+                    interaction.guild_id,
+                    discord_id,
+                    [entry.entry_id for entry in entries if entry.entry_id],
+                )
+            except Exception as e:
+                logger.warning("Could not seed current journal for %s: %s", username, e)
+                await interaction.followup.send(
+                    f"Could not read **{username}**'s current journal, so the activity feed was left unchanged. Try `/setchannel` again shortly.",
+                    ephemeral=True,
+                )
+                return
+
         await self.bot.db.set_feed_channel(interaction.guild_id, channel.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Successfully set {channel.mention} as the automatic Backloggd activity feed channel!",
             ephemeral=True
         )
@@ -115,15 +139,17 @@ class FeedCog(commands.Cog, name="Feed"):
                                 continue
 
                             # Deduplication check
-                            is_seen = await self.bot.db.is_journal_entry_seen(entry.entry_id)
+                            is_seen = await self.bot.db.is_journal_entry_delivered(
+                                guild_id, entry.entry_id
+                            )
                             if not is_seen:
-                                # New entry found!
-                                await self.bot.db.mark_journal_entry_seen(entry.entry_id, discord_id)
-
                                 embed = create_journal_feed_embed(username, avatar_url, entry)
                                 view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(entry.game_slug))
-                                
+
                                 await channel.send(embed=embed, view=view)
+                                await self.bot.db.mark_journal_entry_delivered(
+                                    guild_id, entry.entry_id, discord_id
+                                )
                                 logger.info("Posted journal log '%s' by %s to guild %d", entry.entry_id, username, guild_id)
 
                                 # Brief pause between posts to respect rate limits

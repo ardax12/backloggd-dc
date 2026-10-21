@@ -4,8 +4,9 @@ Supports both local SQLite (aiosqlite) and Turso / libSQL Cloud Database (libsql
 """
 
 import logging
+import asyncio
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import aiosqlite
 import libsql_client
@@ -50,6 +51,7 @@ class Database:
         ).strip().strip("'\"")
         self._conn: Optional[aiosqlite.Connection] = None
         self._client: Optional[libsql_client.Client] = None
+        self._operation_lock = asyncio.Lock()
 
     @property
     def is_turso(self) -> bool:
@@ -83,14 +85,15 @@ class Database:
 
     async def close(self) -> None:
         """Close active database connection."""
-        if self._client:
-            await self._client.close()
-            self._client = None
-            logger.info("Closed Turso client connection.")
-        if self._conn:
-            await self._conn.close()
-            self._conn = None
-            logger.info("Closed SQLite connection.")
+        async with self._operation_lock:
+            if self._client:
+                await self._client.close()
+                self._client = None
+                logger.info("Closed Turso client connection.")
+            if self._conn:
+                await self._conn.close()
+                self._conn = None
+                logger.info("Closed SQLite connection.")
 
     # =========================================================================
     # Internal Query Helpers (Unified backend abstraction)
@@ -98,36 +101,37 @@ class Database:
 
     async def _execute(self, query: str, params: tuple | list = ()) -> None:
         """Execute a write statement (INSERT/UPDATE/CREATE/DELETE)."""
-        if self.is_turso:
-            await self._client.execute(query, list(params))
-        else:
-            await self._conn.execute(query, params)
-            await self._conn.commit()
+        async with self._operation_lock:
+            if self.is_turso:
+                await self._client.execute(query, list(params))
+            else:
+                await self._conn.execute(query, params)
+                await self._conn.commit()
 
     async def _fetchone(self, query: str, params: tuple | list = ()) -> Optional[Any]:
         """Fetch a single row."""
-        if self.is_turso:
-            rs = await self._client.execute(query, list(params))
-            return rs.rows[0] if rs.rows else None
-        else:
+        async with self._operation_lock:
+            if self.is_turso:
+                rs = await self._client.execute(query, list(params))
+                return rs.rows[0] if rs.rows else None
             async with self._conn.execute(query, params) as cursor:
                 return await cursor.fetchone()
 
     async def _fetchall(self, query: str, params: tuple | list = ()) -> List[Any]:
         """Fetch all rows."""
-        if self.is_turso:
-            rs = await self._client.execute(query, list(params))
-            return list(rs.rows)
-        else:
+        async with self._operation_lock:
+            if self.is_turso:
+                rs = await self._client.execute(query, list(params))
+                return list(rs.rows)
             async with self._conn.execute(query, params) as cursor:
                 return await cursor.fetchall()
 
     async def _rowcount_execute(self, query: str, params: tuple | list = ()) -> int:
         """Execute a write statement and return affected rows count."""
-        if self.is_turso:
-            rs = await self._client.execute(query, list(params))
-            return rs.rows_affected
-        else:
+        async with self._operation_lock:
+            if self.is_turso:
+                rs = await self._client.execute(query, list(params))
+                return rs.rows_affected
             async with self._conn.cursor() as cursor:
                 await cursor.execute(query, params)
                 await self._conn.commit()
@@ -191,6 +195,25 @@ class Database:
                 discord_id INTEGER NOT NULL,
                 posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        """)
+
+        # Delivery state is per guild. Migrate old global seen markers to all
+        # currently configured feeds so deployment does not replay old entries.
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS seen_journal_deliveries (
+                guild_id INTEGER NOT NULL,
+                entry_id TEXT NOT NULL,
+                discord_id INTEGER NOT NULL,
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, entry_id)
+            );
+        """)
+        await self._execute("""
+            INSERT OR IGNORE INTO seen_journal_deliveries
+                (guild_id, entry_id, discord_id, posted_at)
+            SELECT gs.guild_id, old.entry_id, old.discord_id, old.posted_at
+            FROM seen_journal_logs AS old
+            CROSS JOIN guild_settings AS gs;
         """)
 
     # =========================================================================
@@ -342,6 +365,105 @@ class Database:
             WHERE r.discord_id = ? AND r.status = 'backlog';
         """
         return await self._fetchall(query, (discord_id,))
+
+    async def replace_user_library(
+        self,
+        discord_id: int,
+        expected_username: str,
+        games: Iterable[Any],
+    ) -> bool:
+        """Atomically replace a user's ratings if the linked account still matches."""
+        from bot.ui.helpers import clean_image_url
+
+        game_rows = [
+            (
+                game.slug,
+                game.title,
+                clean_image_url(getattr(game, "cover_url", None)),
+                getattr(game, "release_year", None),
+                getattr(game, "community_rating", None),
+                discord_id,
+                getattr(game, "rating", None),
+                game.status.value if hasattr(game.status, "value") else str(game.status),
+                bool(getattr(game, "is_liked", False)),
+            )
+            for game in games
+        ]
+        ownership_sql = """SELECT 1 FROM linked_users
+            WHERE discord_id = ? AND LOWER(backloggd_username) = LOWER(?)"""
+
+        async with self._operation_lock:
+            if self.is_turso:
+                statements = [(ownership_sql, (discord_id, expected_username))]
+                statements.append(("""
+                    UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
+                    WHERE discord_id = ? AND LOWER(backloggd_username) = LOWER(?)
+                """, (discord_id, expected_username)))
+                for row in game_rows:
+                    statements.append(("""
+                        INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(slug) DO UPDATE SET
+                            title = excluded.title,
+                            cover_url = COALESCE(excluded.cover_url, cached_games.cover_url),
+                            release_year = COALESCE(excluded.release_year, cached_games.release_year),
+                            community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
+                    """, row[:5]))
+                statements.append((f"""
+                    DELETE FROM user_ratings
+                    WHERE discord_id = ? AND EXISTS ({ownership_sql})
+                """, (discord_id, discord_id, expected_username)))
+                for row in game_rows:
+                    statements.append((f"""
+                        INSERT INTO user_ratings
+                            (discord_id, game_slug, rating, status, is_liked, updated_at)
+                        SELECT ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+                        WHERE EXISTS ({ownership_sql})
+                        ON CONFLICT(discord_id, game_slug) DO UPDATE SET
+                            rating = excluded.rating,
+                            status = excluded.status,
+                            is_liked = excluded.is_liked,
+                            updated_at = CURRENT_TIMESTAMP
+                    """, (row[5], row[0], row[6], row[7], row[8], discord_id, expected_username)))
+                results = await self._client.batch(statements)
+                return bool(results and results[0].rows)
+
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                async with self._conn.execute(ownership_sql, (discord_id, expected_username)) as cursor:
+                    still_linked = await cursor.fetchone()
+                if not still_linked:
+                    await self._conn.rollback()
+                    return False
+
+                await self._conn.execute("""
+                    UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
+                    WHERE discord_id = ? AND LOWER(backloggd_username) = LOWER(?)
+                """, (discord_id, expected_username))
+                for row in game_rows:
+                    await self._conn.execute("""
+                        INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(slug) DO UPDATE SET
+                            title = excluded.title,
+                            cover_url = COALESCE(excluded.cover_url, cached_games.cover_url),
+                            release_year = COALESCE(excluded.release_year, cached_games.release_year),
+                            community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
+                    """, row[:5])
+                await self._conn.execute(
+                    "DELETE FROM user_ratings WHERE discord_id = ?;", (discord_id,)
+                )
+                for row in game_rows:
+                    await self._conn.execute("""
+                        INSERT INTO user_ratings
+                            (discord_id, game_slug, rating, status, is_liked, updated_at)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (row[5], row[0], row[6], row[7], row[8]))
+                await self._conn.commit()
+                return True
+            except BaseException:
+                await self._conn.rollback()
+                raise
 
     async def get_user_ratings_dict(self, discord_id: int) -> dict[str, Optional[float]]:
         """Return slug -> rating dictionary for similarity computation."""
@@ -543,3 +665,29 @@ class Database:
             "INSERT OR IGNORE INTO seen_journal_logs (entry_id, discord_id) VALUES (?, ?);",
             (entry_id, discord_id)
         )
+
+    async def is_journal_entry_delivered(self, guild_id: int, entry_id: str) -> bool:
+        """Check whether an entry was delivered to a particular guild feed."""
+        row = await self._fetchone(
+            "SELECT 1 FROM seen_journal_deliveries WHERE guild_id = ? AND entry_id = ?;",
+            (guild_id, entry_id),
+        )
+        return row is not None
+
+    async def mark_journal_entry_delivered(
+        self, guild_id: int, entry_id: str, discord_id: int
+    ) -> None:
+        """Record a journal entry only after its guild feed send succeeds."""
+        await self._execute(
+            """INSERT OR IGNORE INTO seen_journal_deliveries
+                (guild_id, entry_id, discord_id) VALUES (?, ?, ?);""",
+            (guild_id, entry_id, discord_id),
+        )
+
+    async def seed_journal_entries_for_guild(
+        self, guild_id: int, discord_id: int, entry_ids: Iterable[str]
+    ) -> None:
+        """Mark current journal entries as already present when a feed is enabled."""
+        for entry_id in set(entry_ids):
+            if entry_id:
+                await self.mark_journal_entry_delivered(guild_id, entry_id, discord_id)
