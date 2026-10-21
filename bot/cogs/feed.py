@@ -5,6 +5,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import logging
 import asyncio
+from typing import Any, List, Optional
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url
