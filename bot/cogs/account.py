@@ -76,6 +76,34 @@ class AccountCog(commands.Cog, name="Account"):
         await interaction.response.defer()
 
         clean_user = username.strip().lstrip("@")
+
+        # 1. Check if the user is already linked to an account
+        existing_link = await self.bot.db.get_linked_user(interaction.user.id)
+        if existing_link:
+            linked_name = existing_link["backloggd_username"]
+            if linked_name.lower() == clean_user.lower():
+                await interaction.followup.send(
+                    f"ℹ️ You are already linked to Backloggd user **[{linked_name}](https://www.backloggd.com/u/{linked_name}/)**.\n"
+                    f"If you want to sync your latest games and ratings, use `/refresh`.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"⚠️ You are currently linked to Backloggd user **[{linked_name}](https://www.backloggd.com/u/{linked_name}/)**.\n"
+                    f"Please run `/unlink` first before linking a different account.",
+                    ephemeral=True
+                )
+            return
+
+        # 2. Check if the Backloggd account is already claimed by another Discord user
+        other_user = await self.bot.db.get_linked_user_by_username(clean_user)
+        if other_user and other_user["discord_id"] != interaction.user.id:
+            await interaction.followup.send(
+                f"❌ The Backloggd username **{clean_user}** is already linked to another Discord user (<@{other_user['discord_id']}>).",
+                ephemeral=True
+            )
+            return
+
         try:
             profile = await self.bot.backloggd.get_user_profile(clean_user)
             if not profile or not profile.username:
