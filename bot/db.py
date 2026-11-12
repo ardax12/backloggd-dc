@@ -364,6 +364,28 @@ class Database:
         query = f"SELECT discord_id, profile_key, backloggd_username, avatar_url FROM linked_users WHERE discord_id IN ({placeholders});"
         return await self._fetchall(query, member_ids)
 
+    async def get_guild_linked_profiles(
+        self,
+        member_ids: List[int],
+        exclude_profile_key: Optional[str] = None,
+    ) -> List[Any]:
+        """Fetch distinct linked profiles present among the supplied guild members."""
+        if not member_ids:
+            return []
+        placeholders = ",".join("?" for _ in member_ids)
+        exclusion = " AND p.profile_key <> ?" if exclude_profile_key else ""
+        params = list(member_ids)
+        if exclude_profile_key:
+            params.append(exclude_profile_key.strip().lower())
+        query = f"""
+            SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url
+            FROM linked_users AS u
+            JOIN profiles AS p ON p.profile_key = u.profile_key
+            WHERE u.discord_id IN ({placeholders}){exclusion}
+            ORDER BY p.profile_key
+        """
+        return await self._fetchall(query, params)
+
     # =========================================================================
     # Cached Games & Ratings
     # =========================================================================
@@ -461,12 +483,16 @@ class Database:
         return await self._fetchall(query, (discord_id, limit))
 
     async def get_user_backlog(self, discord_id: int) -> List[Any]:
-        """Retrieve all games logged as backlog for a user."""
+        """Retrieve unrated backlog and wishlist games for a user."""
         query = """
             SELECT g.slug, g.title, g.cover_url, g.release_year, g.community_rating, r.rating, r.is_liked
-            FROM user_ratings r
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id = ? AND r.status = 'backlog';
+            WHERE r.profile_key = (
+                SELECT profile_key FROM linked_users WHERE discord_id = ?
+            )
+              AND r.status IN ('backlog', 'wishlist')
+              AND r.rating IS NULL;
         """
         return await self._fetchall(query, (discord_id,))
 
@@ -590,6 +616,25 @@ class Database:
         result: dict[int, dict[str, Optional[float]]] = {uid: {} for uid in discord_ids}
         for row in rows:
             result[row["discord_id"]][row["game_slug"]] = row["rating"]
+        return result
+
+    async def get_multi_profile_ratings_dict(
+        self,
+        profile_keys: List[str],
+    ) -> dict[str, dict[str, Optional[float]]]:
+        """Return one cached rating map per normalized Backloggd profile."""
+        normalized_keys = list(dict.fromkeys(key.strip().lower() for key in profile_keys if key.strip()))
+        result: dict[str, dict[str, Optional[float]]] = {key: {} for key in normalized_keys}
+        for start in range(0, len(normalized_keys), 800):
+            key_chunk = normalized_keys[start:start + 800]
+            placeholders = ",".join("?" for _ in key_chunk)
+            rows = await self._fetchall(
+                f"""SELECT profile_key, game_slug, rating
+                    FROM profile_ratings WHERE profile_key IN ({placeholders})""",
+                key_chunk,
+            )
+            for row in rows:
+                result[row["profile_key"]][row["game_slug"]] = row["rating"]
         return result
 
     async def get_games_by_slugs(self, slugs: List[str]) -> dict[str, Any]:

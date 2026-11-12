@@ -310,12 +310,12 @@ def create_compare_embed(
     return embed
 
 def create_roulette_embed(username: str, game: Any, remaining_backlog: int) -> discord.Embed:
-    """Construct embed for /roulette backlog pick."""
+    """Construct embed for /roulette unplayed-library pick."""
     title = f"{game.title} ({game.release_year})" if getattr(game, "release_year", None) else game.title
     game_url = build_backloggd_game_url(game.slug)
 
     embed = discord.Embed(
-        title=f"🎲 Backlog Roulette for {username}",
+        title=f"🎲 Unplayed Game Roulette for {username}",
         url=game_url,
         color=COLOR_GOLD
     )
@@ -331,7 +331,7 @@ def create_roulette_embed(username: str, game: Any, remaining_backlog: int) -> d
         stars = rating_to_stars(game.community_rating)
         desc_lines.append(f"{stars} **{game.community_rating:.1f}** / 5.0")
     
-    desc_lines.append(f"\n🎯 **Your Mission:** Time to take this off your backlog! ({remaining_backlog} games still waiting)")
+    desc_lines.append(f"\n🎯 **Your Mission:** Pick one of these unrated games to play! ({remaining_backlog} games still waiting)")
     embed.description = "\n".join(desc_lines)
     embed.set_footer(text="Click [🔄 Reroll] below to spin again")
     return embed
@@ -448,7 +448,7 @@ def create_taste_twins_embed(
     else:
         embed.add_field(
             name="✨ Top Taste Soulmates",
-            value="*Not enough library overlap with other members yet.*",
+            value="*Not enough overlap between distinct profiles with numeric ratings yet.*",
             inline=False
         )
 
@@ -473,7 +473,7 @@ def create_all_ratings_embed(
     page: int = 1,
     per_page: int = 15
 ) -> discord.Embed:
-    """Construct a paginated modal/embed showing all server members who logged/rated a game."""
+    """Construct a paginated embed showing each linked profile that logged/rated a game."""
     total_ratings = len(server_ratings)
     total_pages = max(1, (total_ratings + per_page - 1) // per_page)
     current_page = max(1, min(page, total_pages))
@@ -504,14 +504,14 @@ def create_all_ratings_embed(
             status_str = format_status(r["status"])
             lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {status_str}")
 
-    # Split at member boundaries rather than cutting off ratings mid-line.
+    # Split at profile boundaries rather than cutting off ratings mid-line.
     chunk = ""
     for line in lines:
         line = line if len(line) <= 280 else line[:277] + "..."
         if chunk and len(chunk) + 1 + len(line) > 1024:
-            embed.add_field(name="Member Ratings & Status", value=chunk, inline=False)
+            embed.add_field(name="Profile Ratings & Status", value=chunk, inline=False)
             chunk = ""
         chunk = f"{chunk}\n{line}" if chunk else line
-    embed.add_field(name="Member Ratings & Status", value=chunk or "*No ratings*", inline=False)
+    embed.add_field(name="Profile Ratings & Status", value=chunk or "*No ratings*", inline=False)
     embed.set_footer(text=f"Page {current_page} of {total_pages} • Backloggd Discord Bot")
     return embed

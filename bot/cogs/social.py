@@ -9,6 +9,7 @@ from backloggd.analytics import calculate_similarity_raw
 from bot.ui.embeds import create_compare_embed, create_taste_twins_embed
 from bot.ui.views import LinkButtonView, TasteTwinsView
 from bot.ui.helpers import build_backloggd_user_url
+from bot.recommendation_rules import numeric_ratings
 
 logger = logging.getLogger("backloggd.cogs.social")
 
@@ -76,7 +77,7 @@ class SocialCog(commands.Cog, name="Social"):
 
         if u1_name.lower() == u2_name.lower():
             await interaction.followup.send(
-                "❌ You cannot compare a user to themselves!",
+                "ℹ️ Both inputs resolve to the same Backloggd profile, so there is no separate profile to compare.",
                 ephemeral=True
             )
             return
@@ -96,27 +97,44 @@ class SocialCog(commands.Cog, name="Social"):
                 )
                 return
 
+            rated1 = numeric_ratings(ratings1)
+            rated2 = numeric_ratings(ratings2)
+            if not rated1 or not rated2:
+                unrated_user = u1_name if not rated1 else u2_name
+                await interaction.followup.send(
+                    f"ℹ️ **{unrated_user}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
+                    ephemeral=True,
+                )
+                return
+
+            shared_rated_slugs = set(rated1) & set(rated2)
+            if not shared_rated_slugs:
+                await interaction.followup.send(
+                    "ℹ️ These profiles have no shared numeric ratings to compare yet.",
+                    ephemeral=True,
+                )
+                return
+
             # Calculate similarity score using backloggd-py
-            final_score, library_score, rating_score = calculate_similarity_raw(ratings1, ratings2)
+            final_score, library_score, rating_score = calculate_similarity_raw(rated1, rated2)
             match_pct = final_score / 100.0
 
             # Find common rated games
-            common_slugs = set(ratings1.keys()) & set(ratings2.keys())
+            common_slugs = shared_rated_slugs
             shared_loves = []
             disagreements = []
 
             for slug in common_slugs:
-                r1 = ratings1.get(slug)
-                r2 = ratings2.get(slug)
-                if r1 is not None and r2 is not None:
-                    delta = abs(r1 - r2)
-                    title = slug.replace("-", " ").title()
-                    # Shared loves (both rated 4.0+)
-                    if r1 >= 4.0 and r2 >= 4.0:
-                        shared_loves.append({"title": title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
-                    # Disagreements (delta >= 1.0)
-                    if delta >= 1.0:
-                        disagreements.append({"title": title, "r1": r1, "r2": r2, "delta": delta})
+                r1 = rated1[slug]
+                r2 = rated2[slug]
+                delta = abs(r1 - r2)
+                title = slug.replace("-", " ").title()
+                # Shared loves (both rated 4.0+)
+                if r1 >= 4.0 and r2 >= 4.0:
+                    shared_loves.append({"title": title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
+                # Disagreements (delta >= 1.0)
+                if delta >= 1.0:
+                    disagreements.append({"title": title, "r1": r1, "r2": r2, "delta": delta})
 
             shared_loves.sort(key=lambda x: x["avg"], reverse=True)
             disagreements.sort(key=lambda x: x["delta"], reverse=True)
@@ -204,7 +222,7 @@ class SocialCog(commands.Cog, name="Social"):
         try:
             # 2. Get target ratings
             if target_discord_id:
-                my_ratings = await self.bot.db.get_user_ratings_dict(target_discord_id)
+                my_ratings = await self.bot.db.get_profile_ratings_dict(target_username)
             else:
                 my_ratings = await self._get_or_fetch_ratings(target_username)
 
@@ -215,53 +233,63 @@ class SocialCog(commands.Cog, name="Social"):
                 )
                 return
 
-            # 3. Fetch candidate members in this guild
+            my_numeric_ratings = numeric_ratings(my_ratings)
+            if not my_numeric_ratings:
+                await interaction.followup.send(
+                    f"ℹ️ **{target_username}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
+                    ephemeral=True,
+                )
+                return
+
+            # 3. Fetch distinct candidate profiles in this guild, excluding every link to the target.
             guild_member_ids = [m.id for m in interaction.guild.members if m.id != target_discord_id]
-            other_linked = await self.bot.db.get_guild_linked_users(guild_member_ids)
+            other_linked = await self.bot.db.get_guild_linked_profiles(
+                guild_member_ids, exclude_profile_key=target_username.lower()
+            )
 
             if not other_linked:
                 await interaction.followup.send(
-                    "ℹ️ No other server members have linked their Backloggd accounts yet! Invite them to use `/link`.",
+                    "ℹ️ No other distinct Backloggd profiles are linked in this server yet. Invite members to use `/link`.",
                     ephemeral=True
                 )
                 return
 
-            # 4. Batch fetch ratings for all candidate members in 1 single query (zero N+1)
-            other_ids = [o["discord_id"] for o in other_linked]
-            all_other_ratings = await self.bot.db.get_multi_user_ratings_dict(other_ids)
+            # 4. Batch fetch ratings once per candidate profile.
+            other_profile_keys = [o["profile_key"] for o in other_linked]
+            all_other_ratings = await self.bot.db.get_multi_profile_ratings_dict(other_profile_keys)
 
             candidates = []
             slugs_to_lookup = set()
+            enough_rated_profiles = False
 
             for other in other_linked:
-                other_id = other["discord_id"]
-                other_username = other["backloggd_username"]
+                other_profile_key = other["profile_key"]
+                other_username = other["display_username"]
                 other_avatar = other["avatar_url"]
-                other_ratings = all_other_ratings.get(other_id, {})
+                other_ratings = numeric_ratings(all_other_ratings.get(other_profile_key, {}))
+                if len(other_ratings) >= 5:
+                    enough_rated_profiles = True
 
-                # Find common rated games
-                common_slugs = [
-                    s for s in (set(my_ratings.keys()) & set(other_ratings.keys()))
-                    if my_ratings.get(s) is not None and other_ratings.get(s) is not None
-                ]
+                # Similarity requires at least two shared numeric ratings.
+                common_slugs = list(set(my_numeric_ratings) & set(other_ratings))
                 if len(common_slugs) < 2:
                     continue
 
-                final_score, _, _ = calculate_similarity_raw(my_ratings, other_ratings)
+                final_score, _, _ = calculate_similarity_raw(my_numeric_ratings, other_ratings)
                 match_pct = int(round(final_score))
 
                 # Find top shared love (both rated >= 3.5)
                 shared_loves = [
-                    (s, (my_ratings[s] + other_ratings[s]) / 2.0)
+                    (s, (my_numeric_ratings[s] + other_ratings[s]) / 2.0)
                     for s in common_slugs
-                    if my_ratings[s] >= 3.5 and other_ratings[s] >= 3.5
+                    if my_numeric_ratings[s] >= 3.5 and other_ratings[s] >= 3.5
                 ]
                 shared_loves.sort(key=lambda x: x[1], reverse=True)
                 top_fav_slug = shared_loves[0][0] if shared_loves else None
 
                 # Find biggest disagreement
                 disagreements = [
-                    (s, abs(my_ratings[s] - other_ratings[s]))
+                    (s, abs(my_numeric_ratings[s] - other_ratings[s]))
                     for s in common_slugs
                 ]
                 disagreements.sort(key=lambda x: x[1], reverse=True)
@@ -273,7 +301,7 @@ class SocialCog(commands.Cog, name="Social"):
                     slugs_to_lookup.add(top_disagree_slug)
 
                 candidates.append({
-                    "discord_id": other_id,
+                    "profile_key": other_profile_key,
                     "username": other_username,
                     "avatar_url": other_avatar,
                     "match_pct": match_pct,
@@ -284,9 +312,12 @@ class SocialCog(commands.Cog, name="Social"):
                 })
 
             if not candidates:
+                if enough_rated_profiles:
+                    reason = "No other profile shares at least two numeric ratings with this profile."
+                else:
+                    reason = "Other profiles need at least five numeric ratings before we can compare taste."
                 await interaction.followup.send(
-                    "ℹ️ Not enough library overlap with other server members yet. "
-                    "Members need at least a few shared rated games to calculate compatibility!",
+                    f"ℹ️ {reason} Unrated backlog and wishlist entries do not count toward similarity.",
                     ephemeral=True
                 )
                 return
@@ -325,23 +356,24 @@ class SocialCog(commands.Cog, name="Social"):
                     )
                     return
                 await btn_interaction.response.defer()
-                t1_ratings = my_ratings
-                t2_ratings = all_other_ratings.get(twins[0]["discord_id"], {})
-                final_s, _, _ = calculate_similarity_raw(t1_ratings, t2_ratings)
+                t1_ratings = my_numeric_ratings
+                t2_ratings = numeric_ratings(all_other_ratings.get(twins[0]["profile_key"], {}))
+                final_s, _, _ = calculate_similarity_raw(my_numeric_ratings, t2_ratings)
                 c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
                 c_loves = []
                 c_dis = []
                 for s in c_slugs:
-                    r1 = t1_ratings.get(s)
+                    r1 = my_numeric_ratings.get(s)
                     r2 = t2_ratings.get(s)
-                    if r1 is not None and r2 is not None:
-                        d = abs(r1 - r2)
-                        meta_lookup = cached_meta.get(s)
-                        t_title = meta_lookup["title"] if meta_lookup and meta_lookup["title"] else s.replace("-", " ").title()
-                        if r1 >= 4.0 and r2 >= 4.0:
-                            c_loves.append({"title": t_title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
-                        if d >= 1.0:
-                            c_dis.append({"title": t_title, "r1": r1, "r2": r2, "delta": d})
+                    if r1 is None or r2 is None:
+                        continue
+                    d = abs(r1 - r2)
+                    meta_lookup = cached_meta.get(s)
+                    t_title = meta_lookup["title"] if meta_lookup and meta_lookup["title"] else s.replace("-", " ").title()
+                    if r1 >= 4.0 and r2 >= 4.0:
+                        c_loves.append({"title": t_title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
+                    if d >= 1.0:
+                        c_dis.append({"title": t_title, "r1": r1, "r2": r2, "delta": d})
 
                 c_loves.sort(key=lambda x: x["avg"], reverse=True)
                 c_dis.sort(key=lambda x: x["delta"], reverse=True)

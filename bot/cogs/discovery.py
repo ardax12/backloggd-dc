@@ -1,4 +1,4 @@
-"""DiscoveryCog: Handles /recommend (server taste-matched suggestions) and /roulette (backlog picker with Reroll button)."""
+"""DiscoveryCog: Handles profile-based recommendations and an unplayed-game roulette."""
 
 import discord
 from discord import app_commands
@@ -11,6 +11,7 @@ from bot.ui.embeds import create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url, rating_to_stars
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
+from bot.recommendation_rules import numeric_ratings
 
 logger = logging.getLogger("backloggd.cogs.discovery")
 
@@ -22,7 +23,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
     # /roulette (Interactive Backlog Decision Picker)
     # =========================================================================
 
-    @app_commands.command(name="roulette", description="Pick a random game from your Backlog to decide what to play next")
+    @app_commands.command(name="roulette", description="Pick an unrated game from your Backlog or Wishlist")
     @app_commands.describe(user="Optional: Backloggd user or mention (defaults to you)")
     async def roulette(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
         await interaction.response.defer()
@@ -43,7 +44,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         if not backlog_games:
             await interaction.followup.send(
-                f"ℹ️ **{username}** has no games with status `Backlog` in the local cache. Try running `/refresh` to sync your latest library!",
+                f"ℹ️ **{username}** has no unrated games in `Backlog` or `Wishlist` in the local cache. Try `/refresh` to sync your latest library.",
                 ephemeral=True
             )
             return
@@ -105,7 +106,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 return
 
             caller_username = caller_link["backloggd_username"]
-            caller_ratings = await self.bot.db.get_user_ratings_dict(caller_discord_id)
+            caller_ratings = await self.bot.db.get_profile_ratings_dict(caller_link["profile_key"])
             if not caller_ratings:
                 await interaction.followup.send(
                     f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library first.",
@@ -115,16 +116,24 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
             friend_discord_id = user.id
             friend_link = await self.bot.db.get_linked_user(friend_discord_id)
+            if friend_link and friend_link["profile_key"] == caller_link["profile_key"]:
+                await interaction.followup.send(
+                    "ℹ️ Both Discord members link to the same Backloggd profile, so there is no separate profile to recommend to.",
+                    ephemeral=True,
+                )
+                return
             friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
             friend_ratings = (
-                await self.bot.db.get_user_ratings_dict(friend_discord_id) if friend_link else {}
+                await self.bot.db.get_profile_ratings_dict(friend_link["profile_key"]) if friend_link else {}
             )
             friend_slugs = set(friend_ratings.keys())
 
             # Optional compatibility score if friend is linked and has ratings
             taste_pct = None
-            if friend_ratings and len(friend_ratings) >= 5:
-                sim_score, _, _ = calculate_similarity_raw(caller_ratings, friend_ratings)
+            caller_numeric = numeric_ratings(caller_ratings)
+            friend_numeric = numeric_ratings(friend_ratings)
+            if len(caller_numeric) >= 5 and len(friend_numeric) >= 5:
+                sim_score, _, _ = calculate_similarity_raw(caller_numeric, friend_numeric)
                 taste_pct = int(round(sim_score))
 
             # Pick caller's top-rated games (rated >= 4.0) that friend hasn't logged yet
@@ -138,7 +147,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             if not eligible_games:
                 if friend_link:
                     await interaction.followup.send(
-                        f"🎉 **{friend_username}** has already played or logged all of your 4.0+ rated games!",
+                        f"🎉 **{friend_username}** already has all of your 4.0+ rated games in their library.",
                         ephemeral=True
                     )
                 else:
@@ -182,8 +191,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             return
 
         # =====================================================================
-        # MODE 1: Discover recommendations for the caller from server taste twins
-        # (Guarantees diversity: 1 recommendation per user across different members)
+        # MODE 1: Discover recommendations from distinct server profiles with similar taste.
         # =====================================================================
         if not caller_link:
             await interaction.followup.send(
@@ -193,7 +201,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             return
 
         caller_username = caller_link["backloggd_username"]
-        my_ratings = await self.bot.db.get_user_ratings_dict(caller_discord_id)
+        my_ratings = await self.bot.db.get_profile_ratings_dict(caller_link["profile_key"])
 
         if not my_ratings:
             await interaction.followup.send(
@@ -202,50 +210,71 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
             return
 
+        my_numeric_ratings = numeric_ratings(my_ratings)
+        if not my_numeric_ratings:
+            await interaction.followup.send(
+                f"ℹ️ **{caller_username}** has no numeric game ratings in the cached library yet. Similarity needs rated games; unrated backlog and wishlist entries do not count.",
+                ephemeral=True,
+            )
+            return
+
         guild_member_ids = [m.id for m in interaction.guild.members if m.id != caller_discord_id]
-        other_linked = await self.bot.db.get_guild_linked_users(guild_member_ids)
+        other_linked = await self.bot.db.get_guild_linked_profiles(
+            guild_member_ids, exclude_profile_key=caller_link["profile_key"]
+        )
 
         if not other_linked:
             await interaction.followup.send(
-                "ℹ️ No other server members have linked their Backloggd accounts yet! Invite them to use `/link`.",
+                "ℹ️ No other distinct Backloggd profiles are linked in this server yet. Invite members to use `/link`.",
                 ephemeral=True
             )
             return
 
-        # Batch fetch ratings for all candidate server members in 1 single query (fixes N+1)
-        other_ids = [other["discord_id"] for other in other_linked]
-        all_other_ratings = await self.bot.db.get_multi_user_ratings_dict(other_ids)
+        # Batch fetch ratings once per distinct profile.
+        other_profile_keys = [other["profile_key"] for other in other_linked]
+        all_other_ratings = await self.bot.db.get_multi_profile_ratings_dict(other_profile_keys)
 
         taste_matches = []
+        enough_rated_profiles = False
         for other in other_linked:
-            other_id = other["discord_id"]
-            other_username = other["backloggd_username"]
-            other_ratings = all_other_ratings.get(other_id, {})
+            other_profile_key = other["profile_key"]
+            other_username = other["display_username"]
+            other_ratings = all_other_ratings.get(other_profile_key, {})
+            other_numeric_ratings = numeric_ratings(other_ratings)
 
-            if len(other_ratings) < 5:
+            if len(other_numeric_ratings) < 5:
+                continue
+            enough_rated_profiles = True
+
+            common_rated = set(my_numeric_ratings) & set(other_numeric_ratings)
+            if len(common_rated) < 2:
                 continue
 
-            final_score, _, _ = calculate_similarity_raw(my_ratings, other_ratings)
-            taste_matches.append((other_id, other_username, final_score, other_ratings))
+            final_score, _, _ = calculate_similarity_raw(my_numeric_ratings, other_numeric_ratings)
+            taste_matches.append((other_profile_key, other_username, final_score, other_ratings))
 
         if not taste_matches:
+            if enough_rated_profiles:
+                reason = "No other profile shares at least two numeric ratings with you yet."
+            else:
+                reason = "Other profiles need at least five numeric ratings before we can compare taste."
             await interaction.followup.send(
-                "ℹ️ Not enough library overlap with other server members yet. Try logging more games!",
+                f"ℹ️ {reason} Unrated backlog and wishlist entries do not count toward similarity.",
                 ephemeral=True
             )
             return
 
-        # Sort members by similarity score descending
+        # Sort profiles by similarity score descending.
         taste_matches.sort(key=lambda x: x[2], reverse=True)
 
         my_slugs = set(my_ratings.keys())
         raw_candidates = []
         chosen_slugs = set()
 
-        # PASS 1: Strict diversity — exactly 1 top recommendation per member
-        for other_id, other_name, match_score, other_ratings in taste_matches:
+        # PASS 1: Strict diversity — exactly 1 top recommendation per profile.
+        for other_profile_key, other_name, match_score, other_ratings in taste_matches:
             match_pct = int(round(match_score))
-            # Sort this member's eligible games by rating descending
+            # Sort this profile's eligible games by rating descending.
             user_top_games = [
                 (slug, rating)
                 for slug, rating in other_ratings.items()
@@ -263,7 +292,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         # PASS 2: If fewer than 5 recommendations found (e.g. only 2 or 3 taste twins in server),
         # round-robin additional top games from highest matches to fill up to 5
         if len(raw_candidates) < 5:
-            for other_id, other_name, match_score, other_ratings in taste_matches:
+            for other_profile_key, other_name, match_score, other_ratings in taste_matches:
                 match_pct = int(round(match_score))
                 user_top_games = [
                     (slug, rating)
@@ -282,7 +311,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         if not raw_candidates:
             await interaction.followup.send(
-                f"🎉 You have already played all the top-rated games from your server taste matches!",
+                "ℹ️ There are no 4.0+ recommendations from similar profiles that are missing from your library.",
                 ephemeral=True
             )
             return
@@ -305,7 +334,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         embed = discord.Embed(
             title=f"💡 Recommendations for {caller_username}",
-            description="Hand-picked games from different server members who share your taste:\n",
+            description="Hand-picked games from different server profiles that share your taste:\n",
             color=COLOR_PLAYED
         )
 
