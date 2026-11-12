@@ -200,6 +200,18 @@ class Database:
             );
         """)
 
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS feed_messages (
+                guild_id INTEGER NOT NULL,
+                discord_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                message_id INTEGER,
+                channel_id INTEGER,
+                PRIMARY KEY (guild_id, discord_id, event_id)
+            );
+        """)
+
         # 5. Seen journal logs deduplication
         await self._execute("""
             CREATE TABLE IF NOT EXISTS seen_journal_logs (
@@ -250,6 +262,7 @@ class Database:
         """Remove a linked user and cascade-delete their cached ratings."""
         deleted = await self._rowcount_execute("DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,))
         await self._execute("DELETE FROM feed_sources WHERE discord_id = ?;", (discord_id,))
+        await self._execute("DELETE FROM feed_messages WHERE discord_id = ?;", (discord_id,))
         return deleted > 0
 
     async def get_linked_user(self, discord_id: int) -> Optional[Any]:
@@ -758,3 +771,37 @@ class Database:
                     await self._conn.rollback()
                     raise
             return True
+
+
+    async def get_feed_messages(self, guild_id: int, discord_id: int):
+        """Retain source aliases and Discord message IDs across polls/restarts."""
+        return await self._fetchall(
+            "SELECT event_id, payload, message_id, channel_id FROM feed_messages WHERE guild_id = ? AND discord_id = ?",
+            (guild_id, discord_id),
+        )
+
+    async def store_feed_message(self, guild_id: int, discord_id: int, event_ids,
+                                 payload: str, message_id=None, channel_id=None):
+        statements = []
+        for event_id in event_ids:
+            statements.append(("""
+                INSERT INTO feed_messages (guild_id, discord_id, event_id, payload, message_id, channel_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, discord_id, event_id) DO UPDATE SET
+                    payload = excluded.payload, message_id = excluded.message_id, channel_id = excluded.channel_id
+            """, (guild_id, discord_id, event_id, payload, message_id, channel_id)))
+            statements.append(("""
+                INSERT OR IGNORE INTO seen_journal_deliveries (guild_id, entry_id, discord_id) VALUES (?, ?, ?)
+            """, (guild_id, event_id, discord_id)))
+        async with self._operation_lock:
+            if self.is_turso:
+                await self._client.batch(statements)
+            else:
+                await self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for sql, args in statements:
+                        await self._conn.execute(sql, args)
+                    await self._conn.commit()
+                except BaseException:
+                    await self._conn.rollback()
+                    raise

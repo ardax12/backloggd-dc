@@ -5,11 +5,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import logging
 import asyncio
-from typing import Any, List, Optional
+import json
+from dataclasses import asdict, replace
+from bot.feed_rules import VISIBLE_ACTIONS, journal_events, merge_announcements, calendar_date
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url
-from bot.activity_parser import parse_user_activity_page, ActivityEntry
+from bot.feed_models import FeedEvent
 
 logger = logging.getLogger("backloggd.cogs.feed")
 
@@ -31,27 +33,107 @@ class FeedCog(commands.Cog, name="Feed"):
     # =========================================================================
 
 
-    async def _fetch_user_activity_or_journal(self, username: str) -> list[Any]:
-        """Fetch latest game events from user's /activity/you/ stream, falling back to /journal/."""
-        # 1. Try personal activity stream (/activity/you/)
-        clean_user = username.strip()
-        url = f"https://backloggd.com/u/{clean_user}/activity/you/"
+    async def _fetch_feed_sources(self, username: str) -> dict[str, list[FeedEvent]]:
+        """Read sources independently; a blocked page is never an empty snapshot."""
+        sources = {}
         try:
-            resp = await self.bot.backloggd._request_with_retry("GET", url, resource_type="user")
-            self.bot.backloggd._check_response(resp, resource_type="user")
-            activities = parse_user_activity_page(resp.text, clean_user)
-            if activities:
-                return activities
-        except Exception as e:
-            logger.debug("Activity stream fetch failed for %s (%s), falling back to journal", username, e)
+            entries = await self.bot.backloggd.get_user_activity(username)
+            sources["activity"] = [FeedEvent.from_activity(entry) for entry in entries]
+        except Exception as error:
+            logger.warning("Could not read activity for %s: %s", username, error)
+        try:
+            entries = await self.bot.backloggd.get_user_journal(
+                username, max_pages=100, require_complete=True
+            )
+            sources["journal"] = journal_events(entries, username)
+        except Exception as error:
+            logger.warning("Could not read journal for %s: %s", username, error)
+        return sources
 
-        # 2. Fallback to /journal/
-        try:
-            journal = await self.bot.backloggd.get_user_journal(clean_user, max_pages=1)
-            return journal or []
-        except Exception as e:
-            logger.warning("Could not fetch journal or activity for %s: %s", username, e)
-            return []
+    async def _publish_sources(self, guild_id, discord_id, username, avatar_url, channel, sources):
+        rows = await self.bot.db.get_feed_messages(guild_id, discord_id)
+        saved = {row["event_id"]: row for row in rows}
+        historical = {}
+        for row in rows:
+            data = json.loads(row["payload"])
+            data["event_ids"] = tuple(data["event_ids"])
+            data["session_labels"] = tuple(data["session_labels"])
+            event = FeedEvent(**data)
+            if event.source == "activity":
+                historical[event.activity_id] = event
+        for source, events in sources.items():
+            # Empty successful sources are baselined too. A source absent from
+            # this mapping failed and must be retried without changing state.
+            ids = [e.activity_id for e in events]
+            first = await self.bot.db.seed_feed_source(guild_id, discord_id, source + "-display-v1", ids)
+            if first:
+                for event in events:
+                    payload = json.dumps(asdict(replace(event, event_ids=(event.activity_id,))), sort_keys=True)
+                    await self.bot.db.store_feed_message(guild_id, discord_id, (event.activity_id,), payload)
+                # Refresh the lookup to include the baseline just written.
+                saved = {r["event_id"]: r for r in await self.bot.db.get_feed_messages(guild_id, discord_id)}
+        activity = {e.activity_id: e for e in historical.values()}
+        for event in sources.get("activity", []):
+            previous = historical.get(event.activity_id)
+            activity[event.activity_id] = replace(event, event_ids=previous.event_ids) if previous else event
+        activities = [replace(e, event_ids=e.event_ids or (e.activity_id,)) for e in activity.values() if e.action_type in VISIBLE_ACTIONS]
+        logs = [e for e in sources.get("journal", []) if e.action_type in VISIBLE_ACTIONS]
+        events = merge_announcements(activities, logs)
+        events.sort(key=lambda e: e.occurred_at or calendar_date(e.played_date) or "")
+        known_ratings = {}
+        for previous in sorted(historical.values(), key=lambda e: e.occurred_at or ""):
+            if previous.rating is not None:
+                known_ratings[previous.game_slug] = previous.rating
+        for event in events:
+            aliases = event.event_ids or (event.activity_id,)
+            records = [saved[key] for key in aliases if key in saved]
+            record = next((r for r in records if r["message_id"] is not None), records[0] if records else None)
+            if record is None:
+                for alias in aliases:
+                    if await self.bot.db.is_journal_entry_delivered(guild_id, alias):
+                        record = {"payload": json.dumps(asdict(event)), "message_id": None, "channel_id": None}
+                        break
+            if record:
+                old = json.loads(record["payload"])
+                previous_rating = old.get("previous_rating")
+                if event.action_type == "rated" and old.get("rating") != event.rating:
+                    previous_rating = old.get("rating")
+                event = replace(event, previous_rating=previous_rating)
+            elif event.action_type == "rated":
+                old_rating = known_ratings.get(event.game_slug)
+                if old_rating != event.rating:
+                    event = replace(event, previous_rating=old_rating)
+            payload = json.dumps(asdict(event), sort_keys=True)
+            if record and payload == record["payload"] and all(alias in saved for alias in aliases):
+                if event.rating is not None:
+                    known_ratings[event.game_slug] = event.rating
+                continue
+            message_id = record["message_id"] if record else None
+            old_channel = record["channel_id"] if record else None
+            if record and message_id is None:
+                # Historic baseline: remember aliases but never publish history.
+                pass
+            else:
+                embed = create_journal_feed_embed(username, avatar_url, event)
+                view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(event.game_slug))
+                if message_id is not None:
+                    if old_channel != channel.id or payload == record["payload"]:
+                        continue
+                    try:
+                        await channel.get_partial_message(message_id).edit(embed=embed, view=view)
+                    except discord.NotFound:
+                        # A removed announcement stays removed; do not repost it.
+                        continue
+                else:
+                    message = await channel.send(embed=embed, view=view)
+                    message_id, old_channel = message.id, channel.id
+            await self.bot.db.store_feed_message(guild_id, discord_id, aliases, payload, message_id, old_channel)
+            for alias in aliases:
+                saved[alias] = {"payload": payload, "message_id": message_id, "channel_id": old_channel}
+            if not record:
+                await asyncio.sleep(1)
+            if event.rating is not None:
+                known_ratings[event.game_slug] = event.rating
 
     @app_commands.command(name="setchannel", description="Set the channel where automatic Backloggd playthrough logs are posted")
     @app_commands.describe(channel="The text channel for game log announcements")
@@ -67,18 +149,14 @@ class FeedCog(commands.Cog, name="Feed"):
             discord_id = user_row["discord_id"]
             username = user_row["backloggd_username"]
             try:
-                entries = await self._fetch_user_activity_or_journal(username)
-                e_ids = [getattr(e, "activity_id", None) or getattr(e, "entry_id", None) for e in entries]
-                await self.bot.db.seed_journal_entries_for_guild(
-                    interaction.guild_id,
-                    discord_id,
-                    [eid for eid in e_ids if eid],
-                )
-                if entries:
-                    source = "activity" if isinstance(entries[0], ActivityEntry) else "journal"
-                    await self.bot.db.seed_feed_source(
-                        interaction.guild_id, discord_id, source, [eid for eid in e_ids if eid]
-                    )
+                sources = await self._fetch_feed_sources(username)
+                for source, entries in sources.items():
+                    ids = [entry.activity_id for entry in entries]
+                    await self.bot.db.seed_journal_entries_for_guild(interaction.guild_id, discord_id, ids)
+                    await self.bot.db.seed_feed_source(interaction.guild_id, discord_id, source + "-display-v1", ids)
+                    for event in entries:
+                        payload = json.dumps(asdict(replace(event, event_ids=(event.activity_id,))), sort_keys=True)
+                        await self.bot.db.store_feed_message(interaction.guild_id, discord_id, (event.activity_id,), payload)
             except Exception as e:
                 logger.warning("Could not seed current activity for %s: %s", username, e)
 
@@ -128,7 +206,7 @@ class FeedCog(commands.Cog, name="Feed"):
                 return
 
             # Per-tick journal cache to avoid duplicate HTTP requests across multiple guilds
-            user_journal_cache: dict[str, list] = {}
+            user_journal_cache: dict[str, dict] = {}
 
             for setting in guild_settings:
                 guild_id = setting["guild_id"]
@@ -158,42 +236,11 @@ class FeedCog(commands.Cog, name="Feed"):
                     avatar_url = user_row["avatar_url"]
 
                     try:
-                        # Fetch latest activity or journal page (cached per loop iteration)
                         if username not in user_journal_cache:
-                            user_journal_cache[username] = (
-                                await self._fetch_user_activity_or_journal(username)
-                            )
-                        entries = user_journal_cache[username]
-                        if not entries:
-                            continue
-
-                        source = "activity" if isinstance(entries[0], ActivityEntry) else "journal"
-                        entry_ids = [getattr(e, "activity_id", None) or getattr(e, "entry_id", None) for e in entries]
-                        if await self.bot.db.seed_feed_source(guild_id, discord_id, source, entry_ids):
-                            continue
-
-                        for entry in entries:
-                            entry_id = getattr(entry, "activity_id", None) or getattr(entry, "entry_id", None)
-                            game_slug = getattr(entry, "game_slug", "")
-                            if not entry_id or not game_slug:
-                                continue
-
-                            # Deduplication check
-                            is_seen = await self.bot.db.is_journal_entry_delivered(
-                                guild_id, entry_id
-                            )
-                            if not is_seen:
-                                embed = create_journal_feed_embed(username, avatar_url, entry)
-                                view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(game_slug))
-
-                                await channel.send(embed=embed, view=view)
-                                await self.bot.db.mark_journal_entry_delivered(
-                                    guild_id, entry_id, discord_id
-                                )
-                                logger.info("Posted activity feed event '%s' by %s to guild %d", entry_id, username, guild_id)
-
-                                # Brief pause between posts to respect rate limits
-                                await asyncio.sleep(1.0)
+                            user_journal_cache[username] = await self._fetch_feed_sources(username)
+                        await self._publish_sources(
+                            guild_id, discord_id, username, avatar_url, channel, user_journal_cache[username]
+                        )
 
                     except Exception as e:
                         logger.warning("Error polling activity for %s: %s", username, e)

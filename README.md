@@ -159,9 +159,15 @@ python -m unittest discover -s tests -v
 
 Both checks run offline with temporary databases; verification does not use configured Turso credentials or live game search.
 
-Activity feeds establish a persisted baseline per server, member, and source (activity stream or journal). The first nonempty poll for a new source records existing history without posting it; subsequent polls announce new entries. This also applies once after upgrading an existing installation. Refreshing a library does not suppress pending feed events. When an activity exposes neither a stable ID nor an absolute timestamp, identical repeated actions are conservatively treated as one event to avoid reposting changing relative timestamps.
+Activity feeds read activity and journal independently. Started/Finished milestones, explicit ratings and rating changes, written reviews, and identifiable replays are announced. Ordinary daily sessions, backlog/wishlist changes, likes, follows, badges, comments, and lists are hidden. A rating displayed beside a completion is included in that announcement; it does not generate a second rating event.
 
-The private ?View All Ratings? response includes Previous/Next controls with 15 members per page. Long lists are split across embed fields to respect Discord limits.
+Journal dates, Started/Finished labels, replay flags, and available platforms enrich matching announcements. A unique game/action/calendar-date pair can connect an activity milestone to a journal row; ambiguous same-day sessions remain separate. Reviews and standalone ratings combine with milestones only through an exact timestamp or numeric permalink. Source aliases and Discord message IDs persist so later information edits the existing announcement across polls and restarts. Rating changes show the previous value when it was observed. Backdated sessions explicitly show their played date without implying the game was played today.
+
+Each server/member/source gets a persisted baseline on its first successful fetch, including a successfully empty page. Existing history is not announced, including once after upgrading to these display rules. Blocked or unknown pages are retried without initializing a baseline, and one failed source does not prevent the other from working. Journal pagination is scanned to discover backdated milestones; scans beyond 100 pages fail rather than seeding partial history. Refreshing a library does not suppress pending events.
+
+Public journal rows expose no unique session IDs. Identity uses the user, game, date, labels, replay flag, and an occurrence count for otherwise identical rows. Exact duplicate rows remain inherently indistinguishable if edited or reordered. Activity uses server IDs, numeric permalinks, or immutable tooltip timestamps where available. Without any stable reference, identical repeated actions can only be treated conservatively as one event.
+
+The private "View All Ratings" response includes Previous/Next controls with 15 members per page. Long lists are split across embed fields to respect Discord limits.
 
 ---
 
@@ -175,3 +181,26 @@ The private ?View All Ratings? response includes Previous/Next controls with 15 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+
+## Local SDK development
+
+All Backloggd HTTP requests, security/layout validation, pagination, and HTML
+parsing belong to `backloggd-py`. The bot calls only its public
+`get_user_activity()` and `get_user_journal()` APIs and adds Discord announcement
+state in `bot/feed_models.py`. HTML fixtures and parser regression tests live
+in the SDK repository; bot tests use typed SDK samples.
+
+The bot uses the published `backloggd-py` 0.2.0 API. Install it with the other
+requirements and run the bot's checks:
+
+```shell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python verify_all.py
+```
+
+When developing both repositories together, replace the published SDK with an
+editable install: `python -m pip install -e /path/to/backloggd-matcher`.
+On this machine that checkout is at
+`C:/Users/LENOVO/Documents/GitHub/backloggd-matcher`.

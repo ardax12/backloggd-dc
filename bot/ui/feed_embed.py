@@ -1,6 +1,8 @@
 """Embed constructor for automatic activity feed events (Filmlinkd-style)."""
 
 import discord
+from datetime import datetime, timezone
+from bot.feed_rules import calendar_date
 from typing import Any
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED, COLOR_WISHLIST
 from bot.ui.helpers import (
@@ -46,8 +48,20 @@ def create_journal_feed_embed(
         title = f"🎮 {username} logged {game_title}"
         color = COLOR_PLAYED
 
+    previous_rating = getattr(entry, "previous_rating", None)
+    if action_type == "rated" and previous_rating is not None:
+        title = f"{username} changed their rating for {game_title}"
+    elif action_type == "replay":
+        title = f"{username} logged a replay of {game_title}"
+    played_date = getattr(entry, "played_date", None)
+    played_day = calendar_date(played_date)
+    action_day = calendar_date(getattr(entry, "occurred_at", None)) or datetime.now(timezone.utc).date().isoformat()
+    is_backdated = played_day and played_day < action_day
+    if is_backdated:
+        title = f"{username} logged {'a replay' if getattr(entry, 'is_replay', False) else 'a playthrough'} of {game_title}"
+
     embed = discord.Embed(
-        title=title,
+        title=title[:256],
         url=game_url,
         color=color
     )
@@ -62,7 +76,10 @@ def create_journal_feed_embed(
     details = []
     if getattr(entry, "rating", None) is not None:
         stars = rating_to_stars(entry.rating)
-        details.append(f"**Rating:** {stars} (`{entry.rating:.1f}` / 5.0)")
+        if previous_rating is not None and action_type == "rated":
+            details.append(f"**Rating:** {previous_rating:.1f} \u2192 {entry.rating:.1f} / 5.0")
+        else:
+            details.append(f"**Rating:** {stars} (`{entry.rating:.1f}` / 5.0)")
 
     if getattr(entry, "platform", None):
         details.append(f"**Platform:** {entry.platform}")
@@ -70,9 +87,13 @@ def create_journal_feed_embed(
     if getattr(entry, "is_replay", False):
         details.append("**Replay:** 🔁 Yes")
 
-    date_val = getattr(entry, "played_date", None) or getattr(entry, "date_str", None)
-    if date_val:
-        details.append(f"**Activity Time:** {date_val}")
+    if getattr(entry, "session_labels", ()):
+        details.append("**Session:** " + " / ".join(entry.session_labels))
+    if played_date:
+        details.append(f"**Played date:** {played_date}")
+    activity_time = getattr(entry, "occurred_at", None) or getattr(entry, "date_str", None)
+    if activity_time:
+        details.append(f"**Activity time:** {activity_time}")
 
     if details:
         embed.description = "\n".join(details)
@@ -82,6 +103,7 @@ def create_journal_feed_embed(
     if notes:
         if len(notes) > 400:
             notes = notes[:397] + "..."
+        notes = f"||{notes}||" if getattr(entry, "has_spoilers", False) else notes
         embed.add_field(name="💬 Review / Notes", value=f"> {notes}", inline=False)
 
     embed.set_footer(text="Backloggd Activity Stream • Connect yours with /link")

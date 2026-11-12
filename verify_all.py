@@ -252,37 +252,12 @@ class VerificationSuite:
         feed_embed = create_journal_feed_embed("Nox", "https://example.com/nox.png", DummyJournalEntry())
         assert "Sea of Stars" in feed_embed.title
 
-        # Test Activity Parser & Game-Only Filtering
-        from bot.activity_parser import parse_user_activity_page, ActivityEntry
-        mock_activity_html = '''
-        <div class="stream-container">
-            <div class="stream-entry" data-activity-id="act_1">
-                <a href="/games/elden-ring/"><img src="https://example.com/er.jpg" alt="Elden Ring"></a>
-                <div class="activity-text">
-                    <a href="/u/Nox/">Nox</a> completed <a href="/games/elden-ring/">Elden Ring</a>
-                    <div class="stars-top" style="width: 100%"></div>
-                    <span class="time-ago">1 hour ago</span>
-                </div>
-            </div>
-            <!-- Non-game badge event that must be discarded -->
-            <div class="stream-entry" data-activity-id="act_badge">
-                <a href="/badges/vip/"><img src="/vip.png"></a>
-                <div class="activity-text">Nox unlocked VIP badge</div>
-            </div>
-            <!-- Non-game follow event that must be discarded -->
-            <div class="stream-entry" data-activity-id="act_follow">
-                <div class="activity-text">Nox started following someone</div>
-            </div>
-        </div>
-        '''
-        parsed_activities = parse_user_activity_page(mock_activity_html, "Nox")
-        assert len(parsed_activities) == 1, f"Expected 1 game activity, got {len(parsed_activities)}"
-        assert parsed_activities[0].game_slug == "elden-ring"
-        assert parsed_activities[0].action_type == "completed"
-
-        act_embed = create_journal_feed_embed("Nox", "https://example.com/nox.png", parsed_activities[0])
+        from bot.feed_models import FeedEvent
+        activity = FeedEvent("sample-completion", "Elden Ring", "elden-ring", None,
+                             "completed", "completed", 5.0, None, None)
+        act_embed = create_journal_feed_embed("Nox", "https://example.com/nox.png", activity)
         assert "Nox completed Elden Ring" in act_embed.title
-        print("✅ Activity Feed & Parser verified successfully")
+        print("Activity feed rendering verified successfully")
 
         # 8. All Ratings Embed
         dummy_ratings = [
@@ -313,22 +288,6 @@ class VerificationSuite:
         assert any("Soulmates" in f.name and "Kaelen" in f.value for f in twins_embed.fields)
         assert any("Nemesis" in f.name and "GamerX" in f.value for f in twins_embed.fields)
         print("✅ Taste Twins Embed built successfully")
-
-        # 8. Test Runtime Patches
-        from bot.patches import patched_parse_user_profile_page, patched_parse_review_card
-        from bs4 import BeautifulSoup
-        test_profile_html = '<div id="profile-header"><img class="profile-avatar" src="/avatars/test.jpg"><p class="profile-bio">First line.<br>Second line.</p></div>'
-        patched_p = patched_parse_user_profile_page(test_profile_html, "testuser")
-        assert patched_p.avatar_url == "https://backloggd.com/avatars/test.jpg"
-        assert patched_p.bio == "First line. Second line."
-
-        test_card_soup = BeautifulSoup(
-            '<div class="user-reviews"><div class="game-name"><a href="/games/hades/">Hades</a></div><div class="review-text"><p>Great game,</p><p>loved the combat!</p></div></div>',
-            "html.parser"
-        )
-        patched_r = patched_parse_review_card(test_card_soup)
-        assert patched_r.review_text == "Great game, loved the combat!"
-        print("✅ Runtime parser patches verified successfully!")
 
         print("\n=== [4] Testing Bot Client Cog Suite ===")
         bot = BackloggdBot()

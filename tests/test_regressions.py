@@ -4,26 +4,8 @@ import sqlite3
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from bot.activity_parser import parse_user_activity_page
 from bot.ui.embeds import create_all_ratings_embed, create_profile_embed
 from bot.cogs.account import AccountCog
-
-class ParserTests(unittest.TestCase):
-    def test_relative_time_does_not_change_identity(self):
-        html = '<div class="stream-entry"><a href="/games/hades/">Hades</a> completed <span class="time-ago">{}</span></div>'
-        first = parse_user_activity_page(html.format("1 hour ago"), "Tester")[0]
-        later = parse_user_activity_page(html.format("2 hours ago"), "Tester")[0]
-        self.assertEqual(first.activity_id, later.activity_id)
-
-    def test_nested_containers_only_emit_leaf_event(self):
-        html = '<div class="col-12"><div class="stream-entry" data-activity-id="123"><a href="/games/hades/">Hades</a> completed</div></div>'
-        self.assertEqual(len(parse_user_activity_page(html, "Tester")), 1)
-
-    def test_absolute_times_distinguish_repeated_events(self):
-        html = '<div class="stream-entry"><a href="/games/hades/">Hades</a> completed <time datetime="{}">yesterday</time></div>'
-        a = parse_user_activity_page(html.format("2026-01-01"), "Tester")[0]
-        b = parse_user_activity_page(html.format("2026-01-02"), "Tester")[0]
-        self.assertNotEqual(a.activity_id, b.activity_id)
 
 class EmbedTests(unittest.TestCase):
     def test_ratings_fit_field_limits(self):
@@ -100,9 +82,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import MagicMock, patch
         from bot.db import Database
         from bot.cogs.feed import FeedCog
-        from bot.activity_parser import ActivityEntry
+        from bot.feed_models import FeedEvent
         def event(identifier):
-            return ActivityEntry(identifier, "Hades", "hades", None, "completed", "completed", None, None, None)
+            return FeedEvent(identifier, "Hades", "hades", None, "completed", "completed", None, None, None)
         with tempfile.TemporaryDirectory() as directory:
             db = Database(str(Path(directory) / "test.db"), turso_url="")
             await db.connect()
@@ -111,15 +93,16 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 await db.set_feed_channel(1, 100)
                 channel = MagicMock(spec=discord.TextChannel)
                 channel.permissions_for.return_value = SimpleNamespace(send_messages=True, embed_links=True)
-                channel.send = AsyncMock()
+                channel.id = 100
+                channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
                 guild = SimpleNamespace(members=[SimpleNamespace(id=10)], me=object(), get_channel=lambda _: channel)
                 bot = SimpleNamespace(db=db, get_guild=lambda _: guild)
                 cog = FeedCog(bot)
-                cog._fetch_user_activity_or_journal = AsyncMock(return_value=[event("old")])
+                cog._fetch_feed_sources = AsyncMock(return_value={"activity": [event("old")]})
                 with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
                     await cog.journal_feed_loop.coro(cog)
                     channel.send.assert_not_awaited()
-                    cog._fetch_user_activity_or_journal.return_value = [event("new"), event("old")]
+                    cog._fetch_feed_sources.return_value = {"activity": [event("new"), event("old")]}
                     channel.send.side_effect = RuntimeError("temporary delivery failure")
                     await cog.journal_feed_loop.coro(cog)
                     self.assertFalse(await db.is_journal_entry_delivered(1, "new"))

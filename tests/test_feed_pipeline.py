@@ -1,0 +1,153 @@
+import os
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+import json
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+from bot.db import Database
+from bot.cogs.feed import FeedCog
+from backloggd import ChallengeResponseError, PageParseError
+from feed_samples import completion_event, journal_entries
+from bot.feed_rules import journal_events
+
+class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.directory.name) / "feed.db"), turso_url="")
+        await self.db.connect()
+        self.channel = SimpleNamespace(id=100, send=AsyncMock(return_value=SimpleNamespace(id=999)), get_partial_message=MagicMock(return_value=SimpleNamespace(edit=AsyncMock())))
+        self.cog = FeedCog(SimpleNamespace(db=self.db))
+        self.activity = completion_event()
+        self.entries = journal_entries()
+        self.log = journal_events(self.entries[:1], "Millers")[0]
+        self.sleep = patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock())
+        self.sleep.start()
+
+    async def asyncTearDown(self):
+        self.sleep.stop()
+        await self.db.close()
+        self.directory.cleanup()
+
+    async def publish(self, sources, guild=1, member=10):
+        await self.cog._publish_sources(guild, member, "Millers", None, self.channel, sources)
+
+    async def baseline(self):
+        await self.publish({"activity": [], "journal": []})
+
+    async def test_successful_empty_sources_allow_first_new_event(self):
+        await self.baseline()
+        await self.publish({"activity": [self.activity], "journal": []})
+        self.channel.send.assert_awaited_once()
+
+    async def test_late_journal_updates_existing_activity_message(self):
+        await self.baseline()
+        await self.publish({"activity": [self.activity], "journal": []})
+        await self.publish({"activity": [], "journal": [self.log]})
+        self.channel.send.assert_awaited_once()
+        edit = self.channel.get_partial_message.return_value.edit
+        edit.assert_awaited_once()
+        self.assertIn("Played date", edit.call_args.kwargs["embed"].description)
+        await self.publish({"activity": [], "journal": [self.log]})
+        edit.assert_awaited_once()
+
+    async def test_journal_first_then_activity_updates_in_place(self):
+        await self.baseline()
+        await self.publish({"activity": [], "journal": [self.log]})
+        await self.publish({"activity": [self.activity], "journal": [self.log]})
+        self.channel.send.assert_awaited_once()
+        self.channel.get_partial_message.return_value.edit.assert_awaited_once()
+
+    async def test_rating_change_uses_baselined_rating(self):
+        old = replace(self.activity, action_type="rated", rating=3.0)
+        await self.publish({"activity": [old], "journal": []})
+        new = replace(old, activity_id="new-rating", occurred_at="2026-11-12T15:00:00Z", rating=4.0)
+        await self.publish({"activity": [new], "journal": []})
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertIn("changed their rating", embed.title)
+        self.assertIn("3.0", embed.description)
+        self.assertIn("4.0", embed.description)
+
+    async def test_editing_a_sent_rating_shows_previous_value(self):
+        await self.baseline()
+        rating = replace(self.activity, action_type="rated", rating=3.0)
+        await self.publish({"activity": [rating]})
+        await self.publish({"activity": [replace(rating, rating=4.5)]})
+        embed = self.channel.get_partial_message.return_value.edit.call_args.kwargs["embed"]
+        self.assertIn("changed their rating", embed.title)
+        self.assertIn("3.0", embed.description)
+        self.assertIn("4.5", embed.description)
+        self.channel.send.assert_awaited_once()
+
+    async def test_hidden_actions_and_daily_journal_entries_never_send(self):
+        await self.baseline()
+        hidden = replace(self.activity, action_type="wishlist")
+        daily = replace(self.log, action_type="played", session_labels=())
+        await self.publish({"activity": [hidden], "journal": [daily]})
+        self.channel.send.assert_not_awaited()
+
+    async def test_restart_does_not_repost_and_guilds_are_independent(self):
+        await self.baseline()
+        await self.publish({"activity": [self.activity], "journal": [self.log]})
+        await self.db.close()
+        await self.db.connect()
+        await self.publish({"activity": [self.activity], "journal": [self.log]})
+        self.channel.send.assert_awaited_once()
+        await self.publish({"activity": [], "journal": []}, guild=2)
+        await self.publish({"activity": [self.activity], "journal": [self.log]}, guild=2)
+        self.assertEqual(self.channel.send.await_count, 2)
+
+    async def test_failed_send_does_not_mark_event_and_retries(self):
+        await self.baseline()
+        self.channel.send.side_effect = RuntimeError("delivery failed")
+        with self.assertRaises(RuntimeError):
+            await self.publish({"activity": [self.activity]})
+        self.assertFalse(await self.db.is_journal_entry_delivered(1, self.activity.activity_id))
+        self.channel.send.side_effect = None
+        await self.publish({"activity": [self.activity]})
+        self.assertTrue(await self.db.is_journal_entry_delivered(1, self.activity.activity_id))
+
+    async def test_partial_baseline_is_not_replayed_after_restart(self):
+        await self.db.seed_feed_source(1, 10, "activity-display-v1", [self.activity.activity_id])
+        await self.publish({"activity": [self.activity]})
+        self.channel.send.assert_not_awaited()
+
+    async def test_failed_sources_do_not_create_baselines(self):
+        await self.publish({})
+        self.assertTrue(await self.db.seed_feed_source(1, 10, "activity-display-v1", []))
+
+    async def test_failed_edit_retries_without_sending_duplicate(self):
+        await self.baseline()
+        await self.publish({"activity": [self.activity], "journal": []})
+        edit = self.channel.get_partial_message.return_value.edit
+        edit.side_effect = RuntimeError("edit failed")
+        with self.assertRaises(RuntimeError):
+            await self.publish({"activity": [], "journal": [self.log]})
+        edit.side_effect = None
+        await self.publish({"activity": [], "journal": [self.log]})
+        self.assertEqual(edit.await_count, 2)
+        self.channel.send.assert_awaited_once()
+
+
+class FetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activity_failure_does_not_prevent_journal(self):
+        api = SimpleNamespace(get_user_activity=AsyncMock(side_effect=ChallengeResponseError("blocked")),
+                              get_user_journal=AsyncMock(return_value=journal_entries()))
+        sources = await FeedCog(SimpleNamespace(backloggd=api))._fetch_feed_sources("Millers")
+        self.assertNotIn("activity", sources)
+        self.assertEqual(len(sources["journal"]), 2)
+        api.get_user_journal.assert_awaited_once_with("Millers", max_pages=100, require_complete=True)
+
+    async def test_journal_failure_does_not_prevent_activity(self):
+        api = SimpleNamespace(get_user_activity=AsyncMock(return_value=[completion_event()]),
+                              get_user_journal=AsyncMock(side_effect=PageParseError("incomplete journal")))
+        sources = await FeedCog(SimpleNamespace(backloggd=api))._fetch_feed_sources("Millers")
+        self.assertEqual(len(sources["activity"]), 1)
+        self.assertNotIn("journal", sources)
+
+    async def test_successful_empty_public_apis_are_preserved(self):
+        api = SimpleNamespace(get_user_activity=AsyncMock(return_value=[]), get_user_journal=AsyncMock(return_value=[]))
+        sources = await FeedCog(SimpleNamespace(backloggd=api))._fetch_feed_sources("Millers")
+        self.assertEqual(sources, {"activity": [], "journal": []})

@@ -1,0 +1,100 @@
+"""Normalize journal milestones and select announcements without collection noise."""
+from collections import Counter, defaultdict
+from dataclasses import replace
+from datetime import datetime
+import hashlib
+from bot.feed_models import FeedEvent
+
+VISIBLE_ACTIONS = {"playing", "completed", "rated", "reviewed", "replay"}
+
+
+def calendar_date(value):
+    if not value:
+        return None
+    for pattern in ("%Y-%m-%d", "%B, %Y %d", "%B %Y %d"):
+        try:
+            return datetime.strptime(value, pattern).date().isoformat()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return None
+
+
+def journal_events(entries, username):
+    events = []
+    occurrences = Counter()
+    for entry in entries:
+        labels = getattr(entry, "session_labels", ())
+        action = "completed" if "Finished" in labels else "playing" if "Started" in labels else "replay" if entry.is_replay else "played"
+        # Public pages have no session ID. Preserve identical rows by count,
+        # while excluding editable ratings and review text from identity.
+        identity = f"{username.lower()}:{entry.game_slug}:{entry.played_date}:{labels}:{entry.is_replay}"
+        occurrences[identity] += 1
+        identifier = "journal_" + hashlib.sha256(f"{identity}:{occurrences[identity]}".encode()).hexdigest()[:24]
+        events.append(FeedEvent(
+            identifier, entry.game_title, entry.game_slug, entry.cover_url,
+            action, action, entry.rating, entry.review_notes, None,
+            played_date=entry.played_date, platform=entry.platform,
+            is_replay=entry.is_replay, session_labels=labels, source="journal",
+            event_ids=(identifier,),
+        ))
+    return events
+
+
+def build_announcements(activities, journal, username):
+    """Merge unique milestones; never infer a rating action from stars alone."""
+    activities = [FeedEvent.from_activity(e) for e in activities]
+    activity = [replace(e, event_ids=e.event_ids or (e.activity_id,)) for e in activities if e.action_type in VISIBLE_ACTIONS]
+    logs = [e for e in journal_events(journal, username) if e.action_type in VISIBLE_ACTIONS]
+    return merge_announcements(activity, logs)
+
+
+def merge_announcements(activities, logs):
+    def match_key(event):
+        date = calendar_date(event.played_date or event.occurred_at)
+        if date and event.action_type in {"playing", "completed", "replay"}:
+            return event.game_slug, event.action_type, date
+        return None
+    activity_groups, log_groups = defaultdict(list), defaultdict(list)
+    for event in activities:
+        activity_groups[match_key(event)].append(event)
+    for event in logs:
+        log_groups[match_key(event)].append(event)
+    merged, consumed = [], set()
+    for event in activities:
+        key = match_key(event)
+        matches = log_groups.get(key, []) if key else []
+        linked = [log for log in logs if log.activity_id in event.event_ids]
+        if len(linked) == 1 or (len(activity_groups[key]) == 1 and len(matches) == 1):
+            log = linked[0] if linked else matches[0]
+            event = replace(event, played_date=log.played_date,
+                            platform=log.platform or event.platform,
+                            is_replay=log.is_replay or event.is_replay,
+                            session_labels=log.session_labels,
+                            event_ids=tuple(dict.fromkeys((*event.event_ids, *log.event_ids))))
+            consumed.add(log.activity_id)
+        merged.append(event)
+    merged.extend(e for e in logs if e.activity_id not in consumed)
+    # Review/rating prose can enrich a milestone only when an exact event
+    # timestamp or a numeric permalink ties them to the same action.
+    result = []
+    for event in merged:
+        if event.action_type in {"rated", "reviewed"}:
+            matches = [e for e in merged if e.action_type in {"playing", "completed", "replay"}
+                       and e.game_slug == event.game_slug
+                       and ((e.reference and e.reference == event.reference)
+                            or (e.occurred_at and e.occurred_at == event.occurred_at))]
+            if len(matches) == 1:
+                index = merged.index(matches[0])
+                combined = replace(matches[0], review_notes=event.review_notes or matches[0].review_notes,
+                                   rating=event.rating if event.rating is not None else matches[0].rating,
+                                   has_spoilers=event.has_spoilers or matches[0].has_spoilers,
+                                   event_ids=tuple(dict.fromkeys((*matches[0].event_ids, *event.event_ids))))
+                merged[index] = combined
+                continue
+        result.append(event)
+    # Milestones may have been enriched after they were added to result.
+    by_id = {e.activity_id: e for e in merged}
+    return [by_id[e.activity_id] for e in result]
