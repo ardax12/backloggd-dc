@@ -57,8 +57,10 @@ def create_journal_feed_embed(
     played_day = calendar_date(played_date)
     action_day = calendar_date(getattr(entry, "occurred_at", None)) or datetime.now(timezone.utc).date().isoformat()
     is_backdated = played_day and played_day < action_day
-    if is_backdated:
-        title = f"{username} logged {'a replay' if getattr(entry, 'is_replay', False) else 'a playthrough'} of {game_title}"
+    if is_backdated and action_type == "completed":
+        title = f"{username} finished {game_title}"
+    elif is_backdated and action_type == "playing":
+        title = f"{username} started {game_title}"
 
     embed = discord.Embed(
         title=title[:256],

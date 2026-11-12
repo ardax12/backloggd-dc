@@ -149,6 +149,10 @@ class Database:
                 last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        await self._execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_users_username_ci "
+            "ON linked_users(LOWER(backloggd_username));"
+        )
 
         # 2. Cached games
         await self._execute("""
@@ -244,10 +248,13 @@ class Database:
     # User Account Linking
     # =========================================================================
 
-    async def link_user(self, discord_id: int, username: str, avatar_url: Optional[str] = None) -> None:
-        """Insert or update linked Backloggd username for a Discord user."""
+    async def link_user(self, discord_id: int, username: str, avatar_url: Optional[str] = None) -> bool:
+        """Claim a Backloggd username, returning False if another Discord user owns it."""
         from bot.ui.helpers import clean_image_url
         clean_avatar = clean_image_url(avatar_url)
+        existing = await self.get_linked_user_by_username(username)
+        if existing and existing["discord_id"] != discord_id:
+            return False
         query = """
             INSERT INTO linked_users (discord_id, backloggd_username, avatar_url, last_synced_at)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
@@ -256,7 +263,16 @@ class Database:
                 avatar_url = COALESCE(excluded.avatar_url, linked_users.avatar_url),
                 last_synced_at = CURRENT_TIMESTAMP;
         """
-        await self._execute(query, (discord_id, username, clean_avatar))
+        try:
+            await self._execute(query, (discord_id, username, clean_avatar))
+        except Exception:
+            # The case-insensitive unique index is the final guard when two
+            # link requests pass the lookup at the same time.
+            existing = await self.get_linked_user_by_username(username)
+            if existing and existing["discord_id"] != discord_id:
+                return False
+            raise
+        return True
 
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove a linked user and cascade-delete their cached ratings."""
@@ -779,6 +795,35 @@ class Database:
             "SELECT event_id, payload, message_id, channel_id FROM feed_messages WHERE guild_id = ? AND discord_id = ?",
             (guild_id, discord_id),
         )
+
+    async def seed_feed_message(self, guild_id: int, discord_id: int, event_ids,
+                                payload: str):
+        """Record baseline events only when absent, preserving delivered mappings."""
+        statements = []
+        for event_id in event_ids:
+            statements.append((
+                """INSERT OR IGNORE INTO feed_messages
+                   (guild_id, discord_id, event_id, payload, message_id, channel_id)
+                   VALUES (?, ?, ?, ?, NULL, NULL)""",
+                (guild_id, discord_id, event_id, payload),
+            ))
+            statements.append((
+                """INSERT OR IGNORE INTO seen_journal_deliveries
+                   (guild_id, entry_id, discord_id) VALUES (?, ?, ?)""",
+                (guild_id, event_id, discord_id),
+            ))
+        async with self._operation_lock:
+            if self.is_turso:
+                await self._client.batch(statements)
+            else:
+                await self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for sql, args in statements:
+                        await self._conn.execute(sql, args)
+                    await self._conn.commit()
+                except BaseException:
+                    await self._conn.rollback()
+                    raise
 
     async def store_feed_message(self, guild_id: int, discord_id: int, event_ids,
                                  payload: str, message_id=None, channel_id=None):

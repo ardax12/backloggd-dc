@@ -60,6 +60,56 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.channel.send.assert_awaited_once()
         self.channel.get_partial_message.return_value.edit.assert_awaited_once()
 
+    async def test_activity_arriving_during_journal_failure_updates_saved_journal_message(self):
+        await self.baseline()
+        await self.publish({"activity": [], "journal": [self.log]})
+
+        await self.publish({"activity": [self.activity]})
+
+        self.channel.send.assert_awaited_once()
+        edit = self.channel.get_partial_message.return_value.edit
+        edit.assert_awaited_once()
+        self.assertIn("Played date", edit.call_args.kwargs["embed"].description)
+
+    async def test_journal_failure_preserves_previously_observed_enrichment(self):
+        await self.baseline()
+        await self.publish({"activity": [self.activity], "journal": [self.log]})
+
+        await self.publish({"activity": [self.activity]})
+
+        edit = self.channel.get_partial_message.return_value.edit
+        edit.assert_not_awaited()
+        rows = await self.db.get_feed_messages(1, 10)
+        stored = json.loads(next(row["payload"] for row in rows if row["event_id"] == self.activity.activity_id))
+        self.assertEqual(stored["played_date"], self.log.played_date)
+        self.assertEqual(stored["session_labels"], list(self.log.session_labels))
+
+    async def test_setchannel_keeps_existing_message_mappings_and_later_edits_them(self):
+        await self.baseline()
+        await self.publish({"activity": [self.activity], "journal": [self.log]})
+        self.cog._fetch_feed_sources = AsyncMock(return_value={"activity": [self.activity], "journal": [self.log]})
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(members=[SimpleNamespace(id=10)], me=object()),
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        self.channel.mention = "#feed"
+        self.channel.permissions_for = lambda _: SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=True
+        )
+
+        await FeedCog.setchannel.callback(self.cog, interaction, self.channel)
+        updated = replace(self.activity, review_notes="A note added after the channel setup.")
+        await self.publish({"activity": [updated], "journal": [self.log]})
+
+        edit = self.channel.get_partial_message.return_value.edit
+        edit.assert_awaited_once()
+        self.channel.send.assert_awaited_once()
+        rows = await self.db.get_feed_messages(1, 10)
+        self.assertTrue(all(row["message_id"] == 999 for row in rows))
+        self.assertTrue(all(row["channel_id"] == self.channel.id for row in rows))
+
     async def test_setchannel_rejects_missing_embed_permission(self):
         self.channel.permissions_for = lambda _: SimpleNamespace(
             view_channel=True, send_messages=True, embed_links=False
@@ -99,6 +149,31 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.publish({"activity": [old], "journal": []})
         new = replace(old, activity_id="new-rating", occurred_at="2026-11-12T15:00:00Z", rating=4.0)
         await self.publish({"activity": [new], "journal": []})
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertIn("changed their rating", embed.title)
+        self.assertIn("3.0", embed.description)
+        self.assertIn("4.0", embed.description)
+
+    async def test_journal_rating_does_not_replace_previous_activity_rating(self):
+        old_rating = replace(
+            self.activity,
+            activity_id="old-rating",
+            action_type="rated",
+            occurred_at="2026-11-10T15:00:00Z",
+            rating=3.0,
+        )
+        await self.publish({"activity": [old_rating], "journal": []})
+        current_log = replace(self.log, rating=4.0)
+        await self.publish({"activity": [old_rating], "journal": [current_log]})
+        new_rating = replace(
+            old_rating,
+            activity_id="new-rating",
+            occurred_at="2026-11-12T15:00:00Z",
+            rating=4.0,
+        )
+
+        await self.publish({"activity": [old_rating, new_rating], "journal": [current_log]})
+
         embed = self.channel.send.call_args.kwargs["embed"]
         self.assertIn("changed their rating", embed.title)
         self.assertIn("3.0", embed.description)
@@ -185,3 +260,42 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         api = SimpleNamespace(get_user_activity=AsyncMock(return_value=[]), get_user_journal=AsyncMock(return_value=[]))
         sources = await FeedCog(SimpleNamespace(backloggd=api))._fetch_feed_sources("Millers")
         self.assertEqual(sources, {"activity": [], "journal": []})
+
+
+class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.directory.name) / "links.db"), turso_url="")
+        await self.db.connect()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.directory.cleanup()
+
+    async def test_username_claim_is_unique_without_case_sensitivity(self):
+        import asyncio
+
+        original_lookup = self.db.get_linked_user_by_username
+        lookups = 0
+        both_looked_up = asyncio.Event()
+
+        async def lookup_before_either_insert(username):
+            nonlocal lookups
+            result = await original_lookup(username)
+            lookups += 1
+            if lookups == 2:
+                both_looked_up.set()
+            if lookups <= 2:
+                await both_looked_up.wait()
+            return result
+
+        self.db.get_linked_user_by_username = lookup_before_either_insert
+        results = await asyncio.gather(
+            self.db.link_user(10, "Millers"),
+            self.db.link_user(11, "millers"),
+            return_exceptions=True,
+        )
+
+        self.assertEqual(sum(result is True for result in results), 1)
+        self.assertEqual(sum(result is False for result in results), 1)
+        self.assertEqual(len(await self.db.get_all_linked_users()), 1)

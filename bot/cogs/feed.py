@@ -54,6 +54,7 @@ class FeedCog(commands.Cog, name="Feed"):
         rows = await self.bot.db.get_feed_messages(guild_id, discord_id)
         saved = {row["event_id"]: row for row in rows}
         historical = {}
+        historical_journal = {}
         for row in rows:
             data = json.loads(row["payload"])
             data["event_ids"] = tuple(data["event_ids"])
@@ -61,6 +62,8 @@ class FeedCog(commands.Cog, name="Feed"):
             event = FeedEvent(**data)
             if event.source == "activity":
                 historical[event.activity_id] = event
+            elif event.source == "journal":
+                historical_journal[event.activity_id] = event
         for source, events in sources.items():
             # Empty successful sources are baselined too. A source absent from
             # this mapping failed and must be retried without changing state.
@@ -69,20 +72,41 @@ class FeedCog(commands.Cog, name="Feed"):
             if first:
                 for event in events:
                     payload = json.dumps(asdict(replace(event, event_ids=(event.activity_id,))), sort_keys=True)
-                    await self.bot.db.store_feed_message(guild_id, discord_id, (event.activity_id,), payload)
+                    await self.bot.db.seed_feed_message(guild_id, discord_id, (event.activity_id,), payload)
                 # Refresh the lookup to include the baseline just written.
                 saved = {r["event_id"]: r for r in await self.bot.db.get_feed_messages(guild_id, discord_id)}
         activity = {e.activity_id: e for e in historical.values()}
         for event in sources.get("activity", []):
             previous = historical.get(event.activity_id)
-            activity[event.activity_id] = replace(event, event_ids=previous.event_ids) if previous else event
+            if previous:
+                preserved = {}
+                if "journal" not in sources:
+                    preserved = {
+                        "played_date": event.played_date or previous.played_date,
+                        "platform": event.platform or previous.platform,
+                        "session_labels": event.session_labels or previous.session_labels,
+                        "is_replay": event.is_replay or previous.is_replay,
+                        "rating": event.rating if event.rating is not None else previous.rating,
+                        "review_notes": event.review_notes or previous.review_notes,
+                        "has_spoilers": event.has_spoilers or previous.has_spoilers,
+                        "occurred_at": event.occurred_at or previous.occurred_at,
+                        "date_str": event.date_str or previous.date_str,
+                        "reference": event.reference or previous.reference,
+                        "cover_url": event.cover_url or previous.cover_url,
+                        "previous_rating": event.previous_rating if event.previous_rating is not None else previous.previous_rating,
+                    }
+                activity[event.activity_id] = replace(event, event_ids=previous.event_ids, **preserved)
+            else:
+                activity[event.activity_id] = event
         activities = [replace(e, event_ids=e.event_ids or (e.activity_id,)) for e in activity.values() if e.action_type in VISIBLE_ACTIONS]
-        logs = [e for e in sources.get("journal", []) if e.action_type in VISIBLE_ACTIONS]
+        journal = {e.activity_id: e for e in historical_journal.values()}
+        journal.update({e.activity_id: e for e in sources.get("journal", [])})
+        logs = [e for e in journal.values() if e.action_type in VISIBLE_ACTIONS]
         events = merge_announcements(activities, logs)
         events.sort(key=lambda e: e.occurred_at or calendar_date(e.played_date) or "")
         known_ratings = {}
         for previous in sorted(historical.values(), key=lambda e: e.occurred_at or ""):
-            if previous.rating is not None:
+            if previous.source == "activity" and previous.rating is not None:
                 known_ratings[previous.game_slug] = previous.rating
         for event in events:
             aliases = event.event_ids or (event.activity_id,)
@@ -105,7 +129,7 @@ class FeedCog(commands.Cog, name="Feed"):
                     event = replace(event, previous_rating=old_rating)
             payload = json.dumps(asdict(event), sort_keys=True)
             if record and payload == record["payload"] and all(alias in saved for alias in aliases):
-                if event.rating is not None:
+                if event.source == "activity" and event.rating is not None:
                     known_ratings[event.game_slug] = event.rating
                 continue
             message_id = record["message_id"] if record else None
@@ -132,7 +156,7 @@ class FeedCog(commands.Cog, name="Feed"):
                 saved[alias] = {"payload": payload, "message_id": message_id, "channel_id": old_channel}
             if not record:
                 await asyncio.sleep(1)
-            if event.rating is not None:
+            if event.source == "activity" and event.rating is not None:
                 known_ratings[event.game_slug] = event.rating
 
     @app_commands.command(name="setchannel", description="Set the channel where automatic Backloggd playthrough logs are posted")
@@ -176,7 +200,7 @@ class FeedCog(commands.Cog, name="Feed"):
                     await self.bot.db.seed_feed_source(interaction.guild_id, discord_id, source + "-display-v1", ids)
                     for event in entries:
                         payload = json.dumps(asdict(replace(event, event_ids=(event.activity_id,))), sort_keys=True)
-                        await self.bot.db.store_feed_message(interaction.guild_id, discord_id, (event.activity_id,), payload)
+                        await self.bot.db.seed_feed_message(interaction.guild_id, discord_id, (event.activity_id,), payload)
             except Exception as e:
                 logger.warning("Could not seed current activity for %s: %s", username, e)
 

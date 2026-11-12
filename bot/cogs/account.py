@@ -137,11 +137,19 @@ class AccountCog(commands.Cog, name="Account"):
             return
 
         # Save basic link immediately
-        await self.bot.db.link_user(
+        linked = await self.bot.db.link_user(
             discord_id=interaction.user.id,
             username=profile.username,
             avatar_url=profile.avatar_url
         )
+        if not linked:
+            other_user = await self.bot.db.get_linked_user_by_username(profile.username)
+            owner = f" (<@{other_user['discord_id']}>)" if other_user else ""
+            await interaction.followup.send(
+                f"❌ The Backloggd username **{profile.username}** is already linked to another Discord user{owner}.",
+                ephemeral=True
+            )
+            return
 
         embed = discord.Embed(
             title="🔗 Account Linked!",

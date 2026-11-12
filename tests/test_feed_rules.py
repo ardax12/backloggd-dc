@@ -66,12 +66,17 @@ class AnnouncementTests(unittest.TestCase):
         self.assertNotEqual(logs[0].activity_id, logs[1].activity_id)
         self.assertNotEqual(logs[0].activity_id, journal_events([entries[0]], "AnotherUser")[0].activity_id)
 
-    def test_backdated_embed_does_not_claim_played_today(self):
-        event = replace(self.event, played_date="November, 2026 05", session_labels=("Finished",))
-        embed = create_journal_feed_embed("Millers", None, event)
-        self.assertIn("logged a playthrough", embed.title)
-        self.assertIn("**Played date:** November, 2026 05", embed.description)
-        self.assertIn("**Session:** Finished", embed.description)
+    def test_backdated_milestones_keep_action_in_title_and_played_date(self):
+        for action, label, verb in (("completed", "Finished", "finished"), ("playing", "Started", "started")):
+            for occurred_at in (None, "2026-11-11T15:48:38Z"):
+                with self.subTest(action=action, occurred_at=occurred_at):
+                    event = replace(self.event, action_type=action, occurred_at=occurred_at,
+                                    played_date="November, 2026 05", session_labels=(label,))
+                    embed = create_journal_feed_embed("Millers", None, event)
+                    self.assertIn(f"Millers {verb} Grand Theft Auto: Vice City", embed.title)
+                    self.assertNotIn("logged a playthrough", embed.title)
+                    self.assertIn("**Played date:** November, 2026 05", embed.description)
+                    self.assertIn(f"**Session:** {label}", embed.description)
 
     def test_delayed_poll_does_not_change_an_on_time_completion_into_backdated(self):
         embed = create_journal_feed_embed("Millers", None, replace(self.event, played_date="November, 2026 11"))
