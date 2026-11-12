@@ -191,6 +191,15 @@ class Database:
             );
         """)
 
+        await self._execute("""
+            CREATE TABLE IF NOT EXISTS feed_sources (
+                guild_id INTEGER NOT NULL,
+                discord_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                PRIMARY KEY (guild_id, discord_id, source)
+            );
+        """)
+
         # 5. Seen journal logs deduplication
         await self._execute("""
             CREATE TABLE IF NOT EXISTS seen_journal_logs (
@@ -240,6 +249,7 @@ class Database:
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove a linked user and cascade-delete their cached ratings."""
         deleted = await self._rowcount_execute("DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,))
+        await self._execute("DELETE FROM feed_sources WHERE discord_id = ?;", (discord_id,))
         return deleted > 0
 
     async def get_linked_user(self, discord_id: int) -> Optional[Any]:
@@ -715,3 +725,36 @@ class Database:
         for entry_id in set(entry_ids):
             if entry_id:
                 await self.mark_journal_entry_delivered(guild_id, entry_id, discord_id)
+
+
+    async def seed_feed_source(self, guild_id: int, discord_id: int,
+                               source: str, entry_ids: Iterable[str]) -> bool:
+        """Baseline a new source once, atomically; later polls deliver new IDs."""
+        async with self._operation_lock:
+            query = "SELECT 1 FROM feed_sources WHERE guild_id = ? AND discord_id = ? AND source = ?"
+            params = (guild_id, discord_id, source)
+            if self.is_turso:
+                result = await self._client.execute(query, list(params))
+                exists = bool(result.rows)
+            else:
+                async with self._conn.execute(query, params) as cursor:
+                    exists = await cursor.fetchone() is not None
+            if exists:
+                return False
+            statements = [(
+                "INSERT OR IGNORE INTO seen_journal_deliveries (guild_id, entry_id, discord_id) VALUES (?, ?, ?)",
+                (guild_id, entry_id, discord_id),
+            ) for entry_id in set(entry_ids) if entry_id]
+            statements.append(("INSERT OR IGNORE INTO feed_sources VALUES (?, ?, ?)", params))
+            if self.is_turso:
+                await self._client.batch(statements)
+            else:
+                await self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for sql, args in statements:
+                        await self._conn.execute(sql, args)
+                    await self._conn.commit()
+                except BaseException:
+                    await self._conn.rollback()
+                    raise
+            return True

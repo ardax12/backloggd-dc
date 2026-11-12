@@ -36,6 +36,10 @@ def parse_user_activity_page(html: str, username: str) -> list[ActivityEntry]:
     activities: list[ActivityEntry] = []
     seen_ids: set[str] = set()
 
+    # Keep the innermost event container, excluding layout wrappers.
+    row_ids = {id(row) for row in rows}
+    rows = [row for row in rows if not any(id(child) in row_ids for child in row.find_all(True))]
+
     for row in rows:
         # 1. STRICT GAME OBJECT FILTER: Must contain a link to /games/{slug}/
         # This completely filters out badges (/badges/), users (/u/), follows, etc.
@@ -117,15 +121,20 @@ def parse_user_activity_page(html: str, username: str) -> list[ActivityEntry]:
 
         # 5. Date / Relative time
         date_str = None
-        time_el = row.find(["time", "span"], class_=lambda c: c and any(k in str(c).lower() for k in ["time", "date", "ago"]))
+        time_el = row.select_one("time, .time-ago, .date, [datetime], [data-timestamp]")
         if time_el:
             date_str = time_el.get_text(strip=True)
 
         # 6. Activity ID for Deduplication
         act_id = row.get("data-activity-id") or row.get("data-log-id") or row.get("id")
         if not act_id:
-            # Deterministic hash to prevent duplicate deliveries
-            hash_input = f"{username.lower()}:{game_slug}:{action_type}:{rating}:{date_str}"
+            # Relative display text changes on every poll. Only immutable time
+            # attributes participate in identity; content is a conservative
+            # fallback when the page exposes no event ID or absolute timestamp.
+            timestamp = (time_el.get("datetime") or time_el.get("data-timestamp")) if time_el else None
+            permalink = row.find("a", href=re.compile(r"/(?:review|log)/"))
+            stable_reference = permalink.get("href") if permalink else timestamp
+            hash_input = f"{username.lower()}:{game_slug}:{action_type}:{rating}:{stable_reference}:{review_notes or ''}"
             act_id = "act_" + hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:16]
 
         if act_id in seen_ids:

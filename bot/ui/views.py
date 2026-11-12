@@ -79,3 +79,40 @@ class GameCardView(View):
             )
             view_all_btn.callback = on_view_all
             self.add_item(view_all_btn)
+
+
+class RatingsView(View):
+    """Navigate the private ratings response without rerunning a game search."""
+
+    def __init__(self, game_title: str, game_slug: str, guild_name: str, ratings: list):
+        super().__init__(timeout=180)
+        self.game_title = game_title
+        self.game_slug = game_slug
+        self.guild_name = guild_name
+        self.ratings = ratings
+        self.page = 1
+        self.total_pages = max(1, (len(ratings) + 14) // 15)
+        self._update_buttons()
+
+    def embed(self):
+        from bot.ui.embeds import create_all_ratings_embed
+        return create_all_ratings_embed(
+            self.game_title, self.game_slug, self.guild_name, self.ratings, page=self.page
+        )
+
+    def _update_buttons(self):
+        self.previous_button.disabled = self.page <= 1
+        self.next_button.disabled = self.page >= self.total_pages
+
+    async def _move(self, interaction: discord.Interaction, offset: int):
+        self.page = max(1, min(self.total_pages, self.page + offset))
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: Button):
+        await self._move(interaction, -1)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: Button):
+        await self._move(interaction, 1)

@@ -154,7 +154,14 @@ The repository includes a standalone test suite covering database queries, forma
 
 ```bash
 python verify_all.py
+python -m unittest discover -s tests -v
 ```
+
+Both checks run offline with temporary databases; verification does not use configured Turso credentials or live game search.
+
+Activity feeds establish a persisted baseline per server, member, and source (activity stream or journal). The first nonempty poll for a new source records existing history without posting it; subsequent polls announce new entries. This also applies once after upgrading an existing installation. Refreshing a library does not suppress pending feed events. When an activity exposes neither a stable ID nor an absolute timestamp, identical repeated actions are conservatively treated as one event to avoid reposting changing relative timestamps.
+
+The private ?View All Ratings? response includes Previous/Next controls with 15 members per page. Long lists are split across embed fields to respect Discord limits.
 
 ---
 

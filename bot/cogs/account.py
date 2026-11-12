@@ -52,18 +52,6 @@ class AccountCog(commands.Cog, name="Account"):
                 logger.info("Discarded stale library sync for %s (%d)", username, discord_id)
                 return None
 
-            # Seed current journal entries for feeds this member belongs to.
-            try:
-                journal = await self.bot.backloggd.get_user_journal(username, max_pages=1)
-                entry_ids = [entry.entry_id for entry in journal if entry.entry_id]
-                for guild in self.bot.guilds:
-                    if guild.get_member(discord_id) and await self.bot.db.get_feed_channel(guild.id):
-                        await self.bot.db.seed_journal_entries_for_guild(
-                            guild.id, discord_id, entry_ids
-                        )
-            except Exception as e:
-                logger.warning("Failed to seed journal logs for %s: %s", username, e)
-
             logger.info("Synced library for %s (%d games)", username, len(library))
             return len(library)
         except Exception as e:

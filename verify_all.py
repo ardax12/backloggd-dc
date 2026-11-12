@@ -5,6 +5,14 @@ import os
 import sys
 import unittest
 from pathlib import Path
+import tempfile
+from unittest.mock import AsyncMock, patch
+
+# Verification must never connect to the configured production database.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+os.environ["TURSO_DATABASE_URL"] = ""
+os.environ["TURSO_AUTH_TOKEN"] = ""
+os.environ["DEV_GUILD_ID"] = ""
 
 # Fix Windows console UTF-8 output
 sys.stdout.reconfigure(encoding="utf-8")
@@ -324,6 +332,7 @@ class VerificationSuite:
 
         print("\n=== [4] Testing Bot Client Cog Suite ===")
         bot = BackloggdBot()
+        bot.db = Database(TEST_DB_PATH, turso_url="")
         await bot.setup_hook()
         cogs = list(bot.cogs.keys())
         expected_cogs = ['Account', 'Games', 'Users', 'Social', 'Discovery', 'Stats', 'Feed']
@@ -337,7 +346,8 @@ class VerificationSuite:
         # Simulate interaction
         from unittest.mock import MagicMock
         mock_interaction = MagicMock()
-        await games_cog.game_autocomplete(mock_interaction, "zelda")
+        with patch.object(bot.backloggd, "search_games", new=AsyncMock(return_value=[])):
+            await games_cog.game_autocomplete(mock_interaction, "zelda")
         assert len(games_cog._autocomplete_cache) <= 2, f"Cache not pruned: {len(games_cog._autocomplete_cache)}"
         print("✅ Games autocomplete cache pruning verified successfully!")
 
@@ -355,5 +365,7 @@ class VerificationSuite:
         print("\n🎉 ALL E2E AND SMOKE TESTS PASSED!")
 
 if __name__ == "__main__":
-    suite = VerificationSuite()
-    asyncio.run(suite.run_all())
+    with tempfile.TemporaryDirectory(prefix="backloggd-verification-") as directory:
+        TEST_DB_PATH = str(Path(directory) / "verification.db")
+        suite = VerificationSuite()
+        asyncio.run(suite.run_all())

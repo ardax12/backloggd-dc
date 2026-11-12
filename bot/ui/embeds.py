@@ -216,6 +216,9 @@ def create_profile_embed(
     if recent_played:
         recent_lines = []
         for entry in recent_played[:5]:
+            if hasattr(entry, "keys"):
+                from types import SimpleNamespace
+                entry = SimpleNamespace(**dict(entry))
             title = getattr(entry, "game_title", None) or getattr(entry, "title", "Unknown Game")
             rating = getattr(entry, "rating", None)
             date_str = getattr(entry, "played_date", None)
@@ -475,7 +478,7 @@ def create_all_ratings_embed(
     slice_ratings = server_ratings[start_idx:end_idx]
 
     embed = discord.Embed(
-        title=f"👥 {game_title} — All {guild_name} Ratings",
+        title=f"👥 {game_title} — All {guild_name} Ratings"[:256],
         url=build_backloggd_game_url(game_slug),
         description=f"Showing **{start_idx + 1}–{min(end_idx, total_ratings)}** of **{total_ratings}** members who logged this game:\n",
         color=COLOR_PRIMARY
@@ -496,6 +499,14 @@ def create_all_ratings_embed(
             status_str = format_status(r["status"])
             lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {status_str}")
 
-    embed.add_field(name="Member Ratings & Status", value="\n".join(lines) if lines else "*No ratings*", inline=False)
+    # Split at member boundaries rather than cutting off ratings mid-line.
+    chunk = ""
+    for line in lines:
+        line = line if len(line) <= 280 else line[:277] + "..."
+        if chunk and len(chunk) + 1 + len(line) > 1024:
+            embed.add_field(name="Member Ratings & Status", value=chunk, inline=False)
+            chunk = ""
+        chunk = f"{chunk}\n{line}" if chunk else line
+    embed.add_field(name="Member Ratings & Status", value=chunk or "*No ratings*", inline=False)
     embed.set_footer(text=f"Page {current_page} of {total_pages} • Backloggd Discord Bot")
     return embed

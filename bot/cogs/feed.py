@@ -74,6 +74,11 @@ class FeedCog(commands.Cog, name="Feed"):
                     discord_id,
                     [eid for eid in e_ids if eid],
                 )
+                if entries:
+                    source = "activity" if isinstance(entries[0], ActivityEntry) else "journal"
+                    await self.bot.db.seed_feed_source(
+                        interaction.guild_id, discord_id, source, [eid for eid in e_ids if eid]
+                    )
             except Exception as e:
                 logger.warning("Could not seed current activity for %s: %s", username, e)
 
@@ -160,6 +165,11 @@ class FeedCog(commands.Cog, name="Feed"):
                             )
                         entries = user_journal_cache[username]
                         if not entries:
+                            continue
+
+                        source = "activity" if isinstance(entries[0], ActivityEntry) else "journal"
+                        entry_ids = [getattr(e, "activity_id", None) or getattr(e, "entry_id", None) for e in entries]
+                        if await self.bot.db.seed_feed_source(guild_id, discord_id, source, entry_ids):
                             continue
 
                         for entry in entries:

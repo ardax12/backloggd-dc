@@ -6,7 +6,7 @@ from discord.ext import commands
 import logging
 from typing import List
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
-from bot.ui.views import LinkButtonView, GameCardView
+from bot.ui.views import LinkButtonView, GameCardView, RatingsView
 from bot.ui.helpers import build_backloggd_game_url
 
 logger = logging.getLogger("backloggd.cogs.games")
@@ -97,13 +97,10 @@ class GamesCog(commands.Cog, name="Games"):
             game_url = build_backloggd_game_url(game_data.slug)
 
             async def on_view_all(btn_interaction: discord.Interaction):
-                all_ratings_embed = create_all_ratings_embed(
-                    game_title=game_data.title,
-                    game_slug=game_data.slug,
-                    guild_name=guild_name,
-                    server_ratings=server_ratings
+                ratings_view = RatingsView(game_data.title, game_data.slug, guild_name, server_ratings)
+                await btn_interaction.response.send_message(
+                    embed=ratings_view.embed(), view=ratings_view, ephemeral=True
                 )
-                await btn_interaction.response.send_message(embed=all_ratings_embed, ephemeral=True)
 
             view = GameCardView(
                 game_url=game_url,
