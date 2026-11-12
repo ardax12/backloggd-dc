@@ -50,8 +50,10 @@ class FeedCog(commands.Cog, name="Feed"):
             logger.warning("Could not read journal for %s: %s", username, error)
         return sources
 
-    async def _publish_sources(self, guild_id, discord_id, username, avatar_url, channel, sources):
-        rows = await self.bot.db.get_feed_messages(guild_id, discord_id)
+    async def _publish_sources(
+        self, guild_id, profile_key, username, avatar_url, channel, sources
+    ):
+        rows = await self.bot.db.get_feed_messages(guild_id, profile_key)
         saved = {row["event_id"]: row for row in rows}
         historical = {}
         historical_journal = {}
@@ -68,13 +70,13 @@ class FeedCog(commands.Cog, name="Feed"):
             # Empty successful sources are baselined too. A source absent from
             # this mapping failed and must be retried without changing state.
             ids = [e.activity_id for e in events]
-            first = await self.bot.db.seed_feed_source(guild_id, discord_id, source + "-display-v1", ids)
+            first = await self.bot.db.seed_feed_source(guild_id, profile_key, source + "-display-v1", ids)
             if first:
                 for event in events:
                     payload = json.dumps(asdict(replace(event, event_ids=(event.activity_id,))), sort_keys=True)
-                    await self.bot.db.seed_feed_message(guild_id, discord_id, (event.activity_id,), payload)
+                    await self.bot.db.seed_feed_message(guild_id, profile_key, (event.activity_id,), payload)
                 # Refresh the lookup to include the baseline just written.
-                saved = {r["event_id"]: r for r in await self.bot.db.get_feed_messages(guild_id, discord_id)}
+                saved = {r["event_id"]: r for r in await self.bot.db.get_feed_messages(guild_id, profile_key)}
         activity = {e.activity_id: e for e in historical.values()}
         for event in sources.get("activity", []):
             previous = historical.get(event.activity_id)
@@ -111,11 +113,15 @@ class FeedCog(commands.Cog, name="Feed"):
         for event in events:
             aliases = event.event_ids or (event.activity_id,)
             records = [saved[key] for key in aliases if key in saved]
-            record = next((r for r in records if r["message_id"] is not None), records[0] if records else None)
+            sent_records = [r for r in records if r["message_id"] is not None]
+            record = min(sent_records, key=lambda row: row["message_id"]) if sent_records else (records[0] if records else None)
             if record is None:
                 for alias in aliases:
-                    if await self.bot.db.is_journal_entry_delivered(guild_id, alias):
-                        record = {"payload": json.dumps(asdict(event)), "message_id": None, "channel_id": None}
+                    if await self.bot.db.is_journal_entry_delivered(guild_id, profile_key, alias):
+                        record = {
+                            "payload": json.dumps(asdict(event)), "message_id": None,
+                            "channel_id": None, "delivery_state": "baseline",
+                        }
                         break
             if record:
                 old = json.loads(record["payload"])
@@ -134,6 +140,13 @@ class FeedCog(commands.Cog, name="Feed"):
                 continue
             message_id = record["message_id"] if record else None
             old_channel = record["channel_id"] if record else None
+            state = record["delivery_state"] if record and "delivery_state" in record.keys() else None
+            if state in {"pending", "unknown", "deleted"}:
+                await self.bot.db.store_feed_message(
+                    guild_id, profile_key, aliases, payload, message_id, old_channel,
+                    delivery_state=state,
+                )
+                continue
             if record and message_id is None:
                 # Historic baseline: remember aliases but never publish history.
                 pass
@@ -147,11 +160,30 @@ class FeedCog(commands.Cog, name="Feed"):
                         await channel.get_partial_message(message_id).edit(embed=embed, view=view)
                     except discord.NotFound:
                         # A removed announcement stays removed; do not repost it.
+                        await self.bot.db.mark_feed_message_deleted(
+                            guild_id, profile_key, aliases, payload
+                        )
                         continue
                 else:
-                    message = await channel.send(embed=embed, view=view)
+                    if not await self.bot.db.begin_feed_delivery(
+                        guild_id, profile_key, aliases, payload, channel.id
+                    ):
+                        continue
+                    try:
+                        message = await channel.send(embed=embed, view=view)
+                    except asyncio.CancelledError:
+                        raise
+                    except discord.HTTPException as error:
+                        if 400 <= getattr(error, "status", 500) < 500:
+                            await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
+                        else:
+                            await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
+                        raise
+                    except Exception:
+                        await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
+                        raise
                     message_id, old_channel = message.id, channel.id
-            await self.bot.db.store_feed_message(guild_id, discord_id, aliases, payload, message_id, old_channel)
+            await self.bot.db.store_feed_message(guild_id, profile_key, aliases, payload, message_id, old_channel)
             for alias in aliases:
                 saved[alias] = {"payload": payload, "message_id": message_id, "channel_id": old_channel}
             if not record:
@@ -185,22 +217,22 @@ class FeedCog(commands.Cog, name="Feed"):
             )
             return
 
-        # Seed each linked member's current journal before enabling the feed,
+        # Seed each linked profile's current journal before enabling the feed,
         # so setup does not publish existing history as new activity.
         member_ids = [member.id for member in interaction.guild.members]
-        linked_members = await self.bot.db.get_guild_linked_users(member_ids)
-        for user_row in linked_members:
-            discord_id = user_row["discord_id"]
-            username = user_row["backloggd_username"]
+        linked_profiles = await self.bot.db.get_guild_linked_profiles(member_ids)
+        for profile_row in linked_profiles:
+            profile_key = profile_row["profile_key"]
+            username = profile_row["display_username"]
             try:
                 sources = await self._fetch_feed_sources(username)
                 for source, entries in sources.items():
                     ids = [entry.activity_id for entry in entries]
-                    await self.bot.db.seed_journal_entries_for_guild(interaction.guild_id, discord_id, ids)
-                    await self.bot.db.seed_feed_source(interaction.guild_id, discord_id, source + "-display-v1", ids)
+                    await self.bot.db.seed_journal_entries_for_guild(interaction.guild_id, profile_key, ids)
+                    await self.bot.db.seed_feed_source(interaction.guild_id, profile_key, source + "-display-v1", ids)
                     for event in entries:
                         payload = json.dumps(asdict(replace(event, event_ids=(event.activity_id,))), sort_keys=True)
-                        await self.bot.db.seed_feed_message(interaction.guild_id, discord_id, (event.activity_id,), payload)
+                        await self.bot.db.seed_feed_message(interaction.guild_id, profile_key, (event.activity_id,), payload)
             except Exception as e:
                 logger.warning("Could not seed current activity for %s: %s", username, e)
 
@@ -270,20 +302,20 @@ class FeedCog(commands.Cog, name="Feed"):
                     logger.warning("Missing send_messages or embed_links permission in guild %d channel %d", guild_id, channel_id)
                     continue
 
-                # Get linked members in this guild
+                # Get distinct linked profiles in this guild.
                 member_ids = [m.id for m in guild.members]
-                linked_members = await self.bot.db.get_guild_linked_users(member_ids)
+                linked_profiles = await self.bot.db.get_guild_linked_profiles(member_ids)
 
-                for user_row in linked_members:
-                    discord_id = user_row["discord_id"]
-                    username = user_row["backloggd_username"]
-                    avatar_url = user_row["avatar_url"]
+                for profile_row in linked_profiles:
+                    profile_key = profile_row["profile_key"]
+                    username = profile_row["display_username"]
+                    avatar_url = profile_row["avatar_url"]
 
                     try:
-                        if username not in user_journal_cache:
-                            user_journal_cache[username] = await self._fetch_feed_sources(username)
+                        if profile_key not in user_journal_cache:
+                            user_journal_cache[profile_key] = await self._fetch_feed_sources(username)
                         await self._publish_sources(
-                            guild_id, discord_id, username, avatar_url, channel, user_journal_cache[username]
+                            guild_id, profile_key, username, avatar_url, channel, user_journal_cache[profile_key]
                         )
 
                     except Exception as e:

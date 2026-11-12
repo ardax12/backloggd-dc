@@ -40,6 +40,33 @@ def create_legacy_database(path: Path, *, case_insensitive_index: bool = False) 
             FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
             FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
         );
+        CREATE TABLE feed_sources (
+            guild_id INTEGER NOT NULL,
+            discord_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (guild_id, discord_id, source)
+        );
+        CREATE TABLE feed_messages (
+            guild_id INTEGER NOT NULL,
+            discord_id INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            message_id INTEGER,
+            channel_id INTEGER,
+            PRIMARY KEY (guild_id, discord_id, event_id)
+        );
+        CREATE TABLE seen_journal_deliveries (
+            guild_id INTEGER NOT NULL,
+            entry_id TEXT NOT NULL,
+            discord_id INTEGER NOT NULL,
+            posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, entry_id)
+        );
+        CREATE TABLE seen_journal_logs (
+            entry_id TEXT PRIMARY KEY,
+            discord_id INTEGER NOT NULL,
+            posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     if case_insensitive_index:
         connection.execute(
@@ -86,7 +113,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
         await db.connect()
         try:
             version = await db._fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-            self.assertEqual(version["version"], 1)
+            self.assertEqual(version["version"], 2)
             self.assertEqual(await db._fetchall("SELECT * FROM profiles"), [])
             self.assertIsNotNone(await db._fetchone(
                 "SELECT type FROM sqlite_master WHERE name = 'user_ratings'"
@@ -128,7 +155,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(repeated), 2)
             version = await db._fetchone("SELECT COUNT(*) AS count FROM schema_migrations")
-            self.assertEqual(version["count"], 1)
+            self.assertEqual(version["count"], 2)
         finally:
             await db.close()
 
@@ -182,7 +209,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "new-game": 4.0, "shared-game": 4.5
             })
             version = await retry._fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-            self.assertEqual(version["version"], 1)
+            self.assertEqual(version["version"], 2)
         finally:
             await retry.close()
 
@@ -225,6 +252,6 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(row["game_slug"], row["rating"]) for row in rows], [
                 ("new-game", 4.0), ("shared-game", 4.5)
             ])
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 2)
         finally:
             await db.close()

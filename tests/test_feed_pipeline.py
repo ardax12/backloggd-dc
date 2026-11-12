@@ -19,6 +19,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.db = Database(str(Path(self.directory.name) / "feed.db"), turso_url="")
         await self.db.connect()
+        await self.db.link_user(10, "Millers")
         self.channel = SimpleNamespace(id=100, send=AsyncMock(return_value=SimpleNamespace(id=999)), get_partial_message=MagicMock(return_value=SimpleNamespace(edit=AsyncMock())))
         self.cog = FeedCog(SimpleNamespace(db=self.db))
         self.activity = completion_event()
@@ -33,7 +34,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.directory.cleanup()
 
     async def publish(self, sources, guild=1, member=10):
-        await self.cog._publish_sources(guild, member, "Millers", None, self.channel, sources)
+        await self.cog._publish_sources(guild, "millers", "Millers", None, self.channel, sources)
 
     async def baseline(self):
         await self.publish({"activity": [], "journal": []})
@@ -80,7 +81,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         edit = self.channel.get_partial_message.return_value.edit
         edit.assert_not_awaited()
-        rows = await self.db.get_feed_messages(1, 10)
+        rows = await self.db.get_feed_messages(1, "millers")
         stored = json.loads(next(row["payload"] for row in rows if row["event_id"] == self.activity.activity_id))
         self.assertEqual(stored["played_date"], self.log.played_date)
         self.assertEqual(stored["session_labels"], list(self.log.session_labels))
@@ -107,7 +108,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         edit = self.channel.get_partial_message.return_value.edit
         edit.assert_awaited_once()
         self.channel.send.assert_awaited_once()
-        rows = await self.db.get_feed_messages(1, 10)
+        rows = await self.db.get_feed_messages(1, "millers")
         self.assertTrue(all(row["message_id"] == 999 for row in rows))
         self.assertTrue(all(row["channel_id"] == self.channel.id for row in rows))
 
@@ -210,23 +211,41 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.channel.send.await_count, 2)
 
     async def test_failed_send_does_not_mark_event_and_retries(self):
+        import discord
         await self.baseline()
-        self.channel.send.side_effect = RuntimeError("delivery failed")
-        with self.assertRaises(RuntimeError):
+        rejected = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), {"message": "rejected"})
+        self.channel.send.side_effect = rejected
+        with self.assertRaises(discord.Forbidden):
             await self.publish({"activity": [self.activity]})
-        self.assertFalse(await self.db.is_journal_entry_delivered(1, self.activity.activity_id))
+        self.assertFalse(await self.db.is_journal_entry_delivered(1, "millers", self.activity.activity_id))
         self.channel.send.side_effect = None
         await self.publish({"activity": [self.activity]})
-        self.assertTrue(await self.db.is_journal_entry_delivered(1, self.activity.activity_id))
+        self.assertTrue(await self.db.is_journal_entry_delivered(1, "millers", self.activity.activity_id))
+
+    async def test_unknown_send_outcome_is_archived_without_blind_retry(self):
+        await self.baseline()
+        self.channel.send.side_effect = RuntimeError("connection lost after request")
+        with self.assertRaisesRegex(RuntimeError, "connection lost"):
+            await self.publish({"activity": [self.activity]})
+
+        self.channel.send.side_effect = None
+        await self.publish({"activity": [self.activity]})
+
+        self.channel.send.assert_awaited_once()
+        rows = await self.db.get_feed_messages(1, "millers")
+        self.assertEqual(rows[0]["delivery_state"], "unknown")
+        self.assertFalse(await self.db.is_journal_entry_delivered(
+            1, "millers", self.activity.activity_id
+        ))
 
     async def test_partial_baseline_is_not_replayed_after_restart(self):
-        await self.db.seed_feed_source(1, 10, "activity-display-v1", [self.activity.activity_id])
+        await self.db.seed_feed_source(1, "millers", "activity-display-v1", [self.activity.activity_id])
         await self.publish({"activity": [self.activity]})
         self.channel.send.assert_not_awaited()
 
     async def test_failed_sources_do_not_create_baselines(self):
         await self.publish({})
-        self.assertTrue(await self.db.seed_feed_source(1, 10, "activity-display-v1", []))
+        self.assertTrue(await self.db.seed_feed_source(1, "millers", "activity-display-v1", []))
 
     async def test_failed_edit_retries_without_sending_duplicate(self):
         await self.baseline()

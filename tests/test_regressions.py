@@ -58,18 +58,19 @@ class FeedTests(unittest.IsolatedAsyncioTestCase):
             db = Database(path, turso_url="")
             await db.connect()
             try:
-                self.assertTrue(await db.seed_feed_source(1, 10, "activity", ["old"]))
-                self.assertTrue(await db.is_journal_entry_delivered(1, "old"))
-                self.assertFalse(await db.seed_feed_source(1, 10, "activity", ["new"]))
-                self.assertFalse(await db.is_journal_entry_delivered(1, "new"))
-                self.assertTrue(await db.seed_feed_source(2, 10, "activity", ["old"]))
-                self.assertTrue(await db.seed_feed_source(1, 10, "journal", ["journal-old"]))
+                await db.link_user(10, "Tester")
+                self.assertTrue(await db.seed_feed_source(1, "tester", "activity", ["old"]))
+                self.assertTrue(await db.is_journal_entry_delivered(1, "tester", "old"))
+                self.assertFalse(await db.seed_feed_source(1, "tester", "activity", ["new"]))
+                self.assertFalse(await db.is_journal_entry_delivered(1, "tester", "new"))
+                self.assertTrue(await db.seed_feed_source(2, "tester", "activity", ["old"]))
+                self.assertTrue(await db.seed_feed_source(1, "tester", "journal", ["journal-old"]))
             finally:
                 await db.close()
             await db.connect()
             try:
-                self.assertFalse(await db.seed_feed_source(1, 10, "activity", ["after-restart"]))
-                self.assertFalse(await db.is_journal_entry_delivered(1, "after-restart"))
+                self.assertFalse(await db.seed_feed_source(1, "tester", "activity", ["after-restart"]))
+                self.assertFalse(await db.is_journal_entry_delivered(1, "tester", "after-restart"))
             finally:
                 await db.close()
 
@@ -103,12 +104,15 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                     await cog.journal_feed_loop.coro(cog)
                     channel.send.assert_not_awaited()
                     cog._fetch_feed_sources.return_value = {"activity": [event("new"), event("old")]}
-                    channel.send.side_effect = RuntimeError("temporary delivery failure")
+                    channel.send.side_effect = discord.Forbidden(
+                        SimpleNamespace(status=403, reason="Forbidden"),
+                        {"message": "temporary permission rejection"},
+                    )
                     await cog.journal_feed_loop.coro(cog)
-                    self.assertFalse(await db.is_journal_entry_delivered(1, "new"))
+                    self.assertFalse(await db.is_journal_entry_delivered(1, "tester", "new"))
                     channel.send.side_effect = None
                     await cog.journal_feed_loop.coro(cog)
-                    self.assertTrue(await db.is_journal_entry_delivered(1, "new"))
+                    self.assertTrue(await db.is_journal_entry_delivered(1, "tester", "new"))
                     await cog.journal_feed_loop.coro(cog)
                     self.assertEqual(channel.send.await_count, 2)
             finally:

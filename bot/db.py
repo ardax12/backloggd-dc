@@ -271,8 +271,6 @@ class Database:
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove this member's connection while retaining the shared profile snapshot."""
         deleted = await self._rowcount_execute("DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,))
-        await self._execute("DELETE FROM feed_sources WHERE discord_id = ?;", (discord_id,))
-        await self._execute("DELETE FROM feed_messages WHERE discord_id = ?;", (discord_id,))
         return deleted > 0
 
     async def get_linked_user(self, discord_id: int) -> Optional[Any]:
@@ -870,39 +868,43 @@ class Database:
             (entry_id, discord_id)
         )
 
-    async def is_journal_entry_delivered(self, guild_id: int, entry_id: str) -> bool:
-        """Check whether an entry was delivered to a particular guild feed."""
+    async def is_journal_entry_delivered(
+        self, guild_id: int, profile_key: str, entry_id: str
+    ) -> bool:
+        """Check whether a profile event was delivered or baselined in this guild."""
         row = await self._fetchone(
-            "SELECT 1 FROM seen_journal_deliveries WHERE guild_id = ? AND entry_id = ?;",
-            (guild_id, entry_id),
+            """SELECT 1 FROM profile_seen_journal_deliveries
+               WHERE guild_id = ? AND profile_key = ? AND entry_id = ?""",
+            (guild_id, profile_key.strip().lower(), entry_id),
         )
         return row is not None
 
     async def mark_journal_entry_delivered(
-        self, guild_id: int, entry_id: str, discord_id: int
+        self, guild_id: int, profile_key: str, entry_id: str
     ) -> None:
         """Record a journal entry only after its guild feed send succeeds."""
         await self._execute(
-            """INSERT OR IGNORE INTO seen_journal_deliveries
-                (guild_id, entry_id, discord_id) VALUES (?, ?, ?);""",
-            (guild_id, entry_id, discord_id),
+            """INSERT OR IGNORE INTO profile_seen_journal_deliveries
+                (guild_id, profile_key, entry_id) VALUES (?, ?, ?);""",
+            (guild_id, profile_key.strip().lower(), entry_id),
         )
 
     async def seed_journal_entries_for_guild(
-        self, guild_id: int, discord_id: int, entry_ids: Iterable[str]
+        self, guild_id: int, profile_key: str, entry_ids: Iterable[str]
     ) -> None:
         """Mark current journal entries as already present when a feed is enabled."""
         for entry_id in set(entry_ids):
             if entry_id:
-                await self.mark_journal_entry_delivered(guild_id, entry_id, discord_id)
+                await self.mark_journal_entry_delivered(guild_id, profile_key, entry_id)
 
 
-    async def seed_feed_source(self, guild_id: int, discord_id: int,
+    async def seed_feed_source(self, guild_id: int, profile_key: str,
                                source: str, entry_ids: Iterable[str]) -> bool:
         """Baseline a new source once, atomically; later polls deliver new IDs."""
+        profile_key = profile_key.strip().lower()
         async with self._operation_lock:
-            query = "SELECT 1 FROM feed_sources WHERE guild_id = ? AND discord_id = ? AND source = ?"
-            params = (guild_id, discord_id, source)
+            query = "SELECT 1 FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ? AND source = ?"
+            params = (guild_id, profile_key, source)
             if self.is_turso:
                 result = await self._client.execute(query, list(params))
                 exists = bool(result.rows)
@@ -912,10 +914,10 @@ class Database:
             if exists:
                 return False
             statements = [(
-                "INSERT OR IGNORE INTO seen_journal_deliveries (guild_id, entry_id, discord_id) VALUES (?, ?, ?)",
-                (guild_id, entry_id, discord_id),
+                "INSERT OR IGNORE INTO profile_seen_journal_deliveries (guild_id, profile_key, entry_id) VALUES (?, ?, ?)",
+                (guild_id, profile_key, entry_id),
             ) for entry_id in set(entry_ids) if entry_id]
-            statements.append(("INSERT OR IGNORE INTO feed_sources VALUES (?, ?, ?)", params))
+            statements.append(("INSERT OR IGNORE INTO profile_feed_sources VALUES (?, ?, ?)", params))
             if self.is_turso:
                 await self._client.batch(statements)
             else:
@@ -930,28 +932,38 @@ class Database:
             return True
 
 
-    async def get_feed_messages(self, guild_id: int, discord_id: int):
+    async def get_feed_messages(self, guild_id: int, profile_key: str):
         """Retain source aliases and Discord message IDs across polls/restarts."""
+        profile_key = profile_key.strip().lower()
+        # A pending write without a confirmed response may have crossed a process
+        # restart. Mark it uncertain so the next poll never blindly reposts it.
+        await self._execute(
+            """UPDATE profile_feed_messages SET delivery_state = 'unknown'
+               WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'""",
+            (guild_id, profile_key),
+        )
         return await self._fetchall(
-            "SELECT event_id, payload, message_id, channel_id FROM feed_messages WHERE guild_id = ? AND discord_id = ?",
-            (guild_id, discord_id),
+            """SELECT event_id, payload, message_id, channel_id, delivery_state
+               FROM profile_feed_messages WHERE guild_id = ? AND profile_key = ?""",
+            (guild_id, profile_key),
         )
 
-    async def seed_feed_message(self, guild_id: int, discord_id: int, event_ids,
+    async def seed_feed_message(self, guild_id: int, profile_key: str, event_ids,
                                 payload: str):
         """Record baseline events only when absent, preserving delivered mappings."""
+        profile_key = profile_key.strip().lower()
         statements = []
         for event_id in event_ids:
             statements.append((
-                """INSERT OR IGNORE INTO feed_messages
-                   (guild_id, discord_id, event_id, payload, message_id, channel_id)
-                   VALUES (?, ?, ?, ?, NULL, NULL)""",
-                (guild_id, discord_id, event_id, payload),
+                """INSERT OR IGNORE INTO profile_feed_messages
+                   (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                   VALUES (?, ?, ?, ?, NULL, NULL, 'baseline')""",
+                (guild_id, profile_key, event_id, payload),
             ))
             statements.append((
-                """INSERT OR IGNORE INTO seen_journal_deliveries
-                   (guild_id, entry_id, discord_id) VALUES (?, ?, ?)""",
-                (guild_id, event_id, discord_id),
+                """INSERT OR IGNORE INTO profile_seen_journal_deliveries
+                   (guild_id, profile_key, entry_id) VALUES (?, ?, ?)""",
+                (guild_id, profile_key, event_id),
             ))
         async with self._operation_lock:
             if self.is_turso:
@@ -966,19 +978,35 @@ class Database:
                     await self._conn.rollback()
                     raise
 
-    async def store_feed_message(self, guild_id: int, discord_id: int, event_ids,
-                                 payload: str, message_id=None, channel_id=None):
+    async def store_feed_message(self, guild_id: int, profile_key: str, event_ids,
+                                 payload: str, message_id=None, channel_id=None,
+                                 delivery_state: Optional[str] = None):
+        profile_key = profile_key.strip().lower()
+        saved_state = delivery_state or ("sent" if message_id is not None else "baseline")
         statements = []
         for event_id in event_ids:
             statements.append(("""
-                INSERT INTO feed_messages (guild_id, discord_id, event_id, payload, message_id, channel_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(guild_id, discord_id, event_id) DO UPDATE SET
-                    payload = excluded.payload, message_id = excluded.message_id, channel_id = excluded.channel_id
-            """, (guild_id, discord_id, event_id, payload, message_id, channel_id)))
-            statements.append(("""
-                INSERT OR IGNORE INTO seen_journal_deliveries (guild_id, entry_id, discord_id) VALUES (?, ?, ?)
-            """, (guild_id, event_id, discord_id)))
+                INSERT INTO profile_feed_messages
+                    (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, profile_key, event_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    message_id = COALESCE(excluded.message_id, profile_feed_messages.message_id),
+                    channel_id = COALESCE(excluded.channel_id, profile_feed_messages.channel_id),
+                    delivery_state = CASE
+                        WHEN excluded.delivery_state IN ('unknown', 'deleted') THEN excluded.delivery_state
+                        WHEN excluded.message_id IS NOT NULL THEN 'sent'
+                        ELSE profile_feed_messages.delivery_state
+                    END
+            """, (
+                guild_id, profile_key, event_id, payload, message_id, channel_id,
+                saved_state,
+            )))
+            if saved_state != "unknown":
+                statements.append(("""
+                    INSERT OR IGNORE INTO profile_seen_journal_deliveries
+                        (guild_id, profile_key, entry_id) VALUES (?, ?, ?)
+                """, (guild_id, profile_key, event_id)))
         async with self._operation_lock:
             if self.is_turso:
                 await self._client.batch(statements)
@@ -991,3 +1019,94 @@ class Database:
                 except BaseException:
                     await self._conn.rollback()
                     raise
+
+    async def begin_feed_delivery(
+        self, guild_id: int, profile_key: str, event_ids: Iterable[str], payload: str, channel_id: int
+    ) -> bool:
+        """Persist a send intent before calling Discord; return false for known or uncertain events."""
+        profile_key = profile_key.strip().lower()
+        aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not aliases:
+            return False
+        placeholders = ",".join("?" for _ in aliases)
+        async with self._operation_lock:
+            query = f"""SELECT delivery_state FROM profile_feed_messages
+                WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})"""
+            params = [guild_id, profile_key, *aliases]
+            if self.is_turso:
+                transaction = self._client.transaction()
+                try:
+                    result = await transaction.execute(query, params)
+                    if result.rows:
+                        await transaction.commit()
+                        return False
+                    for event_id in aliases:
+                        await transaction.execute(
+                            """INSERT OR IGNORE INTO profile_feed_messages
+                               (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                               VALUES (?, ?, ?, ?, NULL, ?, 'pending')""",
+                            [guild_id, profile_key, event_id, payload, channel_id],
+                        )
+                    await transaction.commit()
+                    return True
+                except BaseException:
+                    await transaction.rollback()
+                    raise
+
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                async with self._conn.execute(query, params) as cursor:
+                    existing = await cursor.fetchone()
+                if existing:
+                    await self._conn.commit()
+                    return False
+                for event_id in aliases:
+                    await self._conn.execute(
+                        """INSERT OR IGNORE INTO profile_feed_messages
+                           (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                           VALUES (?, ?, ?, ?, NULL, ?, 'pending')""",
+                        (guild_id, profile_key, event_id, payload, channel_id),
+                    )
+                await self._conn.commit()
+                return True
+            except BaseException:
+                await self._conn.rollback()
+                raise
+
+    async def release_feed_delivery(self, guild_id: int, profile_key: str, event_ids: Iterable[str]) -> None:
+        """Remove a pending intent after Discord definitively rejected a send."""
+        aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not aliases:
+            return
+        placeholders = ",".join("?" for _ in aliases)
+        await self._rowcount_execute(
+            f"""DELETE FROM profile_feed_messages
+                WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
+                  AND event_id IN ({placeholders})""",
+            [guild_id, profile_key.strip().lower(), *aliases],
+        )
+
+    async def mark_feed_delivery_unknown(self, guild_id: int, profile_key: str, event_ids: Iterable[str]) -> None:
+        aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not aliases:
+            return
+        placeholders = ",".join("?" for _ in aliases)
+        await self._execute(
+            f"""UPDATE profile_feed_messages SET delivery_state = 'unknown'
+                WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
+                  AND event_id IN ({placeholders})""",
+            [guild_id, profile_key.strip().lower(), *aliases],
+        )
+
+    async def mark_feed_message_deleted(
+        self, guild_id: int, profile_key: str, event_ids: Iterable[str], payload: str
+    ) -> None:
+        aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not aliases:
+            return
+        placeholders = ",".join("?" for _ in aliases)
+        await self._execute(
+            f"""UPDATE profile_feed_messages SET delivery_state = 'deleted', payload = ?
+                WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
+            [payload, guild_id, profile_key.strip().lower(), *aliases],
+        )

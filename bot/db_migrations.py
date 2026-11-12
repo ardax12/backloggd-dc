@@ -112,6 +112,92 @@ async def _migrate_profile_schema(execute: Execute, fetchone: FetchOne) -> None:
     await execute("CREATE INDEX IF NOT EXISTS idx_profile_ratings_status ON profile_ratings(status)", ())
 
 
+async def _migrate_profile_feed_schema(execute: Execute, fetchone: FetchOne) -> None:
+    """Copy provable legacy feed ownership to profiles and retain legacy rows for audit."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_feed_sources (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            PRIMARY KEY (guild_id, profile_key, source),
+            FOREIGN KEY (profile_key) REFERENCES profiles(profile_key)
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_feed_messages (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            message_id INTEGER,
+            channel_id INTEGER,
+            delivery_state TEXT NOT NULL DEFAULT 'baseline',
+            PRIMARY KEY (guild_id, profile_key, event_id),
+            FOREIGN KEY (profile_key) REFERENCES profiles(profile_key)
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_seen_journal_deliveries (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, profile_key, entry_id),
+            FOREIGN KEY (profile_key) REFERENCES profiles(profile_key)
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_seen_journal_logs (
+            profile_key TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (profile_key, entry_id),
+            FOREIGN KEY (profile_key) REFERENCES profiles(profile_key)
+        )
+    """, ())
+
+    await execute("""
+        INSERT OR IGNORE INTO profile_feed_sources (guild_id, profile_key, source)
+        SELECT DISTINCT old.guild_id, linked.profile_key, old.source
+        FROM feed_sources AS old
+        JOIN linked_users AS linked ON linked.discord_id = old.discord_id
+    """, ())
+    await execute("""
+        WITH ranked_messages AS (
+            SELECT old.guild_id, linked.profile_key, old.event_id, old.payload,
+                   old.message_id, old.channel_id, linked.discord_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY old.guild_id, linked.profile_key, old.event_id
+                       ORDER BY CASE WHEN old.message_id IS NULL THEN 1 ELSE 0 END,
+                                old.message_id ASC, linked.discord_id ASC
+                   ) AS profile_rank
+            FROM feed_messages AS old
+            JOIN linked_users AS linked ON linked.discord_id = old.discord_id
+        )
+        INSERT OR IGNORE INTO profile_feed_messages
+            (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+        SELECT guild_id, profile_key, event_id, payload, message_id, channel_id,
+               CASE WHEN message_id IS NULL THEN 'baseline' ELSE 'sent' END
+        FROM ranked_messages
+        WHERE profile_rank = 1
+    """, ())
+    await execute("""
+        INSERT OR IGNORE INTO profile_seen_journal_deliveries
+            (guild_id, profile_key, entry_id, posted_at)
+        SELECT DISTINCT old.guild_id, linked.profile_key, old.entry_id, old.posted_at
+        FROM seen_journal_deliveries AS old
+        JOIN linked_users AS linked ON linked.discord_id = old.discord_id
+    """, ())
+    await execute("""
+        INSERT OR IGNORE INTO profile_seen_journal_logs (profile_key, entry_id, posted_at)
+        SELECT DISTINCT linked.profile_key, old.entry_id, old.posted_at
+        FROM seen_journal_logs AS old
+        JOIN linked_users AS linked ON linked.discord_id = old.discord_id
+    """, ())
+    await execute("CREATE INDEX IF NOT EXISTS idx_profile_feed_messages_lookup ON profile_feed_messages(guild_id, profile_key)", ())
+    await execute("CREATE INDEX IF NOT EXISTS idx_profile_feed_deliveries_lookup ON profile_seen_journal_deliveries(guild_id, profile_key)", ())
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -138,6 +224,9 @@ async def run_migrations(database) -> None:
                 if version < 1:
                     await _migrate_profile_schema(execute, fetchone)
                     await execute("INSERT INTO schema_migrations (version) VALUES (1)")
+                if version < 2:
+                    await _migrate_profile_feed_schema(execute, fetchone)
+                    await execute("INSERT INTO schema_migrations (version) VALUES (2)")
                 await transaction.commit()
             except BaseException:
                 await transaction.rollback()
@@ -160,6 +249,9 @@ async def run_migrations(database) -> None:
             if version < 1:
                 await _migrate_profile_schema(execute, fetchone)
                 await execute("INSERT INTO schema_migrations (version) VALUES (1)")
+            if version < 2:
+                await _migrate_profile_feed_schema(execute, fetchone)
+                await execute("INSERT INTO schema_migrations (version) VALUES (2)")
             await connection.commit()
         except BaseException:
             await connection.rollback()
