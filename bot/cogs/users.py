@@ -63,9 +63,18 @@ class UsersCog(commands.Cog, name="Users"):
             reviews_task = self.bot.backloggd.get_user_reviews(target_username, max_pages=1)
 
             results = await asyncio.gather(profile_task, journal_task, reviews_task, return_exceptions=True)
-            profile_data = results[0] if not isinstance(results[0], Exception) else None
+            profile_error = results[0] if isinstance(results[0], Exception) else None
+            profile_data = results[0] if profile_error is None else None
             journal_entries = results[1] if not isinstance(results[1], Exception) and isinstance(results[1], list) else []
             user_reviews = results[2] if not isinstance(results[2], Exception) and isinstance(results[2], list) else []
+
+            if profile_error:
+                logger.warning("Could not load Backloggd profile for %s: %s", target_username, profile_error)
+                await interaction.followup.send(
+                    f"❌ Backloggd could not load **{target_username}**'s profile right now. Please try again shortly.",
+                    ephemeral=True
+                )
+                return
 
             if not profile_data or not profile_data.username:
                 await interaction.followup.send(
@@ -84,10 +93,6 @@ class UsersCog(commands.Cog, name="Users"):
                 if stats and stats.get("rated_count", 0) > 0:
                     avg_rating = stats.get("average_rating")
                     rated_count = stats.get("rated_count")
-
-                # Fallback to local DB recent ratings if journal is empty
-                if not recent_played:
-                    recent_played = await self.bot.db.get_user_recent_ratings(target_discord_id, limit=5)
 
             latest_review = user_reviews[0] if user_reviews else None
 

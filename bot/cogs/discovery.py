@@ -60,6 +60,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 game_url=build_backloggd_game_url(new_choice["slug"]),
                 on_reroll=on_reroll
             )
+            new_view.message = btn_interaction.message
             await btn_interaction.response.edit_message(embed=new_embed, view=new_view)
 
         embed = create_roulette_embed(username, chosen_game, remaining)
@@ -69,7 +70,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             on_reroll=on_reroll
         )
 
-        await interaction.followup.send(embed=embed, view=view)
+        view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
 
     # =========================================================================
     # /recommend (Taste-Matched Server Recommendations)

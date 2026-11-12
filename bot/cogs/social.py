@@ -373,7 +373,7 @@ class SocialCog(commands.Cog, name="Social"):
                 on_compare=on_compare if top_twin_name else None
             )
 
-            await interaction.followup.send(embed=embed, view=view)
+            view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
 
         except Exception as e:
             logger.error("Error running taste-twins for %s: %s", target_username, e, exc_info=True)

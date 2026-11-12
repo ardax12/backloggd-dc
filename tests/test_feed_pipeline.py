@@ -60,6 +60,40 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.channel.send.assert_awaited_once()
         self.channel.get_partial_message.return_value.edit.assert_awaited_once()
 
+    async def test_setchannel_rejects_missing_embed_permission(self):
+        self.channel.permissions_for = lambda _: SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=False
+        )
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(members=[], me=object()),
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await FeedCog.setchannel.callback(self.cog, interaction, self.channel)
+
+        self.assertIsNone(await self.db.get_feed_channel(1))
+        self.assertIn("embed", interaction.followup.send.call_args.args[0].lower())
+
+    async def test_setchannel_explains_that_only_future_events_are_announced(self):
+        self.channel.mention = "#feed"
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(members=[], me=object()),
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        self.channel.permissions_for = lambda _: SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=True
+        )
+
+        await FeedCog.setchannel.callback(self.cog, interaction, self.channel)
+
+        message = interaction.followup.send.call_args.args[0].lower()
+        self.assertIn("future", message)
+        self.assertIn("existing", message)
+
     async def test_rating_change_uses_baselined_rating(self):
         old = replace(self.activity, action_type="rated", rating=3.0)
         await self.publish({"activity": [old], "journal": []})

@@ -5,6 +5,7 @@ from discord import app_commands
 from discord.ext import commands
 import logging
 from typing import List
+from uuid import uuid4
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
 from bot.ui.views import LinkButtonView, GameCardView, RatingsView
 from bot.ui.helpers import build_backloggd_game_url
@@ -16,6 +17,7 @@ class GamesCog(commands.Cog, name="Games"):
         self.bot = bot
         # Lightweight in-memory cache for autocomplete queries to avoid hammering search
         self._autocomplete_cache = {}
+        self._autocomplete_slugs = {}
 
     async def game_autocomplete(
         self,
@@ -34,6 +36,7 @@ class GamesCog(commands.Cog, name="Games"):
         # Prevent unbounded memory growth by pruning cache if it grows too large
         if len(self._autocomplete_cache) > 500:
             self._autocomplete_cache.clear()
+            self._autocomplete_slugs.clear()
 
         try:
             results = await self.bot.backloggd.search_games(clean_query)
@@ -43,7 +46,9 @@ class GamesCog(commands.Cog, name="Games"):
                 # Discord choice name limit is 100 characters
                 if len(name) > 100:
                     name = name[:97] + "..."
-                choices.append(app_commands.Choice(name=name, value=g.slug))
+                token = f"g{uuid4().hex}"
+                self._autocomplete_slugs[token] = g.slug
+                choices.append(app_commands.Choice(name=name, value=token))
 
             self._autocomplete_cache[clean_query.lower()] = choices
             return choices
@@ -57,16 +62,27 @@ class GamesCog(commands.Cog, name="Games"):
     async def game(self, interaction: discord.Interaction, title: str):
         await interaction.response.defer()
 
-        # Resolve slug or run fallback search
-        slug = title.strip()
+        # Autocomplete values are opaque tokens so free text is always searched.
+        query = title.strip()
         try:
-            # Check if title is directly a slug or title
-            if " " in slug or not slug.replace("-", "").isalnum():
-                search_results = await self.bot.backloggd.search_games(slug)
+            slug = self._autocomplete_slugs.get(query)
+            if not slug:
+                search_results = await self.bot.backloggd.search_games(query)
                 if not search_results:
                     await interaction.followup.send(
-                        f"❌ No games found matching **{slug}** on Backloggd.",
+                        f"❌ No games found matching **{query}** on Backloggd.",
                         ephemeral=True
+                    )
+                    return
+                if len(search_results) > 1:
+                    candidates = [
+                        f"{game.title} ({game.release_year})" if getattr(game, "release_year", None) else game.title
+                        for game in search_results[:5]
+                    ]
+                    options = "; ".join(candidates)
+                    await interaction.followup.send(
+                        f"I found several games matching **{query}**: {options}. Select the game from the autocomplete list and run `/game` again.",
+                        ephemeral=True,
                     )
                     return
                 slug = search_results[0].slug
@@ -101,6 +117,7 @@ class GamesCog(commands.Cog, name="Games"):
                 await btn_interaction.response.send_message(
                     embed=ratings_view.embed(), view=ratings_view, ephemeral=True
                 )
+                ratings_view.message = await btn_interaction.original_response()
 
             view = GameCardView(
                 game_url=game_url,
@@ -108,7 +125,7 @@ class GamesCog(commands.Cog, name="Games"):
                 on_view_all=on_view_all if len(server_ratings) > 12 else None
             )
 
-            await interaction.followup.send(embed=embed, view=view)
+            view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
 
         except Exception as e:
             logger.error("Error looking up game '%s': %s", title, e, exc_info=True)

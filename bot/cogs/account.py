@@ -20,7 +20,7 @@ class AccountCog(commands.Cog, name="Account"):
             task.cancel()
         self._sync_tasks.clear()
 
-    def _start_sync_task(self, discord_id: int, username: str) -> asyncio.Task:
+    def _start_sync_task(self, discord_id: int, username: str, status_message=None) -> asyncio.Task:
         """Keep only the newest library sync active for each Discord account."""
         previous = self._sync_tasks.get(discord_id)
         if previous and not previous.done():
@@ -34,7 +34,35 @@ class AccountCog(commands.Cog, name="Account"):
                 self._sync_tasks.pop(discord_id, None)
 
         task.add_done_callback(clear_task)
+        if status_message:
+            task.add_done_callback(
+                lambda completed: asyncio.create_task(
+                    self._update_link_status(completed, username, status_message)
+                )
+            )
         return task
+
+    async def _update_link_status(self, task: asyncio.Task, username: str, status_message) -> None:
+        try:
+            total_synced = task.result()
+        except asyncio.CancelledError:
+            title = "Library sync stopped"
+            description = f"The sync for **{username}** was interrupted. Run `/refresh` to try again."
+            color = COLOR_PRIMARY
+        else:
+            if total_synced is None:
+                title = "Library sync failed"
+                description = f"Backloggd could not sync **{username}** right now. Your previous library was kept; try `/refresh` shortly."
+                color = COLOR_ERROR
+            else:
+                title = "Library sync complete"
+                description = f"Synced **{total_synced}** games for **{username}**. Your ratings are ready to use with `/game`."
+                color = COLOR_PLAYED
+        embed = discord.Embed(title=title, description=description, color=color)
+        try:
+            await status_message.edit(embed=embed)
+        except discord.HTTPException:
+            logger.info("Could not update link status message for %s", username, exc_info=True)
 
     def _cancel_sync_task(self, discord_id: int) -> None:
         task = self._sync_tasks.pop(discord_id, None)
@@ -103,7 +131,7 @@ class AccountCog(commands.Cog, name="Account"):
         except Exception as e:
             logger.error("Failed to verify user %s: %s", clean_user, e)
             await interaction.followup.send(
-                f"❌ Error verifying username **{clean_user}**. Please check the spelling.",
+                f"❌ Backloggd could not verify **{clean_user}** right now. Please try again shortly.",
                 ephemeral=True
             )
             return
@@ -126,10 +154,10 @@ class AccountCog(commands.Cog, name="Account"):
         if profile.avatar_url:
             embed.set_thumbnail(url=profile.avatar_url)
 
-        await interaction.followup.send(embed=embed)
+        status_message = await interaction.followup.send(embed=embed, wait=True)
 
         # Background sync. An older in-flight sync cannot write after a relink.
-        self._start_sync_task(interaction.user.id, profile.username)
+        self._start_sync_task(interaction.user.id, profile.username, status_message=status_message)
 
     @app_commands.command(name="unlink", description="Unlink your Backloggd account from Discord")
     async def unlink(self, interaction: discord.Interaction):

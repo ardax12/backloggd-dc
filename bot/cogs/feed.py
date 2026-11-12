@@ -141,6 +141,26 @@ class FeedCog(commands.Cog, name="Feed"):
     async def setchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await interaction.response.defer(ephemeral=True)
 
+        if interaction.guild is None:
+            await interaction.followup.send("❌ Choose a text channel in a server to set up the activity feed.", ephemeral=True)
+            return
+
+        permissions = channel.permissions_for(interaction.guild.me)
+        missing = [
+            name for attribute, name in (
+                ("view_channel", "View Channel"),
+                ("send_messages", "Send Messages"),
+                ("embed_links", "Embed Links"),
+            )
+            if not getattr(permissions, attribute, False)
+        ]
+        if missing:
+            await interaction.followup.send(
+                "❌ I need **" + "**, **".join(missing) + "** permission in that channel before I can post activity.",
+                ephemeral=True,
+            )
+            return
+
         # Seed each linked member's current journal before enabling the feed,
         # so setup does not publish existing history as new activity.
         member_ids = [member.id for member in interaction.guild.members]
@@ -162,7 +182,7 @@ class FeedCog(commands.Cog, name="Feed"):
 
         await self.bot.db.set_feed_channel(interaction.guild_id, channel.id)
         await interaction.followup.send(
-            f"✅ Successfully set {channel.mention} as the automatic Backloggd activity feed channel!",
+            f"✅ Set {channel.mention} as the Backloggd activity feed channel. Only future activity will be announced; existing history is skipped.",
             ephemeral=True
         )
 

@@ -13,7 +13,25 @@ class LinkButtonView(View):
             for extra_label, extra_url in extra_buttons:
                 self.add_item(Button(label=extra_label, url=extra_url, style=discord.ButtonStyle.link))
 
-class RouletteView(View):
+class ExpiringView(View):
+    """Disable expired controls on the message that owns this view."""
+
+    def __init__(self, *, timeout: float = 180):
+        super().__init__(timeout=timeout)
+        self.message = None
+
+    async def on_timeout(self):
+        for item in self.children:
+            if getattr(item, "url", None) is None:
+                item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.NotFound:
+                pass
+
+
+class RouletteView(ExpiringView):
     """Interactive view for Backlog Roulette with a Reroll button."""
     def __init__(
         self,
@@ -21,7 +39,7 @@ class RouletteView(View):
         game_url: str,
         on_reroll: Callable[[discord.Interaction], Coroutine[Any, Any, None]]
     ):
-        super().__init__(timeout=180)  # 3 minute interaction timeout
+        super().__init__()  # 3 minute interaction timeout
         self.author_id = author_id
         self.on_reroll = on_reroll
 
@@ -41,7 +59,7 @@ class RouletteView(View):
         await self.on_reroll(interaction)
 
 
-class TasteTwinsView(View):
+class TasteTwinsView(ExpiringView):
     """Interactive view for /taste-twins with link button and quick Duel button."""
     def __init__(
         self,
@@ -49,7 +67,7 @@ class TasteTwinsView(View):
         top_twin_name: Optional[str] = None,
         on_compare: Optional[Callable[[discord.Interaction], Coroutine[Any, Any, None]]] = None
     ):
-        super().__init__(timeout=180)
+        super().__init__()
         self.add_item(Button(label="View Profile on Backloggd", url=user_url, style=discord.ButtonStyle.link))
         if top_twin_name and on_compare:
             compare_btn = Button(
@@ -61,7 +79,7 @@ class TasteTwinsView(View):
             self.add_item(compare_btn)
 
 
-class GameCardView(View):
+class GameCardView(ExpiringView):
     """Interactive view for /game command with Backloggd link and optional 'View All Ratings' button."""
     def __init__(
         self,
@@ -69,7 +87,7 @@ class GameCardView(View):
         total_ratings: int,
         on_view_all: Optional[Callable[[discord.Interaction], Coroutine[Any, Any, None]]] = None
     ):
-        super().__init__(timeout=180)
+        super().__init__()
         self.add_item(Button(label="View on Backloggd", url=game_url, style=discord.ButtonStyle.link))
         if total_ratings > 12 and on_view_all:
             view_all_btn = Button(
@@ -81,11 +99,11 @@ class GameCardView(View):
             self.add_item(view_all_btn)
 
 
-class RatingsView(View):
+class RatingsView(ExpiringView):
     """Navigate the private ratings response without rerunning a game search."""
 
     def __init__(self, game_title: str, game_slug: str, guild_name: str, ratings: list):
-        super().__init__(timeout=180)
+        super().__init__()
         self.game_title = game_title
         self.game_slug = game_slug
         self.guild_name = guild_name
