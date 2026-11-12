@@ -1,5 +1,6 @@
 import os
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+import asyncio
 import json
 import tempfile
 import unittest
@@ -272,30 +273,35 @@ class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self.directory.cleanup()
 
-    async def test_username_claim_is_unique_without_case_sensitivity(self):
-        import asyncio
-
-        original_lookup = self.db.get_linked_user_by_username
-        lookups = 0
-        both_looked_up = asyncio.Event()
-
-        async def lookup_before_either_insert(username):
-            nonlocal lookups
-            result = await original_lookup(username)
-            lookups += 1
-            if lookups == 2:
-                both_looked_up.set()
-            if lookups <= 2:
-                await both_looked_up.wait()
-            return result
-
-        self.db.get_linked_user_by_username = lookup_before_either_insert
+    async def test_case_insensitive_profile_links_are_nonexclusive(self):
         results = await asyncio.gather(
             self.db.link_user(10, "Millers"),
             self.db.link_user(11, "millers"),
             return_exceptions=True,
         )
 
-        self.assertEqual(sum(result is True for result in results), 1)
-        self.assertEqual(sum(result is False for result in results), 1)
-        self.assertEqual(len(await self.db.get_all_linked_users()), 1)
+        self.assertEqual(results, [True, True])
+        links = await self.db.get_all_linked_users()
+        self.assertEqual(len(links), 2)
+        self.assertEqual({row["profile_key"] for row in links}, {"millers"})
+
+    async def test_unlinking_one_member_keeps_the_shared_profile_library(self):
+        await self.db.link_user(10, "Millers")
+        await self.db.link_user(11, "millers")
+        await self.db.upsert_game("hades", "Hades")
+        await self.db.upsert_user_rating(10, "hades", 4.5, "played")
+
+        self.assertTrue(await self.db.unlink_user(10))
+
+        self.assertIsNone(await self.db.get_linked_user(10))
+        self.assertEqual((await self.db.get_linked_user(11))["profile_key"], "millers")
+        self.assertEqual(await self.db.get_user_ratings_dict(11), {"hades": 4.5})
+
+    async def test_profile_connections_are_scoped_to_supplied_server_members(self):
+        await self.db.link_user(10, "Millers")
+        await self.db.link_user(11, "millers")
+        await self.db.link_user(12, "MILLERS")
+
+        rows = await self.db.get_profile_connections("MiLLeRs", [10, 11], exclude_discord_id=10)
+
+        self.assertEqual([row["discord_id"] for row in rows], [11])

@@ -4,7 +4,7 @@ os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from bot.cogs.account import AccountCog
 from bot.cogs.games import GamesCog
@@ -67,6 +67,65 @@ class AccountUxTests(unittest.IsolatedAsyncioTestCase):
         message = interaction.followup.send.call_args.args[0]
         self.assertIn("try again", message.lower())
         self.assertNotIn("check the spelling", message.lower())
+
+    async def test_duplicate_profile_notice_names_only_other_members_in_current_guild(self):
+        db = SimpleNamespace(
+            get_linked_user=AsyncMock(return_value=None),
+            link_user=AsyncMock(return_value=True),
+            get_profile_connections=AsyncMock(return_value=[{"discord_id": 2}]),
+        )
+        profile = SimpleNamespace(username="Millers", avatar_url=None)
+        api = SimpleNamespace(get_user_profile=AsyncMock(return_value=profile))
+        cog = AccountCog(SimpleNamespace(db=db, backloggd=api))
+        cog._start_sync_task = MagicMock()
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock(return_value=object())),
+            user=SimpleNamespace(id=1),
+            guild=SimpleNamespace(members=[
+                SimpleNamespace(id=1, display_name="Current member"),
+                SimpleNamespace(id=2, display_name="*Same server*"),
+                SimpleNamespace(id=3, display_name="Unlinked member"),
+            ]),
+        )
+
+        await AccountCog.link.callback(cog, interaction, "Millers")
+
+        db.get_profile_connections.assert_awaited_once_with(
+            "Millers", [1, 2, 3], exclude_discord_id=1
+        )
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        self.assertIn("\\*Same server\\*", embed.fields[0].value)
+        self.assertNotIn("Unlinked member", embed.fields[0].value)
+        self.assertIn("does not verify profile ownership", embed.description)
+        allowed_mentions = interaction.followup.send.call_args.kwargs["allowed_mentions"]
+        self.assertFalse(allowed_mentions.everyone)
+        self.assertFalse(allowed_mentions.users)
+        self.assertFalse(allowed_mentions.roles)
+
+    async def test_duplicate_profile_notice_does_not_query_connections_in_dm(self):
+        db = SimpleNamespace(
+            get_linked_user=AsyncMock(return_value=None),
+            link_user=AsyncMock(return_value=True),
+            get_profile_connections=AsyncMock(return_value=[{"discord_id": 2}]),
+        )
+        api = SimpleNamespace(
+            get_user_profile=AsyncMock(return_value=SimpleNamespace(username="Millers", avatar_url=None))
+        )
+        cog = AccountCog(SimpleNamespace(db=db, backloggd=api))
+        cog._start_sync_task = MagicMock()
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock(return_value=object())),
+            user=SimpleNamespace(id=1),
+            guild=None,
+        )
+
+        await AccountCog.link.callback(cog, interaction, "Millers")
+
+        db.get_profile_connections.assert_not_awaited()
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        self.assertEqual(len(embed.fields), 0)
 
 
 class ViewUxTests(unittest.IsolatedAsyncioTestCase):

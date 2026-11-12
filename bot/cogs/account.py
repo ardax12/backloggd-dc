@@ -111,15 +111,6 @@ class AccountCog(commands.Cog, name="Account"):
                 )
             return
 
-        # 2. Check if the Backloggd account is already claimed by another Discord user
-        other_user = await self.bot.db.get_linked_user_by_username(clean_user)
-        if other_user and other_user["discord_id"] != interaction.user.id:
-            await interaction.followup.send(
-                f"❌ The Backloggd username **{clean_user}** is already linked to another Discord user (<@{other_user['discord_id']}>).",
-                ephemeral=True
-            )
-            return
-
         try:
             profile = await self.bot.backloggd.get_user_profile(clean_user)
             if not profile or not profile.username:
@@ -136,33 +127,55 @@ class AccountCog(commands.Cog, name="Account"):
             )
             return
 
-        # Save basic link immediately
-        linked = await self.bot.db.link_user(
+        await self.bot.db.link_user(
             discord_id=interaction.user.id,
             username=profile.username,
-            avatar_url=profile.avatar_url
+            avatar_url=profile.avatar_url,
         )
-        if not linked:
-            other_user = await self.bot.db.get_linked_user_by_username(profile.username)
-            owner = f" (<@{other_user['discord_id']}>)" if other_user else ""
-            await interaction.followup.send(
-                f"❌ The Backloggd username **{profile.username}** is already linked to another Discord user{owner}.",
-                ephemeral=True
-            )
-            return
 
         embed = discord.Embed(
             title="🔗 Account Linked!",
             description=(
-                f"Successfully linked **{interaction.user.mention}** to Backloggd user **[{profile.username}](https://www.backloggd.com/u/{profile.username}/)**.\n\n"
-                f"🔄 *Syncing your library in the background so your ratings show up on `/game`...*"
+                f"Connected your Discord account to the public Backloggd profile **[{profile.username}](https://www.backloggd.com/u/{profile.username}/)**. "
+                f"This link does not verify profile ownership.\n\n"
+                f"Syncing your library in the background so your ratings show up on `/game`..."
             ),
             color=COLOR_PLAYED
         )
         if profile.avatar_url:
             embed.set_thumbnail(url=profile.avatar_url)
 
-        status_message = await interaction.followup.send(embed=embed, wait=True)
+        duplicate_names = []
+        if interaction.guild:
+            members = {member.id: member for member in interaction.guild.members}
+            connections = await self.bot.db.get_profile_connections(
+                profile.username,
+                list(members),
+                exclude_discord_id=interaction.user.id,
+            )
+            duplicate_names = [
+                discord.utils.escape_markdown(members[row["discord_id"]].display_name)
+                for row in connections
+                if row["discord_id"] in members
+            ]
+        if duplicate_names:
+            shown_names = duplicate_names[:8]
+            if len(duplicate_names) > len(shown_names):
+                shown_names.append(f"and {len(duplicate_names) - len(shown_names)} more")
+            embed.add_field(
+                name="Also linked in this server",
+                value=(
+                    ", ".join(shown_names)
+                    + "\nThese are separate public-profile links; they do not prove who owns the profile."
+                ),
+                inline=False,
+            )
+
+        status_message = await interaction.followup.send(
+            embed=embed,
+            wait=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
         # Background sync. An older in-flight sync cannot write after a relink.
         self._start_sync_task(interaction.user.id, profile.username, status_message=status_message)

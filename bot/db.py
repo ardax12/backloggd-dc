@@ -67,6 +67,8 @@ class Database:
                 auth_token=self.turso_token or None,
             )
             await self._create_tables()
+            from bot.db_migrations import run_migrations
+            await run_migrations(self)
             logger.info("Connected to Turso cloud database.")
         else:
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +76,8 @@ class Database:
             self._conn.row_factory = aiosqlite.Row
             await self._conn.execute("PRAGMA foreign_keys = ON;")
             await self._create_tables()
+            from bot.db_migrations import run_migrations
+            await run_migrations(self)
             logger.info("Connected to local SQLite database at %s", self.db_path)
 
     @property
@@ -149,11 +153,6 @@ class Database:
                 last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        await self._execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_linked_users_username_ci "
-            "ON linked_users(LOWER(backloggd_username));"
-        )
-
         # 2. Cached games
         await self._execute("""
             CREATE TABLE IF NOT EXISTS cached_games (
@@ -166,26 +165,23 @@ class Database:
         """)
 
         # 3. User ratings and status logs
-        await self._execute("""
-            CREATE TABLE IF NOT EXISTS user_ratings (
-                discord_id INTEGER NOT NULL,
-                game_slug TEXT NOT NULL,
-                rating REAL,
-                status TEXT NOT NULL,
-                is_liked BOOLEAN DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (discord_id, game_slug),
-                FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
-                FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
-            );
-        """)
-
-        # Indexes for fast lookup
-        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_slug ON user_ratings(game_slug);")
-        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_user ON user_ratings(discord_id);")
-        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_status ON user_ratings(status);")
-        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_user_status ON user_ratings(discord_id, status);")
-        await self._execute("CREATE INDEX IF NOT EXISTS idx_ratings_slug_user ON user_ratings(game_slug, discord_id);")
+        rating_object = await self._fetchone(
+            "SELECT type FROM sqlite_master WHERE name = 'user_ratings';"
+        )
+        if not rating_object or rating_object["type"] == "table":
+            await self._execute("""
+                CREATE TABLE IF NOT EXISTS user_ratings (
+                    discord_id INTEGER NOT NULL,
+                    game_slug TEXT NOT NULL,
+                    rating REAL,
+                    status TEXT NOT NULL,
+                    is_liked BOOLEAN DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (discord_id, game_slug),
+                    FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
+                    FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
+                );
+            """)
 
         # 4. Guild settings for automatic feed
         await self._execute("""
@@ -249,33 +245,31 @@ class Database:
     # =========================================================================
 
     async def link_user(self, discord_id: int, username: str, avatar_url: Optional[str] = None) -> bool:
-        """Claim a Backloggd username, returning False if another Discord user owns it."""
+        """Connect a Discord member to a normalized shared profile."""
         from bot.ui.helpers import clean_image_url
         clean_avatar = clean_image_url(avatar_url)
-        existing = await self.get_linked_user_by_username(username)
-        if existing and existing["discord_id"] != discord_id:
-            return False
+        profile_key = username.strip().lower()
+        await self._execute("""
+            INSERT INTO profiles (profile_key, display_username, avatar_url)
+            VALUES (?, ?, ?)
+            ON CONFLICT(profile_key) DO UPDATE SET
+                display_username = excluded.display_username,
+                avatar_url = COALESCE(excluded.avatar_url, profiles.avatar_url)
+        """, (profile_key, username.strip(), clean_avatar))
         query = """
-            INSERT INTO linked_users (discord_id, backloggd_username, avatar_url, last_synced_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO linked_users (discord_id, profile_key, backloggd_username, avatar_url, last_synced_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(discord_id) DO UPDATE SET
+                profile_key = excluded.profile_key,
                 backloggd_username = excluded.backloggd_username,
                 avatar_url = COALESCE(excluded.avatar_url, linked_users.avatar_url),
                 last_synced_at = CURRENT_TIMESTAMP;
         """
-        try:
-            await self._execute(query, (discord_id, username, clean_avatar))
-        except Exception:
-            # The case-insensitive unique index is the final guard when two
-            # link requests pass the lookup at the same time.
-            existing = await self.get_linked_user_by_username(username)
-            if existing and existing["discord_id"] != discord_id:
-                return False
-            raise
+        await self._execute(query, (discord_id, profile_key, username, clean_avatar))
         return True
 
     async def unlink_user(self, discord_id: int) -> bool:
-        """Remove a linked user and cascade-delete their cached ratings."""
+        """Remove this member's connection while retaining the shared profile snapshot."""
         deleted = await self._rowcount_execute("DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,))
         await self._execute("DELETE FROM feed_sources WHERE discord_id = ?;", (discord_id,))
         await self._execute("DELETE FROM feed_messages WHERE discord_id = ?;", (discord_id,))
@@ -284,27 +278,52 @@ class Database:
     async def get_linked_user(self, discord_id: int) -> Optional[Any]:
         """Fetch linked user record by Discord ID."""
         return await self._fetchone(
-            "SELECT discord_id, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE discord_id = ?;",
+            "SELECT discord_id, profile_key, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE discord_id = ?;",
             (discord_id,)
         )
 
     async def get_linked_user_by_username(self, username: str) -> Optional[Any]:
         """Fetch linked user record by Backloggd username (case-insensitive)."""
         return await self._fetchone(
-            "SELECT discord_id, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE LOWER(backloggd_username) = LOWER(?);",
+            "SELECT discord_id, profile_key, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE profile_key = LOWER(TRIM(?)) ORDER BY discord_id LIMIT 1;",
             (username.strip(),)
         )
 
+    async def get_profile_connections(
+        self,
+        username: str,
+        member_ids: List[int],
+        exclude_discord_id: Optional[int] = None,
+    ) -> List[Any]:
+        """List only this profile's links among explicitly supplied guild members."""
+        if not member_ids:
+            return []
+        excluded = exclude_discord_id if exclude_discord_id is not None else -1
+        connections = []
+        for start in range(0, len(member_ids), 800):
+            member_chunk = member_ids[start:start + 800]
+            placeholders = ",".join("?" for _ in member_chunk)
+            query = f"""
+                SELECT discord_id FROM linked_users
+                WHERE profile_key = LOWER(TRIM(?))
+                  AND discord_id IN ({placeholders})
+                  AND discord_id <> ?
+                ORDER BY discord_id
+            """
+            params = [username.strip(), *member_chunk, excluded]
+            connections.extend(await self._fetchall(query, params))
+        return connections
+
     async def get_all_linked_users(self) -> List[Any]:
         """Fetch all linked users."""
-        return await self._fetchall("SELECT discord_id, backloggd_username, avatar_url FROM linked_users;")
+        return await self._fetchall("SELECT discord_id, profile_key, backloggd_username, avatar_url FROM linked_users;")
 
     async def get_guild_linked_users(self, member_ids: List[int]) -> List[Any]:
         """Fetch all linked users present in a specific guild."""
         if not member_ids:
             return []
         placeholders = ",".join("?" for _ in member_ids)
-        query = f"SELECT discord_id, backloggd_username, avatar_url FROM linked_users WHERE discord_id IN ({placeholders});"
+        query = f"SELECT discord_id, profile_key, backloggd_username, avatar_url FROM linked_users WHERE discord_id IN ({placeholders});"
         return await self._fetchall(query, member_ids)
 
     # =========================================================================
@@ -341,17 +360,18 @@ class Database:
         status: str,
         is_liked: bool = False
     ) -> None:
-        """Insert or update a user's individual rating and status for a game."""
+        """Insert or update a game row in the linked profile's shared library."""
         query = """
-            INSERT INTO user_ratings (discord_id, game_slug, rating, status, is_liked, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(discord_id, game_slug) DO UPDATE SET
+            INSERT INTO profile_ratings (profile_key, game_slug, rating, status, is_liked, updated_at)
+            SELECT profile_key, ?, ?, ?, ?, CURRENT_TIMESTAMP
+            FROM linked_users WHERE discord_id = ?
+            ON CONFLICT(profile_key, game_slug) DO UPDATE SET
                 rating = excluded.rating,
                 status = excluded.status,
                 is_liked = excluded.is_liked,
                 updated_at = CURRENT_TIMESTAMP;
         """
-        await self._execute(query, (discord_id, game_slug, rating, status, is_liked))
+        await self._execute(query, (game_slug, rating, status, is_liked, discord_id))
 
     async def get_server_ratings_for_game(self, guild_member_ids: List[int], game_slug: str) -> List[Any]:
         """Fetch all ratings and statuses for a game from linked guild members."""
@@ -414,7 +434,7 @@ class Database:
         expected_username: str,
         games: Iterable[Any],
     ) -> bool:
-        """Atomically replace a user's ratings if the linked account still matches."""
+        """Atomically replace the shared profile library if the link still matches."""
         from bot.ui.helpers import clean_image_url
 
         game_rows = [
@@ -424,23 +444,27 @@ class Database:
                 clean_image_url(getattr(game, "cover_url", None)),
                 getattr(game, "release_year", None),
                 getattr(game, "community_rating", None),
-                discord_id,
                 getattr(game, "rating", None),
                 game.status.value if hasattr(game.status, "value") else str(game.status),
                 bool(getattr(game, "is_liked", False)),
             )
             for game in games
         ]
+        profile_key = expected_username.strip().lower()
         ownership_sql = """SELECT 1 FROM linked_users
-            WHERE discord_id = ? AND LOWER(backloggd_username) = LOWER(?)"""
+            WHERE discord_id = ? AND profile_key = ?"""
 
         async with self._operation_lock:
             if self.is_turso:
-                statements = [(ownership_sql, (discord_id, expected_username))]
+                statements = [(ownership_sql, (discord_id, profile_key))]
+                statements.append(("""
+                    UPDATE profiles SET last_synced_at = CURRENT_TIMESTAMP
+                    WHERE profile_key = ? AND EXISTS (""" + ownership_sql + ")",
+                    (profile_key, discord_id, profile_key)))
                 statements.append(("""
                     UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
-                    WHERE discord_id = ? AND LOWER(backloggd_username) = LOWER(?)
-                """, (discord_id, expected_username)))
+                    WHERE profile_key = ? AND EXISTS (""" + ownership_sql + ")",
+                    (profile_key, discord_id, profile_key)))
                 for row in game_rows:
                     statements.append(("""
                         INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
@@ -452,36 +476,38 @@ class Database:
                             community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
                     """, row[:5]))
                 statements.append((f"""
-                    DELETE FROM user_ratings
-                    WHERE discord_id = ? AND EXISTS ({ownership_sql})
-                """, (discord_id, discord_id, expected_username)))
+                    DELETE FROM profile_ratings
+                    WHERE profile_key = ? AND EXISTS ({ownership_sql})
+                """, (profile_key, discord_id, profile_key)))
                 for row in game_rows:
                     statements.append((f"""
-                        INSERT INTO user_ratings
-                            (discord_id, game_slug, rating, status, is_liked, updated_at)
+                        INSERT INTO profile_ratings
+                            (profile_key, game_slug, rating, status, is_liked, updated_at)
                         SELECT ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
                         WHERE EXISTS ({ownership_sql})
-                        ON CONFLICT(discord_id, game_slug) DO UPDATE SET
+                        ON CONFLICT(profile_key, game_slug) DO UPDATE SET
                             rating = excluded.rating,
                             status = excluded.status,
                             is_liked = excluded.is_liked,
                             updated_at = CURRENT_TIMESTAMP
-                    """, (row[5], row[0], row[6], row[7], row[8], discord_id, expected_username)))
+                    """, (profile_key, row[0], row[5], row[6], row[7], discord_id, profile_key)))
                 results = await self._client.batch(statements)
                 return bool(results and results[0].rows)
 
             await self._conn.execute("BEGIN IMMEDIATE")
             try:
-                async with self._conn.execute(ownership_sql, (discord_id, expected_username)) as cursor:
-                    still_linked = await cursor.fetchone()
-                if not still_linked:
+                async with self._conn.execute(ownership_sql, (discord_id, profile_key)) as cursor:
+                    link = await cursor.fetchone()
+                if not link:
                     await self._conn.rollback()
                     return False
 
                 await self._conn.execute("""
-                    UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
-                    WHERE discord_id = ? AND LOWER(backloggd_username) = LOWER(?)
-                """, (discord_id, expected_username))
+                    UPDATE profiles SET last_synced_at = CURRENT_TIMESTAMP WHERE profile_key = ?
+                """, (profile_key,))
+                await self._conn.execute("""
+                    UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP WHERE profile_key = ?
+                """, (profile_key,))
                 for row in game_rows:
                     await self._conn.execute("""
                         INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
@@ -493,14 +519,14 @@ class Database:
                             community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
                     """, row[:5])
                 await self._conn.execute(
-                    "DELETE FROM user_ratings WHERE discord_id = ?;", (discord_id,)
+                    "DELETE FROM profile_ratings WHERE profile_key = ?;", (profile_key,)
                 )
                 for row in game_rows:
                     await self._conn.execute("""
-                        INSERT INTO user_ratings
-                            (discord_id, game_slug, rating, status, is_liked, updated_at)
+                        INSERT INTO profile_ratings
+                            (profile_key, game_slug, rating, status, is_liked, updated_at)
                         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (row[5], row[0], row[6], row[7], row[8]))
+                    """, (profile_key, row[0], row[5], row[6], row[7]))
                 await self._conn.commit()
                 return True
             except BaseException:
