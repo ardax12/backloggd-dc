@@ -31,12 +31,9 @@ class SocialCog(commands.Cog, name="Social"):
 
     async def _get_or_fetch_ratings(self, username: str) -> Dict[str, Optional[float]]:
         """Fetch user's library ratings mapping (slug -> score)."""
-        # Fast indexed lookup in DB first (O(1) instead of scanning all users)
-        linked = await self.bot.db.get_linked_user_by_username(username)
-        if linked:
-            cached = await self.bot.db.get_user_ratings_dict(linked["discord_id"])
-            if cached:
-                return cached
+        profile = await self.bot.db.get_profile_sync_info(username)
+        if profile and profile["last_synced_at"] is not None:
+            return await self.bot.db.get_profile_ratings_dict(username)
 
         # Otherwise fetch library via backloggd-py
         lib = await self.bot.backloggd.get_user_library(username)
@@ -185,11 +182,10 @@ class SocialCog(commands.Cog, name="Social"):
                 target_avatar = linked["avatar_url"]
             else:
                 clean_name = user.strip().lstrip("@")
-                linked = await self.bot.db.get_linked_user_by_username(clean_name)
-                if linked:
-                    target_discord_id = linked["discord_id"]
-                    target_username = linked["backloggd_username"]
-                    target_avatar = linked["avatar_url"]
+                profile = await self.bot.db.get_profile(clean_name)
+                if profile:
+                    target_username = profile["display_username"]
+                    target_avatar = profile["avatar_url"]
                 else:
                     target_username = clean_name
                     target_avatar = None

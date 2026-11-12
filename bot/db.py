@@ -282,13 +282,6 @@ class Database:
             (discord_id,)
         )
 
-    async def get_linked_user_by_username(self, username: str) -> Optional[Any]:
-        """Fetch linked user record by Backloggd username (case-insensitive)."""
-        return await self._fetchone(
-            "SELECT discord_id, profile_key, backloggd_username, avatar_url, last_synced_at FROM linked_users WHERE profile_key = LOWER(TRIM(?)) ORDER BY discord_id LIMIT 1;",
-            (username.strip(),)
-        )
-
     async def get_profile_connections(
         self,
         username: str,
@@ -313,6 +306,51 @@ class Database:
             params = [username.strip(), *member_chunk, excluded]
             connections.extend(await self._fetchall(query, params))
         return connections
+
+    async def get_profile_sync_info(self, username: str) -> Optional[Any]:
+        """Return the profile's last complete sync time and cached row count."""
+        return await self._fetchone("""
+            SELECT profiles.profile_key, profiles.last_synced_at,
+                   COUNT(profile_ratings.game_slug) AS game_count
+            FROM profiles
+            LEFT JOIN profile_ratings ON profile_ratings.profile_key = profiles.profile_key
+            WHERE profiles.profile_key = LOWER(TRIM(?))
+            GROUP BY profiles.profile_key, profiles.last_synced_at
+        """, (username.strip(),))
+
+    async def get_profile(self, username: str) -> Optional[Any]:
+        """Fetch canonical profile data without attributing it to one Discord member."""
+        return await self._fetchone("""
+            SELECT profile_key, display_username, avatar_url, last_synced_at
+            FROM profiles WHERE profile_key = LOWER(TRIM(?))
+        """, (username.strip(),))
+
+    async def get_profile_ratings_dict(self, username: str) -> dict[str, Optional[float]]:
+        """Return the shared profile's slug-to-rating mapping."""
+        rows = await self._fetchall("""
+            SELECT game_slug, rating FROM profile_ratings
+            WHERE profile_key = LOWER(TRIM(?))
+        """, (username.strip(),))
+        return {row["game_slug"]: row["rating"] for row in rows}
+
+    async def get_profile_stats(self, username: str) -> dict:
+        """Fetch aggregate rating stats once for a Backloggd profile."""
+        row = await self._fetchone("""
+            SELECT COUNT(*) AS total_games,
+                   COUNT(rating) AS rated_count,
+                   AVG(rating) AS average_rating
+            FROM profile_ratings
+            WHERE profile_key = LOWER(TRIM(?))
+        """, (username.strip(),))
+        return {
+            "total_games": row["total_games"] if row else 0,
+            "rated_count": row["rated_count"] if row else 0,
+            "average_rating": (
+                round(row["average_rating"], 2)
+                if row and row["average_rating"] is not None
+                else None
+            ),
+        }
 
     async def get_all_linked_users(self) -> List[Any]:
         """Fetch all linked users."""
@@ -374,16 +412,20 @@ class Database:
         await self._execute(query, (game_slug, rating, status, is_liked, discord_id))
 
     async def get_server_ratings_for_game(self, guild_member_ids: List[int], game_slug: str) -> List[Any]:
-        """Fetch all ratings and statuses for a game from linked guild members."""
+        """Fetch one rating/status row per Backloggd profile connected in this guild."""
         if not guild_member_ids:
             return []
         placeholders = ",".join("?" for _ in guild_member_ids)
         query = f"""
-            SELECT u.discord_id, u.backloggd_username, u.avatar_url, r.rating, r.status, r.is_liked
-            FROM user_ratings r
-            JOIN linked_users u ON r.discord_id = u.discord_id
-            WHERE r.discord_id IN ({placeholders}) AND r.game_slug = ?
-            ORDER BY (r.rating IS NULL), r.rating DESC, u.backloggd_username ASC;
+            SELECT r.profile_key, p.display_username AS backloggd_username,
+                   p.avatar_url, r.rating, r.status, r.is_liked
+            FROM profile_ratings r
+            JOIN profiles p ON p.profile_key = r.profile_key
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.game_slug = ?
+            ORDER BY (r.rating IS NULL), r.rating DESC, p.display_username ASC;
         """
         params = list(guild_member_ids) + [game_slug]
         return await self._fetchall(query, params)
@@ -451,20 +493,19 @@ class Database:
             for game in games
         ]
         profile_key = expected_username.strip().lower()
-        ownership_sql = """SELECT 1 FROM linked_users
-            WHERE discord_id = ? AND profile_key = ?"""
+        ownership_sql = "SELECT 1 FROM linked_users WHERE profile_key = ? LIMIT 1"
 
         async with self._operation_lock:
             if self.is_turso:
-                statements = [(ownership_sql, (discord_id, profile_key))]
+                statements = [(ownership_sql, (profile_key,))]
                 statements.append(("""
                     UPDATE profiles SET last_synced_at = CURRENT_TIMESTAMP
                     WHERE profile_key = ? AND EXISTS (""" + ownership_sql + ")",
-                    (profile_key, discord_id, profile_key)))
+                    (profile_key, profile_key)))
                 statements.append(("""
                     UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
                     WHERE profile_key = ? AND EXISTS (""" + ownership_sql + ")",
-                    (profile_key, discord_id, profile_key)))
+                    (profile_key, profile_key)))
                 for row in game_rows:
                     statements.append(("""
                         INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
@@ -478,7 +519,7 @@ class Database:
                 statements.append((f"""
                     DELETE FROM profile_ratings
                     WHERE profile_key = ? AND EXISTS ({ownership_sql})
-                """, (profile_key, discord_id, profile_key)))
+                """, (profile_key, profile_key)))
                 for row in game_rows:
                     statements.append((f"""
                         INSERT INTO profile_ratings
@@ -490,13 +531,13 @@ class Database:
                             status = excluded.status,
                             is_liked = excluded.is_liked,
                             updated_at = CURRENT_TIMESTAMP
-                    """, (profile_key, row[0], row[5], row[6], row[7], discord_id, profile_key)))
+                    """, (profile_key, row[0], row[5], row[6], row[7], profile_key)))
                 results = await self._client.batch(statements)
                 return bool(results and results[0].rows)
 
             await self._conn.execute("BEGIN IMMEDIATE")
             try:
-                async with self._conn.execute(ownership_sql, (discord_id, profile_key)) as cursor:
+                async with self._conn.execute(ownership_sql, (profile_key,)) as cursor:
                     link = await cursor.fetchone()
                 if not link:
                     await self._conn.rollback()
@@ -565,7 +606,7 @@ class Database:
     # =========================================================================
 
     async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
-        """Get top games by average rating among server members."""
+        """Get top games by average rating among distinct linked profiles."""
         if not guild_member_ids:
             return []
         placeholders = ",".join("?" for _ in guild_member_ids)
@@ -573,9 +614,12 @@ class Database:
             SELECT g.slug, g.title, g.cover_url, g.release_year,
                    AVG(r.rating) as avg_rating,
                    COUNT(r.rating) as rating_count
-            FROM user_ratings r
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id IN ({placeholders}) AND r.rating IS NOT NULL
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.rating IS NOT NULL
             GROUP BY g.slug
             HAVING rating_count >= ?
             ORDER BY avg_rating DESC, rating_count DESC
@@ -585,17 +629,20 @@ class Database:
         return await self._fetchall(query, params)
 
     async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
-        """Get most completed games by server members."""
+        """Get most completed games by distinct linked profiles."""
         if not guild_member_ids:
             return []
         placeholders = ",".join("?" for _ in guild_member_ids)
         query = f"""
             SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   COUNT(r.discord_id) as play_count,
+                   COUNT(r.profile_key) as play_count,
                    AVG(r.rating) as avg_rating
-            FROM user_ratings r
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id IN ({placeholders}) AND r.status = 'played'
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.status = 'played'
             GROUP BY g.slug
             ORDER BY play_count DESC, avg_rating DESC
             LIMIT ?;
@@ -604,16 +651,19 @@ class Database:
         return await self._fetchall(query, params)
 
     async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
-        """Get games most frequently sitting unplayed in server members' backlogs."""
+        """Get games most frequently sitting unplayed in linked profiles' backlogs."""
         if not guild_member_ids:
             return []
         placeholders = ",".join("?" for _ in guild_member_ids)
         query = f"""
             SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   COUNT(r.discord_id) as backlog_count
-            FROM user_ratings r
+                   COUNT(r.profile_key) as backlog_count
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id IN ({placeholders}) AND r.status = 'backlog'
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.status = 'backlog'
             GROUP BY g.slug
             ORDER BY backlog_count DESC
             LIMIT ?;
@@ -631,9 +681,12 @@ class Database:
                    (MAX(r.rating) - MIN(r.rating)) as rating_delta,
                    AVG(r.rating) as avg_rating,
                    COUNT(r.rating) as rating_count
-            FROM user_ratings r
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id IN ({placeholders}) AND r.rating IS NOT NULL
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.rating IS NOT NULL
             GROUP BY g.slug
             HAVING rating_count >= ? AND rating_delta > 0
             ORDER BY rating_delta DESC, rating_count DESC
@@ -651,9 +704,12 @@ class Database:
             SELECT g.slug, g.title, g.cover_url, g.release_year,
                    AVG(r.rating) as avg_rating,
                    COUNT(r.rating) as rating_count
-            FROM user_ratings r
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id IN ({placeholders}) AND r.rating IS NOT NULL
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.rating IS NOT NULL
             GROUP BY g.slug
             HAVING avg_rating >= 4.5 AND rating_count <= 2
             ORDER BY avg_rating DESC, rating_count ASC
@@ -667,6 +723,7 @@ class Database:
         if not guild_member_ids:
             return {
                 "linked_members": 0,
+                "profile_count": 0,
                 "total_logged": 0,
                 "total_played": 0,
                 "server_avg_rating": None,
@@ -675,20 +732,26 @@ class Database:
 
         placeholders = ",".join("?" for _ in guild_member_ids)
 
-        # 1. Linked members count
+        # 1. Distinct member connections and distinct Backloggd profiles.
         link_row = await self._fetchone(
-            f"SELECT COUNT(*) as count FROM linked_users WHERE discord_id IN ({placeholders});",
+            f"""SELECT COUNT(DISTINCT discord_id) AS member_count,
+                       COUNT(DISTINCT profile_key) AS profile_count
+                FROM linked_users WHERE discord_id IN ({placeholders});""",
             guild_member_ids
         )
-        linked_members = link_row["count"] if link_row else 0
+        linked_members = link_row["member_count"] if link_row else 0
+        profile_count = link_row["profile_count"] if link_row else 0
 
         # 2. Logs, Played count, and average rating
         query_metrics = f"""
             SELECT COUNT(*) as total_logged,
                    SUM(CASE WHEN status = 'played' THEN 1 ELSE 0 END) as total_played,
                    AVG(rating) as avg_rating
-            FROM user_ratings
-            WHERE discord_id IN ({placeholders});
+            FROM profile_ratings
+            WHERE profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            );
         """
         row = await self._fetchone(query_metrics, guild_member_ids)
         total_logged = (row["total_logged"] if row else 0) or 0
@@ -697,19 +760,26 @@ class Database:
 
         # 3. Most popular game
         query_top_game = f"""
-            SELECT g.title, COUNT(r.discord_id) as count
-            FROM user_ratings r
+            SELECT g.title, COUNT(r.profile_key) as count
+            FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id IN ({placeholders}) AND r.status = 'played'
+            WHERE r.profile_key IN (
+                SELECT DISTINCT profile_key FROM linked_users
+                WHERE discord_id IN ({placeholders})
+            ) AND r.status = 'played'
             GROUP BY g.slug
             ORDER BY count DESC
             LIMIT 1;
         """
         top_row = await self._fetchone(query_top_game, guild_member_ids)
-        top_game = f"{top_row['title']} ({top_row['count']} players)" if top_row else None
+        top_game = (
+            f"{top_row['title']} ({top_row['count']} profile{'s' if top_row['count'] != 1 else ''})"
+            if top_row else None
+        )
 
         return {
             "linked_members": linked_members,
+            "profile_count": profile_count,
             "total_logged": total_logged,
             "total_played": total_played,
             "server_avg_rating": avg_rating,

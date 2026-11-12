@@ -40,9 +40,6 @@ class UsersCog(commands.Cog, name="Users"):
                     return
             else:
                 target_username = user.strip().lstrip("@")
-                linked = await self.bot.db.get_linked_user_by_username(target_username)
-                if linked:
-                    target_discord_id = linked["discord_id"]
         else:
             # Check caller's own linked account
             target_discord_id = interaction.user.id
@@ -83,16 +80,15 @@ class UsersCog(commands.Cog, name="Users"):
                 )
                 return
 
-            # Fetch cached ratings stats from database if user is linked
+            # Read stats from the shared profile cache, without choosing a Discord link.
             avg_rating = None
             rated_count = None
             recent_played = journal_entries[:5] if journal_entries else []
 
-            if target_discord_id:
-                stats = await self.bot.db.get_user_stats(target_discord_id)
-                if stats and stats.get("rated_count", 0) > 0:
-                    avg_rating = stats.get("average_rating")
-                    rated_count = stats.get("rated_count")
+            stats = await self.bot.db.get_profile_stats(target_username)
+            if stats and stats.get("rated_count", 0) > 0:
+                avg_rating = stats.get("average_rating")
+                rated_count = stats.get("rated_count")
 
             latest_review = user_reviews[0] if user_reviews else None
 

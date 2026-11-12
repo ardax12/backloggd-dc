@@ -6,6 +6,7 @@ import logging
 from backloggd import BackloggdClient
 from bot.db import Database
 from bot.config import DATABASE_PATH, DEV_GUILD_ID
+from bot.services.library_sync import LibrarySyncService
 
 logger = logging.getLogger("backloggd.bot")
 
@@ -23,6 +24,7 @@ class BackloggdBot(commands.Bot):
 
         self.db = Database(DATABASE_PATH)
         self.backloggd = BackloggdClient(request_delay=1.0)
+        self.library_sync = LibrarySyncService(max_workers=2)
 
     async def setup_hook(self) -> None:
         """Called automatically before bot logs into Discord."""
@@ -69,6 +71,7 @@ class BackloggdBot(commands.Bot):
         if feed_cog and hasattr(feed_cog, "journal_feed_loop") and feed_cog.journal_feed_loop.is_running():
             feed_cog.journal_feed_loop.cancel()
 
+        await self.library_sync.close()
         await self.backloggd.close()
         await self.db.close()
         await super().close()

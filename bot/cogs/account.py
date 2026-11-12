@@ -5,35 +5,35 @@ from discord import app_commands
 from discord.ext import commands
 import logging
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 from bot.config import COLOR_PRIMARY, COLOR_PLAYED, COLOR_ERROR
+from bot.services.library_sync import LibrarySyncService, SyncOutcome
 
 logger = logging.getLogger("backloggd.cogs.account")
 
 class AccountCog(commands.Cog, name="Account"):
     def __init__(self, bot):
         self.bot = bot
-        self._sync_tasks: dict[int, asyncio.Task] = {}
+        self.library_sync = getattr(bot, "library_sync", None) or LibrarySyncService()
 
-    def cog_unload(self) -> None:
-        for task in self._sync_tasks.values():
-            task.cancel()
-        self._sync_tasks.clear()
-
-    def _start_sync_task(self, discord_id: int, username: str, status_message=None) -> asyncio.Task:
-        """Keep only the newest library sync active for each Discord account."""
-        previous = self._sync_tasks.get(discord_id)
-        if previous and not previous.done():
-            previous.cancel()
-
-        task = asyncio.create_task(self._sync_user_library(discord_id, username))
-        self._sync_tasks[discord_id] = task
-
-        def clear_task(completed: asyncio.Task) -> None:
-            if self._sync_tasks.get(discord_id) is completed:
-                self._sync_tasks.pop(discord_id, None)
-
-        task.add_done_callback(clear_task)
+    def _start_sync_task(
+        self,
+        discord_id: int,
+        username: str,
+        status_message=None,
+        *,
+        manual: bool = False,
+        freshness_window_seconds: Optional[float] = None,
+    ) -> asyncio.Task:
+        """Request one shared refresh for the normalized Backloggd profile."""
+        profile_key = username.strip().lower()
+        task = self.library_sync.request(
+            profile_key,
+            lambda: self._sync_user_library(discord_id, username),
+            manual=manual,
+            freshness_window_seconds=freshness_window_seconds,
+        )
         if status_message:
             task.add_done_callback(
                 lambda completed: asyncio.create_task(
@@ -42,32 +42,66 @@ class AccountCog(commands.Cog, name="Account"):
             )
         return task
 
+    async def _seed_sync_state(self, username: str) -> None:
+        """Seed the in-memory coordinator from the persisted complete snapshot."""
+        getter = getattr(self.bot.db, "get_profile_sync_info", None)
+        if getter is None:
+            return
+        info = await getter(username)
+        if not info or not info["last_synced_at"]:
+            return
+        try:
+            synced_at = info["last_synced_at"]
+            if not isinstance(synced_at, datetime):
+                synced_at = datetime.fromisoformat(str(synced_at).replace("Z", "+00:00"))
+            if synced_at.tzinfo is None:
+                synced_at = synced_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - synced_at.astimezone(timezone.utc)).total_seconds()
+            self.library_sync.seed_success(
+                username.strip().lower(),
+                age_seconds=max(0.0, age_seconds),
+                game_count=int(info["game_count"] or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            logger.info("Could not seed library refresh age for %s", username, exc_info=True)
+
     async def _update_link_status(self, task: asyncio.Task, username: str, status_message) -> None:
         try:
-            total_synced = task.result()
+            result = task.result()
         except asyncio.CancelledError:
             title = "Library sync stopped"
             description = f"The sync for **{username}** was interrupted. Run `/refresh` to try again."
             color = COLOR_PRIMARY
         else:
-            if total_synced is None:
+            if not isinstance(result, SyncOutcome):
+                result = SyncOutcome(status="failed" if result is None else "success", game_count=result)
+            if result.status == "failed":
                 title = "Library sync failed"
                 description = f"Backloggd could not sync **{username}** right now. Your previous library was kept; try `/refresh` shortly."
                 color = COLOR_ERROR
+            elif result.status == "skipped" and result.reason == "fresh":
+                title = "Shared library is current"
+                description = (
+                    f"Using the shared library for **{username}** ({result.game_count or 0} games); "
+                    "it was synced within the last hour. Use `/refresh` to force a new sync."
+                )
+                color = COLOR_PRIMARY
+            elif result.status == "skipped":
+                title = "Using the shared library"
+                description = (
+                    f"A recent refresh for **{username}** is still within its automatic cooldown. "
+                    "The previous library was kept; use `/refresh` to force a retry."
+                )
+                color = COLOR_PRIMARY
             else:
                 title = "Library sync complete"
-                description = f"Synced **{total_synced}** games for **{username}**. Your ratings are ready to use with `/game`."
+                description = f"Synced **{result.game_count or 0}** games for **{username}**. Your ratings are ready to use with `/game`."
                 color = COLOR_PLAYED
         embed = discord.Embed(title=title, description=description, color=color)
         try:
             await status_message.edit(embed=embed)
         except discord.HTTPException:
             logger.info("Could not update link status message for %s", username, exc_info=True)
-
-    def _cancel_sync_task(self, discord_id: int) -> None:
-        task = self._sync_tasks.pop(discord_id, None)
-        if task and not task.done():
-            task.cancel()
 
     async def _sync_user_library(self, discord_id: int, username: str) -> Optional[int]:
         """Fetch and atomically replace the linked user's cached library."""
@@ -132,6 +166,7 @@ class AccountCog(commands.Cog, name="Account"):
             username=profile.username,
             avatar_url=profile.avatar_url,
         )
+        await self._seed_sync_state(profile.username)
 
         embed = discord.Embed(
             title="🔗 Account Linked!",
@@ -177,16 +212,20 @@ class AccountCog(commands.Cog, name="Account"):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-        # Background sync. An older in-flight sync cannot write after a relink.
-        self._start_sync_task(interaction.user.id, profile.username, status_message=status_message)
+        # The profile-keyed service shares work across members and servers.
+        self._start_sync_task(
+            interaction.user.id,
+            profile.username,
+            status_message=status_message,
+            freshness_window_seconds=3600,
+        )
 
     @app_commands.command(name="unlink", description="Unlink your Backloggd account from Discord")
     async def unlink(self, interaction: discord.Interaction):
-        self._cancel_sync_task(interaction.user.id)
         success = await self.bot.db.unlink_user(interaction.user.id)
         if success:
             await interaction.response.send_message(
-                "✅ Successfully unlinked your Backloggd account. Your cached ratings have been removed.",
+                "Successfully disconnected your Backloggd profile. Shared library data remains available to other linked members, and past feed posts stay in place.",
                 ephemeral=True
             )
         else:
@@ -212,9 +251,9 @@ class AccountCog(commands.Cog, name="Account"):
             return
 
         username = linked["backloggd_username"]
-        task = self._start_sync_task(target_discord_id, username)
+        task = self._start_sync_task(target_discord_id, username, manual=True)
         try:
-            total_synced = await task
+            result = await task
         except asyncio.CancelledError:
             await interaction.followup.send(
                 "❌ This refresh was superseded by a newer account sync. Please try again.",
@@ -222,12 +261,14 @@ class AccountCog(commands.Cog, name="Account"):
             )
             return
 
-        if total_synced is None:
+        if result.status == "failed":
             await interaction.followup.send(
                 f"❌ Could not refresh **{username}**. The previous cached library was kept; try again shortly.",
                 ephemeral=True,
             )
             return
+
+        total_synced = result.game_count or 0
 
         embed = discord.Embed(
             title="🔄 Library Refreshed!",

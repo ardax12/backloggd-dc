@@ -27,7 +27,7 @@ def create_game_embed(
     server_ratings: List[Any],
     guild_name: Optional[str] = "Server"
 ) -> discord.Embed:
-    """Construct embed for /game command with server member ratings shelf."""
+    """Construct embed for /game command with one rating row per server profile."""
     game_url = build_backloggd_game_url(game.slug)
     title = f"{game.title} ({game.release_year})" if game.release_year else game.title
     
@@ -80,10 +80,10 @@ def create_game_embed(
         if stats_parts:
             embed.add_field(name="Global Stats", value="  •  ".join(stats_parts), inline=False)
 
-    # Server Member Ratings Field
+    # Server profile ratings field
     if server_ratings:
         server_lines = []
-        display_limit = 12  # Display up to 12 server members cleanly
+        display_limit = 12  # Display up to 12 profiles cleanly
         for r in server_ratings[:display_limit]:
             username = r["backloggd_username"]
             raw_status = str(r["status"]).lower().strip()
@@ -101,14 +101,14 @@ def create_game_embed(
 
         if len(server_ratings) > display_limit:
             remaining = len(server_ratings) - display_limit
-            server_lines.append(f"*+ {remaining} more members (click 'View All Ratings' below)*")
+            server_lines.append(f"*+ {remaining} more profiles (click 'View All Ratings' below)*")
 
-        field_name = f"👥 {guild_name} Ratings ({len(server_ratings)})"
+        field_name = f"👥 {guild_name} Profile Ratings ({len(server_ratings)})"
         embed.add_field(name=field_name, value="\n".join(server_lines), inline=False)
     else:
         embed.add_field(
-            name=f"👥 {guild_name} Ratings",
-            value="*No server members have rated or logged this game yet.*",
+            name=f"👥 {guild_name} Profile Ratings",
+            value="*No connected Backloggd profiles have rated or logged this game yet.*",
             inline=False
         )
 
@@ -363,13 +363,13 @@ def create_server_top_embed(
         if mode == "highest_rated":
             avg = row["avg_rating"]
             count = row["rating_count"]
-            lines.append(f"{prefix} **[{game_title}]({url})** — ★ **{avg:.2f}** *({count} server ratings)*")
+            lines.append(f"{prefix} **[{game_title}]({url})** — ★ **{avg:.2f}** *({count} profile ratings)*")
         elif mode == "most_played":
             count = row["play_count"]
-            lines.append(f"{prefix} **[{game_title}]({url})** — 🎮 **{count}** completed")
+            lines.append(f"{prefix} **[{game_title}]({url})** — 🎮 **{count}** profiles completed")
         elif mode == "shame_list":
             count = row["backlog_count"]
-            lines.append(f"{prefix} **[{game_title}]({url})** — ⏳ in **{count}** members' backlogs")
+            lines.append(f"{prefix} **[{game_title}]({url})** — ⏳ in **{count}** profiles' backlogs")
         elif mode == "polarizing":
             delta = row["rating_delta"]
             avg = row["avg_rating"]
@@ -377,12 +377,12 @@ def create_server_top_embed(
         elif mode == "hidden_gems":
             avg = row["avg_rating"]
             count = row["rating_count"]
-            lines.append(f"{prefix} **[{game_title}]({url})** — 💎 ★ **{avg:.2f}** *({count} server player{'s' if count > 1 else ''})*")
+            lines.append(f"{prefix} **[{game_title}]({url})** — 💎 ★ **{avg:.2f}** *({count} profile{'s' if count != 1 else ''})*")
         else:
             lines.append(f"{prefix} **[{game_title}]({url})**")
 
     embed.description = "\n".join(lines)
-    embed.set_footer(text=f"Server rankings across linked {guild_name} members")
+    embed.set_footer(text=f"Server rankings across distinct Backloggd profiles linked in {guild_name}")
     return embed
 
 def create_server_stats_embed(stats: dict, guild_name: str) -> discord.Embed:
@@ -396,6 +396,11 @@ def create_server_stats_embed(stats: dict, guild_name: str) -> discord.Embed:
     top_game = stats.get("top_game") or "*N/A*"
 
     embed.add_field(name="👥 Linked Members", value=f"**{stats['linked_members']}** members", inline=True)
+    embed.add_field(
+        name="Unique Backloggd Profiles",
+        value=f"**{stats.get('profile_count', stats['linked_members'])}** profiles",
+        inline=True,
+    )
     embed.add_field(name="📚 Games Logged", value=f"**{stats['total_logged']}** games", inline=True)
     embed.add_field(name="🎮 Games Completed", value=f"**{stats['total_played']}** played", inline=True)
     embed.add_field(name="⭐ Server Avg Rating", value=avg_str, inline=True)
@@ -480,7 +485,7 @@ def create_all_ratings_embed(
     embed = discord.Embed(
         title=f"👥 {game_title} — All {guild_name} Ratings"[:256],
         url=build_backloggd_game_url(game_slug),
-        description=f"Showing **{start_idx + 1}–{min(end_idx, total_ratings)}** of **{total_ratings}** members who logged this game:\n",
+        description=f"Showing **{start_idx + 1}–{min(end_idx, total_ratings)}** of **{total_ratings}** profiles who logged this game:\n",
         color=COLOR_PRIMARY
     )
 

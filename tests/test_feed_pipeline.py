@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from bot.db import Database
 from bot.cogs.feed import FeedCog
-from backloggd import ChallengeResponseError, PageParseError
+from backloggd import ChallengeResponseError, GameEntry, GameStatus, PageParseError
 from feed_samples import completion_event, journal_entries
 from bot.feed_rules import journal_events
 
@@ -296,6 +296,58 @@ class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.db.get_linked_user(10))
         self.assertEqual((await self.db.get_linked_user(11))["profile_key"], "millers")
         self.assertEqual(await self.db.get_user_ratings_dict(11), {"hades": 4.5})
+
+    async def test_shared_sync_can_finish_after_its_requesting_member_unlinks(self):
+        await self.db.link_user(10, "Millers")
+        await self.db.link_user(11, "millers")
+        await self.db.unlink_user(10)
+
+        stored = await self.db.replace_user_library(10, "Millers", [
+            GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)
+        ])
+
+        self.assertTrue(stored)
+        self.assertEqual(await self.db.get_user_ratings_dict(11), {"hades": 4.5})
+
+    async def test_stale_sync_cannot_write_into_a_relinked_profile(self):
+        await self.db.link_user(10, "OldProfile")
+        await self.db.link_user(10, "NewProfile")
+
+        stored = await self.db.replace_user_library(10, "OldProfile", [
+            GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)
+        ])
+
+        self.assertFalse(stored)
+        self.assertEqual(await self.db.get_user_ratings_dict(10), {})
+        self.assertEqual(await self.db.get_profile_ratings_dict("OldProfile"), {})
+
+    async def test_profile_sync_info_reports_shared_snapshot_freshness_and_size(self):
+        await self.db.link_user(10, "Millers")
+        await self.db.replace_user_library(10, "Millers", [
+            GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED),
+            GameEntry(slug="celeste", title="Celeste", rating=4.0, status=GameStatus.PLAYED),
+        ])
+
+        info = await self.db.get_profile_sync_info("MILLERS")
+
+        self.assertEqual(info["profile_key"], "millers")
+        self.assertEqual(info["game_count"], 2)
+        self.assertIsNotNone(info["last_synced_at"])
+
+    async def test_profile_level_rating_lookups_do_not_select_a_discord_owner(self):
+        await self.db.link_user(10, "Millers")
+        await self.db.link_user(11, "millers")
+        await self.db.upsert_game("hades", "Hades")
+        await self.db.upsert_user_rating(10, "hades", 4.5, "played")
+
+        profile = await self.db.get_profile("MILLERS")
+        stats = await self.db.get_profile_stats("millers")
+        ratings = await self.db.get_profile_ratings_dict("Millers")
+
+        self.assertEqual(profile["profile_key"], "millers")
+        self.assertEqual(profile["display_username"], "millers")
+        self.assertEqual(stats["rated_count"], 1)
+        self.assertEqual(ratings, {"hades": 4.5})
 
     async def test_profile_connections_are_scoped_to_supplied_server_members(self):
         await self.db.link_user(10, "Millers")

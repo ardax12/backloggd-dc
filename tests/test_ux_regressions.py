@@ -3,16 +3,110 @@ os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import asyncio
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from bot.cogs.account import AccountCog
 from bot.cogs.games import GamesCog
+from bot.cogs.social import SocialCog
 from bot.cogs.users import UsersCog
+from bot.services.library_sync import LibrarySyncService
 from bot.ui.views import RouletteView
 
 
 class AccountUxTests(unittest.IsolatedAsyncioTestCase):
+    async def test_member_syncs_join_the_same_profile_task(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fetch_library(username, force_refresh=False):
+            started.set()
+            await release.wait()
+            return ["game"]
+
+        db = SimpleNamespace(replace_user_library=AsyncMock(return_value=True))
+        api = SimpleNamespace(get_user_library=AsyncMock(side_effect=fetch_library))
+        service = LibrarySyncService()
+        cog = AccountCog(SimpleNamespace(db=db, backloggd=api, library_sync=service))
+
+        first = cog._start_sync_task(10, "Millers")
+        await started.wait()
+        second = cog._start_sync_task(11, "millers")
+        self.assertIs(first, second)
+
+        release.set()
+        await first
+        api.get_user_library.assert_awaited_once_with("Millers", force_refresh=True)
+        db.replace_user_library.assert_awaited_once_with(10, "Millers", ["game"])
+        await service.close()
+
+    async def test_persisted_profile_sync_is_seeded_as_fresh_after_restart(self):
+        db = SimpleNamespace(get_profile_sync_info=AsyncMock(return_value={
+            "last_synced_at": datetime.now(timezone.utc),
+            "game_count": 8,
+        }))
+        cog = AccountCog(SimpleNamespace(db=db))
+        calls = 0
+
+        async def refresh():
+            nonlocal calls
+            calls += 1
+            return 9
+
+        await cog._seed_sync_state("Millers")
+        outcome = await cog.library_sync.request(
+            "millers", refresh, freshness_window_seconds=3600
+        )
+
+        self.assertEqual(outcome.status, "skipped")
+        self.assertEqual(outcome.reason, "fresh")
+        self.assertEqual(outcome.game_count, 8)
+        self.assertEqual(calls, 0)
+        await cog.library_sync.close()
+
+    async def test_profile_username_resolution_uses_profile_data_not_a_link_owner(self):
+        profile = SimpleNamespace(
+            username="Millers", avatar_url=None, bio=None, badges=[], favorite_games=[],
+            played_count=0, playing_count=0, backlog_count=0, wishlist_count=0,
+        )
+        db = SimpleNamespace(
+            get_profile_stats=AsyncMock(return_value={"rated_count": 1, "average_rating": 4.0}),
+            get_linked_user_by_username=AsyncMock(side_effect=AssertionError("owner lookup is ambiguous")),
+        )
+        api = SimpleNamespace(
+            get_user_profile=AsyncMock(return_value=profile),
+            get_user_journal=AsyncMock(return_value=[]),
+            get_user_reviews=AsyncMock(return_value=[]),
+        )
+        cog = UsersCog(SimpleNamespace(db=db, backloggd=api))
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            user=SimpleNamespace(id=1, display_avatar=None),
+            guild=None,
+        )
+
+        await UsersCog.profile.callback(cog, interaction, "Millers")
+
+        db.get_profile_stats.assert_awaited_once_with("Millers")
+        db.get_linked_user_by_username.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+
+    async def test_social_rating_cache_is_looked_up_by_profile_key(self):
+        db = SimpleNamespace(
+            get_profile_sync_info=AsyncMock(return_value={"last_synced_at": "2026-01-01", "game_count": 1}),
+            get_profile_ratings_dict=AsyncMock(return_value={"hades": 4.5}),
+            get_linked_user_by_username=AsyncMock(side_effect=AssertionError("owner lookup is ambiguous")),
+        )
+        api = SimpleNamespace(get_user_library=AsyncMock())
+        ratings = await SocialCog(SimpleNamespace(db=db, backloggd=api))._get_or_fetch_ratings("Millers")
+
+        self.assertEqual(ratings, {"hades": 4.5})
+        db.get_profile_ratings_dict.assert_awaited_once_with("Millers")
+        db.get_linked_user_by_username.assert_not_awaited()
+        api.get_user_library.assert_not_awaited()
+
     async def test_link_sync_updates_the_original_status_message_on_success(self):
         edited = asyncio.Event()
 
@@ -73,6 +167,7 @@ class AccountUxTests(unittest.IsolatedAsyncioTestCase):
             get_linked_user=AsyncMock(return_value=None),
             link_user=AsyncMock(return_value=True),
             get_profile_connections=AsyncMock(return_value=[{"discord_id": 2}]),
+            get_profile_sync_info=AsyncMock(return_value=None),
         )
         profile = SimpleNamespace(username="Millers", avatar_url=None)
         api = SimpleNamespace(get_user_profile=AsyncMock(return_value=profile))
@@ -108,6 +203,7 @@ class AccountUxTests(unittest.IsolatedAsyncioTestCase):
             get_linked_user=AsyncMock(return_value=None),
             link_user=AsyncMock(return_value=True),
             get_profile_connections=AsyncMock(return_value=[{"discord_id": 2}]),
+            get_profile_sync_info=AsyncMock(return_value=None),
         )
         api = SimpleNamespace(
             get_user_profile=AsyncMock(return_value=SimpleNamespace(username="Millers", avatar_url=None))
@@ -208,7 +304,7 @@ class ProfileUxTests(unittest.IsolatedAsyncioTestCase):
         )
         db = SimpleNamespace(
             get_linked_user=AsyncMock(return_value={"backloggd_username": "Tester"}),
-            get_user_stats=AsyncMock(return_value={"rated_count": 1, "average_rating": 4.0}),
+            get_profile_stats=AsyncMock(return_value={"rated_count": 1, "average_rating": 4.0}),
             get_user_recent_ratings=AsyncMock(return_value=cached),
         )
         cog = UsersCog(SimpleNamespace(db=db, backloggd=api))
