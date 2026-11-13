@@ -443,12 +443,21 @@ def create_server_stats_embed(
         value=f"**{stats.get('profile_count', stats['linked_members'])}** profiles",
         inline=True,
     )
-    embed.add_field(name="📚 Games Logged", value=f"**{stats['total_logged']}** games", inline=True)
-    embed.add_field(name="🎮 Games Completed", value=f"**{stats['total_played']}** played", inline=True)
+    missing_counts = stats.get("logged_profiles_missing", 0)
+    if missing_counts:
+        logged_value = (
+            f"At least **{stats['total_logged']}** games"
+            if stats.get("logged_profiles_counted", 0) else "Unavailable"
+        )
+        noun = "profile count" if missing_counts == 1 else "profile counts"
+        logged_value += f"\n{missing_counts} {noun} unavailable"
+    else:
+        logged_value = f"**{stats['total_logged']}** games"
+    embed.add_field(name="📚 Games Logged", value=logged_value, inline=True)
     embed.add_field(name="⭐ Server Avg Rating", value=avg_str, inline=True)
     embed.add_field(name="👑 Most Played Game", value=str(top_game)[:1024], inline=True)
 
-    embed.set_footer(text="Community aggregate data from linked Backloggd profiles")
+    embed.set_footer(text="Games Logged sums Played tabs per unique linked profile; profile counts cached up to 1 hour.")
     return embed
 
 

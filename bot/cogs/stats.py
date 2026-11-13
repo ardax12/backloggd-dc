@@ -1,6 +1,7 @@
 """StatsCog: Handles /server-top (with 5 specialty leaderboards) and /server-stats commands."""
 
 from datetime import datetime, timezone
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -27,6 +28,30 @@ class StatsCog(commands.Cog, name="Stats"):
     def __init__(self, bot, *, clock=None):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._profile_count_slots = asyncio.Semaphore(2)
+
+    async def _played_tab_counts(self, member_ids: List[int]) -> dict:
+        """Sum public profile Played-tab totals, independently of library status parsing."""
+        profiles = await self.bot.db.get_guild_linked_profiles(member_ids)
+
+        async def count_profile(profile):
+            username = profile["display_username"]
+            try:
+                async with self._profile_count_slots:
+                    public_profile = await self.bot.backloggd.get_user_profile(username)
+                count = getattr(public_profile, "played_count", None)
+                if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    return count
+            except Exception as error:
+                logger.warning("Could not read Played-tab count for %s: %s", username, type(error).__name__)
+            return None
+
+        counts = await asyncio.gather(*(count_profile(profile) for profile in profiles))
+        return {
+            "total_logged": sum(count for count in counts if count is not None),
+            "logged_profiles_counted": sum(count is not None for count in counts),
+            "logged_profiles_missing": sum(count is None for count in counts),
+        }
 
     async def _server_freshness_note(self, member_ids: List[int]) -> Optional[str]:
         profile_getter = (
@@ -110,6 +135,9 @@ class StatsCog(commands.Cog, name="Stats"):
         guild_member_ids = [m.id for m in interaction.guild.members]
         freshness_note = await self._server_freshness_note(guild_member_ids)
         stats = await self.bot.db.get_server_stats(guild_member_ids)
+        # Cached library rows include wishlist/backlog entries and can have
+        # viewer-specific statuses. The displayed total comes from profile tabs.
+        stats.update(await self._played_tab_counts(guild_member_ids))
 
         embed = create_server_stats_embed(
             stats,

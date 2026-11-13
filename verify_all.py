@@ -245,7 +245,7 @@ class VerificationSuite:
 
         # 6. Server Stats Embed
         server_stats_embed = create_server_stats_embed(stats, guild_name="TestServer")
-        assert len(server_stats_embed.fields) == 6
+        assert len(server_stats_embed.fields) == 5
         print("✅ Server Stats Embed built successfully")
 
         # 7. Journal & Activity Feed Embed

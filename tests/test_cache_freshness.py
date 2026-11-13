@@ -265,12 +265,12 @@ class CacheFreshnessTests(unittest.IsolatedAsyncioTestCase):
         # Let background tasks from /game complete before checking updated fresh state
         await self._drain_syncs()
 
-        # /server-stats keeps 6 metric fields and puts aggregate timestamp in description
+        # /server-stats keeps 5 metric fields and puts aggregate timestamp in description
         is_stats = self._interaction(members=members)
         await StatsCog.server_stats.callback(stats_cog, is_stats)
         stats_embed = is_stats.followup.send.call_args.kwargs["embed"]
         assert_discord_embed_limits(self, stats_embed)
-        self.assertEqual(len(stats_embed.fields), 6)
+        self.assertEqual(len(stats_embed.fields), 5)
         self.assertIn(f"<t:{int(fresh_time.timestamp())}:R>", stats_embed.description)
 
         # /server-top

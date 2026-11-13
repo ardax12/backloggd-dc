@@ -23,7 +23,7 @@ class BackloggdBot(commands.Bot):
         )
 
         self.db = Database(DATABASE_PATH)
-        self.backloggd = BackloggdClient(request_delay=1.0)
+        self.backloggd = BackloggdClient(request_delay=1.0, profile_ttl=3600)
         self.library_sync = LibrarySyncService(max_workers=2)
 
     async def setup_hook(self) -> None:
