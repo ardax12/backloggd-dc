@@ -248,12 +248,10 @@ class GuildMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         for cog, cmd, kwargs in (
             (stats_cog, StatsCog.server_top, {"mode": "Highest Rated"}),
             (stats_cog, StatsCog.server_stats, {}),
-            (games_cog, GamesCog.game, {"title": "elden-ring"}),
+            (games_cog, GamesCog.game, {"title": "slug:elden-ring"}),
             (social_cog, SocialCog.taste_twins, {}),
             (discovery_cog, DiscoveryCog.recommend, {}),
         ):
-            if cmd is GamesCog.game:
-                games_cog._autocomplete_slugs["elden-ring"] = "elden-ring"
             interaction = _make_interaction(guild=broken_guild, user_id=10)
             await cmd.callback(cog, interaction, **kwargs)
             interaction.followup.send.assert_awaited_once()
@@ -265,7 +263,7 @@ class GuildMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
 
         # DM behavior for /game must still work without a guild.
         dm_interaction = _make_interaction(guild=None, user_id=10)
-        await GamesCog.game.callback(games_cog, dm_interaction, title="elden-ring")
+        await GamesCog.game.callback(games_cog, dm_interaction, title="slug:elden-ring")
         dm_interaction.followup.send.assert_awaited_once()
         self.assertIsNotNone(dm_interaction.followup.send.call_args.kwargs.get("embed"))
 

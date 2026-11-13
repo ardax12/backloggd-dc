@@ -357,7 +357,7 @@ def create_roulette_embed(
         embed.set_thumbnail(url=cover)
 
     desc_lines = [
-        f"### [{title}]({game_url})"
+        f"### [{escape_display_text(title)}]({game_url})"
     ]
     community_rating = _read_field(game, "community_rating")
     if community_rating:
@@ -394,7 +394,7 @@ def create_server_top_embed(
     medals = ["🥇", "🥈", "🥉"]
     for i, row in enumerate(entries, 1):
         prefix = medals[i - 1] if i <= 3 else f"`#{i}`"
-        game_title = row["title"]
+        game_title = escape_display_text(row["title"])
         slug = row["slug"]
         url = build_backloggd_game_url(slug)
 
@@ -442,7 +442,8 @@ def create_server_stats_embed(
         if stats.get("server_avg_rating") is not None
         else "*N/A*"
     )
-    top_game = stats.get("top_game") or "*N/A*"
+    raw_top_game = stats.get("top_game")
+    top_game = escape_display_text(raw_top_game) if raw_top_game else "*N/A*"
 
     embed.add_field(name="👥 Linked Members", value=f"**{stats['linked_members']}** members", inline=True)
     embed.add_field(
@@ -487,7 +488,7 @@ def create_taste_twins_embed(
     if clean_avatar:
         embed.set_thumbnail(url=clean_avatar)
 
-    desc_lines = [f"Comparing gaming taste across **{guild_name}**."]
+    desc_lines = [f"Comparing gaming taste across **{escape_display_text(guild_name)}**."]
     if server_avg_match is not None:
         desc_lines.append(f"**Community Compatibility:** `{int(round(server_avg_match))}%` average agreement")
     embed.description = "\n".join(desc_lines)[:4096]

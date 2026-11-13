@@ -319,7 +319,8 @@ class VerificationSuite:
         with patch.object(bot.backloggd, "search_games", new=AsyncMock(return_value=[])):
             await games_cog.game_autocomplete(mock_interaction, "metroid")
         assert len(games_cog._autocomplete_cache) <= 500, f"Cache not pruned: {len(games_cog._autocomplete_cache)}"
-        assert fallback_token in games_cog._autocomplete_slugs, "Query eviction must not clear fallback tokens"
+        assert fallback_token in games_cog._fallback_entries, "Query eviction must not clear fallback tokens"
+        assert not hasattr(games_cog, "_autocomplete_slugs"), "Duplicate _autocomplete_slugs mirror must not exist"
         print("✅ Games autocomplete bounded cache and choice survival verified successfully!")
 
         # Verify SocialCog commands

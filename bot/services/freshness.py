@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
+from bot.input_validation import escape_display_text
 from bot.services.library_sync import (
     LibrarySyncService,
     parse_sync_timestamp,
@@ -97,17 +98,41 @@ def evaluate_profile_freshness(
     )
 
 
+def _has_sync_columns(row: Any) -> bool:
+    if row is None:
+        return False
+    if hasattr(row, "keys"):
+        keys = set(row.keys())
+        return {"last_synced_at", "last_sync_attempt_at", "last_sync_error"}.issubset(keys)
+    return (
+        hasattr(row, "last_synced_at")
+        and hasattr(row, "last_sync_attempt_at")
+        and hasattr(row, "last_sync_error")
+    )
+
+
 async def _fetch_sync_info_map(db: Any, profiles: dict[str, tuple[str, Any]]) -> dict[str, Any]:
     if not profiles or db is None:
         return {}
+    result: dict[str, Any] = {}
+    missing_keys: list[str] = []
+    for key, (_, raw_row) in profiles.items():
+        if _has_sync_columns(raw_row):
+            result[key] = raw_row
+        else:
+            missing_keys.append(key)
+    if not missing_keys:
+        return result
+
     batch_getter = getattr(db, "get_profiles_sync_info", None)
     if batch_getter is not None:
-        result = await batch_getter(list(profiles))
-        if isinstance(result, dict):
+        fetched = await batch_getter(missing_keys)
+        if isinstance(fetched, dict):
+            result.update(fetched)
             return result
-    result: dict[str, Any] = {}
     single_getter = getattr(db, "get_profile_sync_info", None)
-    for key, (display_name, raw_row) in profiles.items():
+    for key in missing_keys:
+        display_name, raw_row = profiles[key]
         if raw_row is not None and (
             _row_get(raw_row, "last_synced_at") is not None
             or _row_get(raw_row, "last_sync_attempt_at") is not None
@@ -249,3 +274,55 @@ def format_aggregate_freshness(summary: Optional[dict[str, Any]]) -> Optional[st
     if summary.get("failed"):
         parts.append(f"Last refresh failed: {summary['failed']}")
     return " · ".join(parts)
+
+
+def format_fetching_library_message(
+    username: str,
+    status: Optional[ProfileFreshness],
+) -> str:
+    """Format the missing-cache disclosure message while safely escaping display names once."""
+    safe_username = escape_display_text(username)
+    if status is not None and status.failed_last and not status.refreshing:
+        return (
+            f"⏳ **{safe_username}**'s cached library data is not available yet because the last background refresh failed. "
+            "The bot will retry automatically, or you can run `/refresh`."
+        )
+    return (
+        f"⏳ **{safe_username}**'s cached library data is currently being fetched in the background. "
+        "Try again shortly or use `/refresh`."
+    )
+
+
+async def resolve_guild_aggregate_freshness(
+    bot: Any,
+    member_ids: Iterable[int],
+    *,
+    now: Optional[datetime] = None,
+    profiles: Optional[Iterable[Any]] = None,
+    require_subscribed: bool = True,
+) -> Optional[str]:
+    """Evaluate guild-wide aggregate freshness, reusing resolved profile context when supplied."""
+    if profiles is None:
+        db = getattr(bot, "db", None)
+        if db is None:
+            return None
+        profile_getter = (
+            getattr(db, "get_guild_linked_profiles_with_sync_info", None)
+            or getattr(db, "get_guild_linked_profiles", None)
+        )
+        if profile_getter is None:
+            return None
+        profile_list = list(await profile_getter(list(member_ids)))
+    else:
+        profile_list = list(profiles)
+
+    if not profile_list:
+        return "No linked Backloggd profiles in cache yet."
+
+    statuses = await ensure_profiles_fresh(
+        bot,
+        profile_list,
+        now=now,
+        require_subscribed=require_subscribed,
+    )
+    return format_aggregate_freshness(summarize_aggregate_freshness(statuses.values()))

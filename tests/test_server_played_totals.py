@@ -107,3 +107,132 @@ class ServerPlayedTotalTests(unittest.IsolatedAsyncioTestCase):
         embed = await self.stats(members)
         self.assertIn("**6**", self.logged_field(embed))
         self.assertEqual(peak, 2)
+
+    async def test_deadline_retains_completed_counts_and_cleans_up_workers(self):
+        await self.db.link_user(10, "Fast")
+        await self.db.link_user(20, "Slow1")
+        await self.db.link_user(30, "Slow2")
+
+        slow_started = asyncio.Event()
+        slow_cancelled = 0
+        release_slow = asyncio.Event()
+
+        async def profile(name):
+            nonlocal slow_cancelled
+            if name == "Fast":
+                return SimpleNamespace(played_count=42)
+            slow_started.set()
+            try:
+                await release_slow.wait()
+            except asyncio.CancelledError:
+                slow_cancelled += 1
+                raise
+            return SimpleNamespace(played_count=99)
+
+        self.cog = StatsCog(
+            SimpleNamespace(db=self.db, backloggd=self.api),
+            played_count_timeout=0.05,
+        )
+        self.api.get_user_profile.side_effect = profile
+
+        embed = await self.stats([10, 20, 30])
+        value = self.logged_field(embed)
+        self.assertIn("At least **42**", value)
+        self.assertIn("2 profile counts unavailable", value)
+        self.assertGreaterEqual(slow_cancelled, 1)
+
+        # Slots must be completely free for a subsequent request.
+        self.api.get_user_profile.side_effect = lambda name: SimpleNamespace(played_count=5)
+        next_embed = await self.stats([10, 20])
+        self.assertIn("**10**", self.logged_field(next_embed))
+
+    async def test_all_timeout_reports_unavailable_instead_of_zero(self):
+        await self.db.link_user(10, "SlowA")
+        await self.db.link_user(20, "SlowB")
+
+        block = asyncio.Event()
+        cancelled_count = 0
+
+        async def slow_profile(name):
+            nonlocal cancelled_count
+            try:
+                await block.wait()
+            except asyncio.CancelledError:
+                cancelled_count += 1
+                raise
+
+        self.cog = StatsCog(
+            SimpleNamespace(db=self.db, backloggd=self.api),
+            played_count_timeout=0.05,
+        )
+        self.api.get_user_profile.side_effect = slow_profile
+
+        embed = await self.stats([10, 20])
+        value = self.logged_field(embed)
+        self.assertIn("Unavailable", value)
+        self.assertIn("2 profile counts unavailable", value)
+        self.assertNotIn("**0**", value)
+        self.assertEqual(cancelled_count, 2)
+
+    async def test_1000_profiles_use_bounded_worker_set_and_peak_concurrency_two(self):
+        profiles = [{"profile_key": f"p{i}", "display_username": f"Player{i}"} for i in range(1000)]
+        active = 0
+        peak = 0
+        worker_tasks = set()
+
+        async def fast_profile(name):
+            nonlocal active, peak
+            worker_tasks.add(id(asyncio.current_task()))
+            active += 1
+            peak = max(peak, active)
+            if len(worker_tasks) < 2 and active == 1:
+                await asyncio.sleep(0)
+            active -= 1
+            return SimpleNamespace(played_count=1)
+
+        self.api.get_user_profile.side_effect = fast_profile
+        result = await self.cog._played_tab_counts([], profiles=profiles)
+
+        self.assertEqual(result["total_logged"], 1000)
+        self.assertEqual(result["logged_profiles_counted"], 1000)
+        self.assertEqual(result["logged_profiles_missing"], 0)
+        self.assertLessEqual(peak, 2)
+        self.assertLessEqual(len(worker_tasks), 2)
+
+    async def test_external_cancellation_cleans_up_workers_and_releases_slots(self):
+        await self.db.link_user(10, "SlowA")
+        await self.db.link_user(20, "SlowB")
+
+        both_entered = asyncio.Event()
+        entered = 0
+        cancelled = 0
+        block = asyncio.Event()
+
+        async def blocked_profile(name):
+            nonlocal entered, cancelled
+            entered += 1
+            if entered == 2:
+                both_entered.set()
+            try:
+                await block.wait()
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
+
+        self.cog = StatsCog(
+            SimpleNamespace(db=self.db, backloggd=self.api),
+            played_count_timeout=5.0,
+        )
+        self.api.get_user_profile.side_effect = blocked_profile
+
+        task = asyncio.create_task(self.cog._played_tab_counts([10, 20]))
+        await asyncio.wait_for(both_entered.wait(), timeout=1.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(cancelled, 2)
+        # Slots remain completely released for subsequent lookups.
+        self.api.get_user_profile.side_effect = lambda name: SimpleNamespace(played_count=3)
+        embed = await self.stats([10, 20])
+        self.assertIn("**6**", self.logged_field(embed))

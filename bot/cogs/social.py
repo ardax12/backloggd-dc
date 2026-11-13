@@ -26,6 +26,7 @@ from bot.services.guild_membership import (
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
+    format_fetching_library_message,
     format_profile_freshness_line,
     summarize_aggregate_freshness,
 )
@@ -55,6 +56,38 @@ class SocialCog(commands.Cog, name="Social"):
         self._live_library_semaphore = asyncio.Semaphore(self.live_fetch_concurrency)
         self._live_library_tasks: Dict[str, asyncio.Task] = {}
         self._live_library_waiters: Dict[str, int] = {}
+        self._tracked_live_tasks: set[asyncio.Task] = set()
+        self._closing: bool = False
+        self._draining_task: Optional[asyncio.Task] = None
+
+    async def close(self) -> None:
+        """Idempotently cancel and drain all tracked live-library fetches."""
+        self._closing = True
+        if self._draining_task is not None and not self._draining_task.done():
+            await asyncio.shield(self._draining_task)
+            return
+
+        async def _drain() -> None:
+            while True:
+                pending = [task for task in list(self._tracked_live_tasks) if not task.done()]
+                if not pending:
+                    break
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._live_library_tasks.clear()
+            self._live_library_waiters.clear()
+
+        self._draining_task = asyncio.create_task(_drain())
+        try:
+            await self._draining_task
+        finally:
+            if self._draining_task is not None and self._draining_task.done():
+                self._draining_task = None
+
+    async def cog_unload(self) -> None:
+        """Drain active live fetches when the cog is unloaded."""
+        await self.close()
 
     async def _resolve_username(self, interaction: discord.Interaction, target: Optional[str]) -> Optional[str]:
         """Resolve a parameter into a Backloggd username (supports Discord mention or username)."""
@@ -79,19 +112,6 @@ class SocialCog(commands.Cog, name="Social"):
             return info is not None
         return False
 
-    @staticmethod
-    def _fetching_message(username: str, status) -> str:
-        safe_name = escape_display_text(username)
-        if status is not None and status.failed_last and not status.refreshing:
-            return (
-                f"⏳ **{safe_name}**'s cached library data is not available yet because the last background refresh failed. "
-                "The bot will retry automatically, or you can run `/refresh`."
-            )
-        return (
-            f"⏳ **{safe_name}**'s cached library data is currently being fetched in the background. "
-            "Try again shortly or use `/refresh`."
-        )
-
     async def _fetch_live_library_ratings(self, username: str) -> Dict[str, Optional[float]]:
         async with self._live_library_semaphore:
             lib = await self.bot.backloggd.get_user_library(username)
@@ -99,7 +119,12 @@ class SocialCog(commands.Cog, name="Social"):
 
     async def _get_or_fetch_ratings(self, username: str) -> Dict[str, Optional[float]]:
         """Fetch user's library ratings mapping (slug -> score), coalescing live fetches."""
+        if self._closing:
+            raise asyncio.CancelledError("Social cog is shutting down")
+
         profile = await self.bot.db.get_profile_sync_info(username)
+        if self._closing:
+            raise asyncio.CancelledError("Social cog is shutting down")
         if profile and profile["last_synced_at"] is not None:
             return await self.bot.db.get_profile_ratings_dict(username)
 
@@ -108,6 +133,8 @@ class SocialCog(commands.Cog, name="Social"):
         if task is None or task.done():
             task = asyncio.create_task(self._fetch_live_library_ratings(username))
             self._live_library_tasks[profile_key] = task
+            self._tracked_live_tasks.add(task)
+            task.add_done_callback(self._tracked_live_tasks.discard)
 
             def _cleanup_live_task(completed: asyncio.Task, key: str = profile_key) -> None:
                 if self._live_library_tasks.get(key) is completed:
@@ -125,7 +152,7 @@ class SocialCog(commands.Cog, name="Social"):
             )
         finally:
             remaining = self._live_library_waiters.get(profile_key, 1) - 1
-            if remaining <= 0:
+            if remaining <= 0 or self._closing:
                 self._live_library_waiters.pop(profile_key, None)
                 if self._live_library_tasks.get(profile_key) is task:
                     self._live_library_tasks.pop(profile_key, None)
@@ -227,14 +254,14 @@ class SocialCog(commands.Cog, name="Social"):
             if not ratings1 or not ratings2:
                 if not ratings1 and sub1 and s1 is not None and s1.missing:
                     await interaction.followup.send(
-                        self._fetching_message(u1_name, s1),
+                        format_fetching_library_message(u1_name, s1),
                         ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
                 if not ratings2 and sub2 and s2 is not None and s2.missing:
                     await interaction.followup.send(
-                        self._fetching_message(u2_name, s2),
+                        format_fetching_library_message(u2_name, s2),
                         ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -423,7 +450,7 @@ class SocialCog(commands.Cog, name="Social"):
             if not my_ratings:
                 if target_subscribed and target_status is not None and target_status.missing:
                     await interaction.followup.send(
-                        self._fetching_message(target_username, target_status),
+                        format_fetching_library_message(target_username, target_status),
                         ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )

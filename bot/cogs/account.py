@@ -212,20 +212,22 @@ class AccountCog(commands.Cog, name="Account"):
                     exclude_discord_id=interaction.user.id,
                 )
                 duplicate_names = [
-                    discord.utils.escape_markdown(members[row["discord_id"]].display_name)
+                    escape_display_text(members[row["discord_id"]].display_name)
                     for row in connections
                     if row["discord_id"] in members
                 ]
         if duplicate_names:
+            disclaimer = "\nThese are separate public-profile links; they do not prove who owns the profile."
             shown_names = duplicate_names[:8]
             if len(duplicate_names) > len(shown_names):
                 shown_names.append(f"and {len(duplicate_names) - len(shown_names)} more")
+            max_names_len = 1024 - len(disclaimer)
+            names_text = ", ".join(shown_names)
+            if len(names_text) > max_names_len:
+                names_text = names_text[: max(0, max_names_len - 3)].rstrip(", \\") + "..."
             embed.add_field(
                 name="Also linked in this server",
-                value=(
-                    ", ".join(shown_names)
-                    + "\nThese are separate public-profile links; they do not prove who owns the profile."
-                ),
+                value=names_text + disclaimer,
                 inline=False,
             )
 
@@ -279,17 +281,23 @@ class AccountCog(commands.Cog, name="Account"):
             return
 
         username = linked["backloggd_username"]
+        safe_username = escape_display_text(username)
+        user_url = build_backloggd_user_url(username)
         profile_key = username.strip().lower()
         already_running = self.library_sync.is_refreshing(profile_key)
         embed = discord.Embed(
             title="🔄 Refresh In Progress..." if already_running else "🔄 Library Refresh Queued",
             description=(
-                f"A refresh for **[{username}](https://www.backloggd.com/u/{username}/)** is already running; "
-                "this message will update when it finishes."
+                (
+                    f"A refresh for **[{safe_username}]({user_url})** is already running; "
+                    "this message will update when it finishes."
+                )
                 if already_running
-                else f"Queued a library refresh for **[{username}](https://www.backloggd.com/u/{username}/)** in the background. "
-                "This message will update when it finishes."
-            ),
+                else (
+                    f"Queued a library refresh for **[{safe_username}]({user_url})** in the background. "
+                    "This message will update when it finishes."
+                )
+            )[:4096],
             color=COLOR_PRIMARY,
         )
         if linked["avatar_url"]:

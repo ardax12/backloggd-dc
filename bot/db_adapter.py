@@ -91,22 +91,16 @@ async def open_transaction(database: Any) -> AsyncIterator[TransactionAdapter]:
 async def execute_batch_statements(
     database: Any, statements: Sequence[tuple[str, Sequence[Any]]]
 ) -> list[Any]:
-    """Execute write/select statements atomically via Turso batch or SQLite BEGIN IMMEDIATE."""
+    """Execute write/select statements atomically via Turso batch or guarded SQLite transaction."""
     if not statements:
         return []
-    async with database._acquire_operation_lock():
-        if database.is_turso:
+    if database.is_turso:
+        async with database._acquire_operation_lock():
             results = await database._client.batch(
                 [(sql, list(args)) for sql, args in statements]
             )
             return list(results) if results is not None else []
-        conn = database._conn
-        await conn.execute("BEGIN IMMEDIATE")
-        try:
-            for sql, args in statements:
-                await conn.execute(sql, tuple(args))
-            await conn.commit()
-        except BaseException:
-            await conn.rollback()
-            raise
-        return []
+    async with open_transaction(database) as tx:
+        for sql, args in statements:
+            await tx.execute(sql, args)
+    return []

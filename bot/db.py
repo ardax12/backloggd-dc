@@ -1591,18 +1591,57 @@ class Database:
     # Server Leaderboards & Statistics
     # =========================================================================
 
+    async def get_guild_stats_context(self, member_ids: List[int]) -> dict[str, Any]:
+        """Resolve linked-member count, distinct profiles, and sync metadata in one pass."""
+        members = list(dict.fromkeys(int(value) for value in member_ids))
+        if not members:
+            return {
+                "linked_members": 0,
+                "profile_keys": [],
+                "profiles": [],
+            }
+        linked_discord_ids: set[int] = set()
+        profiles: dict[str, dict[str, Any]] = {}
+        for chunk in _iter_sql_chunks(members):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT u.discord_id,
+                       p.profile_key, p.display_username, p.avatar_url,
+                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error
+                FROM linked_users AS u
+                JOIN profiles AS p ON p.profile_key = u.profile_key
+                WHERE u.discord_id IN ({placeholders})
+                ORDER BY p.profile_key, u.discord_id
+            """
+            for row in await self._fetchall(query, chunk):
+                linked_discord_ids.add(int(row["discord_id"]))
+                key = row["profile_key"]
+                if key not in profiles:
+                    profiles[key] = {
+                        "profile_key": key,
+                        "display_username": row["display_username"],
+                        "avatar_url": row["avatar_url"],
+                        "last_synced_at": row["last_synced_at"],
+                        "last_sync_attempt_at": row["last_sync_attempt_at"],
+                        "last_sync_error": row["last_sync_error"],
+                    }
+        sorted_keys = sorted(profiles)
+        return {
+            "linked_members": len(linked_discord_ids),
+            "profile_keys": sorted_keys,
+            "profiles": [profiles[key] for key in sorted_keys],
+        }
+
     async def _get_guild_linked_profile_keys(self, guild_member_ids: List[int]) -> List[str]:
         if not guild_member_ids:
             return []
         profiles = await self.get_guild_linked_profiles(guild_member_ids)
         return [row["profile_key"] for row in profiles]
 
-    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
-        """Get top games by average rating among distinct linked profiles."""
-        if not guild_member_ids or limit <= 0:
-            return []
-        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        if not profile_keys:
+    async def _get_server_top_rated_for_profiles(
+        self, profile_keys: List[str], limit: int = 10, min_ratings: int = 2
+    ) -> List[Any]:
+        if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(profile_keys):
@@ -1645,12 +1684,17 @@ class Database:
         results.sort(key=lambda row: (-row["avg_rating"], -row["rating_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
-        """Get most completed games by distinct linked profiles."""
+    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
+        """Get top games by average rating among distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        if not profile_keys:
+        return await self._get_server_top_rated_for_profiles(profile_keys, limit=limit, min_ratings=min_ratings)
+
+    async def _get_server_most_played_for_profiles(
+        self, profile_keys: List[str], limit: int = 10
+    ) -> List[Any]:
+        if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(profile_keys):
@@ -1703,12 +1747,17 @@ class Database:
         )
         return results[:limit]
 
-    async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
-        """Get games most frequently sitting unplayed in linked profiles' backlogs."""
+    async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
+        """Get most completed games by distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        if not profile_keys:
+        return await self._get_server_most_played_for_profiles(profile_keys, limit=limit)
+
+    async def _get_server_shame_list_for_profiles(
+        self, profile_keys: List[str], limit: int = 10
+    ) -> List[Any]:
+        if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(profile_keys):
@@ -1737,12 +1786,17 @@ class Database:
         results.sort(key=lambda row: (-row["backlog_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
-        """Get games with the highest rating disparity (max - min) among distinct linked profiles."""
+    async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
+        """Get games most frequently sitting unplayed in linked profiles' backlogs."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        if not profile_keys:
+        return await self._get_server_shame_list_for_profiles(profile_keys, limit=limit)
+
+    async def _get_server_polarizing_for_profiles(
+        self, profile_keys: List[str], limit: int = 10, min_ratings: int = 2
+    ) -> List[Any]:
+        if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(profile_keys):
@@ -1797,12 +1851,17 @@ class Database:
         results.sort(key=lambda row: (-row["rating_delta"], -row["rating_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
-        """Get high-scoring games (>= 4.5) rated by only 1 or 2 distinct linked profiles."""
+    async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
+        """Get games with the highest rating disparity (max - min) among distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        if not profile_keys:
+        return await self._get_server_polarizing_for_profiles(profile_keys, limit=limit, min_ratings=min_ratings)
+
+    async def _get_server_hidden_gems_for_profiles(
+        self, profile_keys: List[str], limit: int = 10
+    ) -> List[Any]:
+        if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(profile_keys):
@@ -1847,34 +1906,33 @@ class Database:
         results.sort(key=lambda row: (-row["avg_rating"], row["rating_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_stats(self, guild_member_ids: List[int]) -> dict:
-        """Compute aggregate community metrics for a server."""
-        if not guild_member_ids:
-            return {
-                "linked_members": 0,
-                "profile_count": 0,
-                "total_logged": 0,
-                "total_played": 0,
-                "server_avg_rating": None,
-                "top_game": None,
-            }
+    async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
+        """Get high-scoring games (>= 4.5) rated by only 1 or 2 distinct linked profiles."""
+        if not guild_member_ids or limit <= 0:
+            return []
+        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
+        return await self._get_server_hidden_gems_for_profiles(profile_keys, limit=limit)
 
-        # 1. Distinct member connections and distinct Backloggd profiles across bounded chunks.
-        linked_rows = await self.get_guild_linked_users(guild_member_ids)
-        linked_members = len(linked_rows)
-        profile_keys = sorted({row["profile_key"] for row in linked_rows if row["profile_key"]})
+    async def _get_server_stats_for_profiles(
+        self,
+        profile_keys: List[str],
+        *,
+        linked_members: int,
+        include_library_row_counts: bool = True,
+    ) -> dict:
         profile_count = len(profile_keys)
         if not profile_keys:
-            return {
+            result = {
                 "linked_members": linked_members,
                 "profile_count": 0,
-                "total_logged": 0,
-                "total_played": 0,
                 "server_avg_rating": None,
                 "top_game": None,
             }
+            if include_library_row_counts:
+                result["total_logged"] = 0
+                result["total_played"] = 0
+            return result
 
-        # 2 & 3. Logs, Played count, rating sum/count, and top game over bounded profile chunks.
         total_logged = 0
         total_played = 0
         rating_sum = 0.0
@@ -1883,20 +1941,27 @@ class Database:
 
         for chunk in _iter_sql_chunks(profile_keys):
             placeholders = ",".join("?" for _ in chunk)
-            row = await self._fetchone(
-                f"""
+            if include_library_row_counts:
+                summary_sql = f"""
                 SELECT COUNT(*) AS total_logged,
                        SUM(CASE WHEN status = 'played' THEN 1 ELSE 0 END) AS total_played,
                        SUM(rating) AS rating_sum,
                        COUNT(rating) AS rating_count
                 FROM profile_ratings
                 WHERE profile_key IN ({placeholders});
-                """,
-                chunk,
-            )
+                """
+            else:
+                summary_sql = f"""
+                SELECT SUM(rating) AS rating_sum,
+                       COUNT(rating) AS rating_count
+                FROM profile_ratings
+                WHERE profile_key IN ({placeholders});
+                """
+            row = await self._fetchone(summary_sql, chunk)
             if row:
-                total_logged += int(row["total_logged"] or 0)
-                total_played += int(row["total_played"] or 0)
+                if include_library_row_counts:
+                    total_logged += int(row["total_logged"] or 0)
+                    total_played += int(row["total_played"] or 0)
                 if row["rating_sum"] is not None:
                     rating_sum += float(row["rating_sum"])
                 rating_count += int(row["rating_count"] or 0)
@@ -1924,14 +1989,35 @@ class Database:
             best = min(played_counts.values(), key=lambda item: (-item["count"], item["slug"]))
             top_game = f"{best['title']} ({best['count']} profile{'s' if best['count'] != 1 else ''})"
 
-        return {
+        result = {
             "linked_members": linked_members,
             "profile_count": profile_count,
-            "total_logged": total_logged,
-            "total_played": total_played,
             "server_avg_rating": avg_rating,
             "top_game": top_game,
         }
+        if include_library_row_counts:
+            result["total_logged"] = total_logged
+            result["total_played"] = total_played
+        return result
+
+    async def get_server_stats(self, guild_member_ids: List[int]) -> dict:
+        """Compute aggregate community metrics for a server."""
+        if not guild_member_ids:
+            return {
+                "linked_members": 0,
+                "profile_count": 0,
+                "total_logged": 0,
+                "total_played": 0,
+                "server_avg_rating": None,
+                "top_game": None,
+            }
+
+        context = await self.get_guild_stats_context(guild_member_ids)
+        return await self._get_server_stats_for_profiles(
+            context["profile_keys"],
+            linked_members=context["linked_members"],
+            include_library_row_counts=True,
+        )
 
     # =========================================================================
     # Guild Settings & Feed Deduplication

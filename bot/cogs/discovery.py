@@ -10,7 +10,7 @@ from typing import Optional
 from backloggd.analytics import calculate_similarity_raw
 from bot.ui.embeds import create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
-from bot.ui.helpers import build_backloggd_game_url, rating_to_stars
+from bot.ui.helpers import build_backloggd_game_url, build_backloggd_user_url, rating_to_stars
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
 from bot.input_validation import escape_display_text
 from bot.recommendation_rules import (
@@ -25,6 +25,7 @@ from bot.services.guild_membership import (
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
+    format_fetching_library_message,
     format_profile_freshness_line,
     summarize_aggregate_freshness,
 )
@@ -43,18 +44,6 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         if hasattr(linked, "keys") and "profile_key" in linked.keys():
             return str(linked["profile_key"]).strip().lower()
         return str(linked["backloggd_username"]).strip().lower()
-
-    @staticmethod
-    def _fetching_message(username: str, status) -> str:
-        if status is not None and status.failed_last and not status.refreshing:
-            return (
-                f"⏳ **{username}**'s cached library data is not available yet because the last background refresh failed. "
-                "The bot will retry automatically, or you can run `/refresh`."
-            )
-        return (
-            f"⏳ **{username}**'s cached library data is currently being fetched in the background. "
-            "Try again shortly or use `/refresh`."
-        )
 
     # =========================================================================
     # /roulette (Interactive Backlog Decision Picker)
@@ -95,11 +84,17 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         if not backlog_games:
             if status is not None and status.missing:
-                await interaction.followup.send(self._fetching_message(username, status), ephemeral=True)
+                await interaction.followup.send(
+                    format_fetching_library_message(username, status),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
+            safe_username = escape_display_text(username)
             await interaction.followup.send(
-                f"ℹ️ **{username}** has no unrated games in `Backlog` or `Wishlist` in the local cache. Try `/refresh` to sync your latest library.",
-                ephemeral=True
+                f"ℹ️ **{safe_username}** has no unrated games in `Backlog` or `Wishlist` in the local cache. Try `/refresh` to sync your latest library.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
@@ -185,20 +180,24 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             caller_status = statuses.get(caller_key)
 
             caller_ratings = await self.bot.db.get_profile_ratings_dict(caller_key)
+            safe_caller = escape_display_text(caller_username)
             if not caller_ratings:
                 if caller_status is not None and caller_status.missing:
                     await interaction.followup.send(
-                        self._fetching_message(caller_username, caller_status),
+                        format_fetching_library_message(caller_username, caller_status),
                         ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                 else:
                     await interaction.followup.send(
-                        f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library first.",
-                        ephemeral=True
+                        f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library first."[:2000],
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                 return
 
             friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
+            safe_friend = escape_display_text(friend_username)
             friend_key = self._linked_profile_key(friend_link) if friend_link else None
             friend_ratings = (
                 await self.bot.db.get_profile_ratings_dict(friend_key) if friend_link else {}
@@ -233,14 +232,18 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 if friend_link:
                     if has_uncertain_library_exclusion(caller_ratings, friend_entries):
                         await interaction.followup.send(
-                            f"ℹ️ No eligible 4.0+ recommendations were found for **{friend_username}** "
-                            "(matching games with an unknown status in their library were conservatively excluded).",
+                            (
+                                f"ℹ️ No eligible 4.0+ recommendations were found for **{safe_friend}** "
+                                "(matching games with an unknown status in their library were conservatively excluded)."
+                            )[:2000],
                             ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
                         )
                     else:
                         await interaction.followup.send(
-                            f"🎉 **{friend_username}** has already played, started, or rated all of your 4.0+ rated games.",
+                            f"🎉 **{safe_friend}** has already played, started, or rated all of your 4.0+ rated games."[:2000],
                             ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
                         )
                 else:
                     await interaction.followup.send(
@@ -254,13 +257,15 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             cached_meta = await self.bot.db.get_games_by_slugs(cand_slugs) if cand_slugs else {}
 
             comp_str = f" • `{taste_pct}%` taste compatibility" if taste_pct is not None else ""
-            desc = f"Hand-picked games from **[{caller_username}](https://www.backloggd.com/u/{caller_username}/)**'s library{comp_str}:"
+            caller_url = build_backloggd_user_url(caller_username)
+            desc = f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library{comp_str}:"
             if not friend_link:
-                desc += f"\n*(Note: {user.display_name} hasn't linked Backloggd yet, showing your all-time highest ratings)*"
+                safe_member_name = escape_display_text(user.display_name)
+                desc += f"\n*(Note: {safe_member_name} hasn't linked Backloggd yet, showing your all-time highest ratings)*"
 
             embed = discord.Embed(
-                title=f"💡 Recommendations for {friend_username}",
-                description=desc,
+                title=f"💡 Recommendations for {friend_username}"[:256],
+                description=desc[:4096],
                 color=COLOR_PLAYED
             )
 
@@ -270,24 +275,24 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 url = build_backloggd_game_url(slug)
                 stars = rating_to_stars(rating)
                 embed.add_field(
-                    name=f"🎮 {title}",
+                    name=f"🎮 {title}"[:256],
                     value=(
-                        f"• {caller_username}'s Rating: {stars} (`{rating:.1f}`)\n"
+                        f"• {safe_caller}'s Rating: {stars} (`{rating:.1f}`)\n"
                         f"• [View on Backloggd]({url})"
-                    ),
+                    )[:1024],
                     inline=False
                 )
 
-            freshness_lines = [format_profile_freshness_line(caller_status, label=f"**{caller_username}**")]
+            freshness_lines = [format_profile_freshness_line(caller_status, label=f"**{safe_caller}**")]
             if friend_link and friend_key:
                 freshness_lines.append(
-                    format_profile_freshness_line(statuses.get(friend_key), label=f"**{friend_username}**")
+                    format_profile_freshness_line(statuses.get(friend_key), label=f"**{safe_friend}**")
                 )
             freshness_text = "\n".join(line for line in freshness_lines if line)
             if freshness_text:
                 embed.add_field(name="⏱ Cache Freshness", value=freshness_text[:1024], inline=False)
 
-            embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot")
+            embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot"[:2048])
             await interaction.followup.send(embed=embed)
             return
 
@@ -302,6 +307,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             return
 
         caller_username = caller_link["backloggd_username"]
+        safe_caller = escape_display_text(caller_username)
         caller_key = self._linked_profile_key(caller_link)
         caller_statuses = await ensure_profiles_fresh(
             self.bot, [(caller_key, caller_username)], now=now, require_subscribed=True
@@ -313,21 +319,24 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         if not my_ratings:
             if caller_status is not None and caller_status.missing:
                 await interaction.followup.send(
-                    self._fetching_message(caller_username, caller_status),
+                    format_fetching_library_message(caller_username, caller_status),
                     ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             else:
                 await interaction.followup.send(
-                    f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library.",
-                    ephemeral=True
+                    f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library."[:2000],
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
             return
 
         my_numeric_ratings = numeric_ratings(my_ratings)
         if not my_numeric_ratings:
             await interaction.followup.send(
-                f"ℹ️ **{caller_username}** has no numeric game ratings in the cached library yet. Similarity needs rated games; unrated backlog and wishlist entries do not count.",
+                f"ℹ️ **{safe_caller}** has no numeric game ratings in the cached library yet. Similarity needs rated games; unrated backlog and wishlist entries do not count."[:2000],
                 ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
@@ -474,7 +483,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             })
 
         embed = discord.Embed(
-            title=f"💡 Recommendations for {caller_username}",
+            title=f"💡 Recommendations for {caller_username}"[:256],
             description="Hand-picked games from different server profiles that share your taste:\n",
             color=COLOR_PLAYED
         )
@@ -482,13 +491,14 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         for rec in recommendations:
             url = build_backloggd_game_url(rec["slug"])
             stars = rating_to_stars(rec["rating"])
+            safe_recommender = escape_display_text(rec["recommender"])
             embed.add_field(
-                name=f"🎮 {rec['title']}",
+                name=f"🎮 {rec['title']}"[:256],
                 value=(
-                    f"• Recommended by **{rec['recommender']}** ({rec['match_pct']}% taste match)\n"
+                    f"• Recommended by **{safe_recommender}** ({rec['match_pct']}% taste match)\n"
                     f"• Their Rating: {stars} (`{rec['rating']:.1f}`)\n"
                     f"• [View on Backloggd]({url})"
-                ),
+                )[:1024],
                 inline=False
             )
 

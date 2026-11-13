@@ -177,6 +177,162 @@ class DbTransactionAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await db.unset_feed_channel(1))
                 self.assertFalse(await db.unset_feed_channel(1))
 
+    async def test_sqlite_batch_commit_and_rollback_double_failure_preserves_primary_error(self):
+        primary_exc = RuntimeError("PRIMARY commit failure")
+        secondary_exc = RuntimeError("SECONDARY rollback failure")
+        real_conn = self.db._conn
+
+        class _FailingCommitRollbackConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, *args, **kwargs):
+                return self._inner.execute(*args, **kwargs)
+
+            async def commit(self):
+                raise primary_exc
+
+            async def rollback(self):
+                await self._inner.rollback()
+                raise secondary_exc
+
+        self.db._conn = _FailingCommitRollbackConn(real_conn)
+        try:
+            with self.assertLogs("backloggd.db", level="WARNING") as logs:
+                with self.assertRaises(RuntimeError) as raised:
+                    await self.db._execute_batch([
+                        ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("p1", "P1")),
+                    ])
+        finally:
+            self.db._conn = real_conn
+
+        self.assertIs(raised.exception, primary_exc)
+        self.assertIn("Could not roll back failed SQLite transaction", "\n".join(logs.output))
+        self.assertFalse(self.db._operation_lock.locked())
+        self.assertIsNone(await self.db.get_profile("p1"))
+
+        # Subsequent write succeeds cleanly.
+        await self.db.link_user(501, "AfterDoubleFail")
+        self.assertEqual((await self.db.get_linked_user(501))["profile_key"], "afterdoublefail")
+
+    async def test_sqlite_batch_body_failure_real_deferred_fk_commit_and_cancellation(self):
+        # 1. Body failure in second statement rolls back first statement.
+        with self.assertRaises(Exception):
+            await self.db._execute_batch([
+                ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("partial", "Partial")),
+                ("INSERT INTO non_existent_table (x) VALUES (?)", ("boom",)),
+            ])
+        self.assertIsNone(await self.db.get_profile("partial"))
+        self.assertFalse(self.db._operation_lock.locked())
+
+        # 2. Real SQLite deferred-FK violation fails at COMMIT, not statement body.
+        await self.db._execute(
+            "CREATE TABLE batch_fk_parent (id INTEGER PRIMARY KEY)"
+        )
+        await self.db._execute(
+            "CREATE TABLE batch_fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES batch_fk_parent(id) DEFERRABLE INITIALLY DEFERRED)"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db._execute_batch([
+                ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("fk_fail", "FkFail")),
+                ("INSERT INTO batch_fk_child (id, parent_id) VALUES (?, ?)", (1, 999999)),
+            ])
+        self.assertIsNone(await self.db.get_profile("fk_fail"))
+        self.assertFalse(self.db._operation_lock.locked())
+
+        # 3. Cancellation during batch rolls back and releases lock.
+        started = asyncio.Event()
+        real_conn = self.db._conn
+
+        class _SlowSecondExecuteConn:
+            def __init__(self, inner):
+                self._inner = inner
+                self._count = 0
+
+            def execute(self, sql, params=()):
+                self._count += 1
+                if "INSERT INTO profiles" in sql:
+                    return self._inner.execute(sql, params)
+                if "SELECT 'wait'" in sql:
+                    started.set()
+                    conn = self._inner
+
+                    class _WaitCtx:
+                        async def __aenter__(self):
+                            await asyncio.sleep(10)
+                            return await conn.execute(sql, params)
+
+                        async def __aexit__(self, *a):
+                            return False
+
+                    return _WaitCtx()
+                return self._inner.execute(sql, params)
+
+            def commit(self):
+                return self._inner.commit()
+
+            def rollback(self):
+                return self._inner.rollback()
+
+        self.db._conn = _SlowSecondExecuteConn(real_conn)
+        try:
+            task = asyncio.create_task(
+                self.db._execute_batch([
+                    ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("cancel_batch", "CancelBatch")),
+                    ("SELECT 'wait'", ()),
+                ])
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            self.db._conn = real_conn
+
+        self.assertIsNone(await self.db.get_profile("cancel_batch"))
+        self.assertFalse(self.db._operation_lock.locked())
+        await self.db.link_user(502, "AfterBatchCancel")
+        self.assertEqual((await self.db.get_linked_user(502))["profile_key"], "afterbatchcancel")
+
+    async def test_batch_empty_success_and_turso_parity(self):
+        # Empty batch is a no-op on both backends
+        self.assertEqual(await self.db._execute_batch_results([]), [])
+        self.assertEqual(await self.turso_db._execute_batch_results([]), [])
+        self.assertFalse(self.db._operation_lock.locked())
+        self.assertFalse(self.turso_db._operation_lock.locked())
+
+        # Successful SQLite batch preserves statement order & params and returns []
+        sqlite_res = await self.db._execute_batch_results([
+            ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("b1", "B1")),
+            ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("b2", "B2")),
+        ])
+        self.assertEqual(sqlite_res, [])
+        self.assertEqual((await self.db.get_profile("b1"))["display_username"], "B1")
+        self.assertEqual((await self.db.get_profile("b2"))["display_username"], "B2")
+
+        # Turso batch executes atomically without nested transaction() calls
+        tx_called = False
+        orig_tx = self.turso_client.transaction
+
+        def _forbid_tx():
+            nonlocal tx_called
+            tx_called = True
+            return orig_tx()
+
+        self.turso_client.transaction = _forbid_tx
+        try:
+            turso_res = await self.turso_db._execute_batch_results([
+                ("INSERT INTO profiles (profile_key, display_username) VALUES (?, ?)", ("tb1", "TB1")),
+                ("SELECT display_username FROM profiles WHERE profile_key = ?", ("tb1",)),
+            ])
+        finally:
+            self.turso_client.transaction = orig_tx
+
+        self.assertFalse(tx_called)
+        self.assertEqual(len(turso_res), 2)
+        self.assertEqual(turso_res[1].rows[0]["display_username"], "TB1")
+        self.assertFalse(self.turso_db._operation_lock.locked())
+
 
 if __name__ == "__main__":
     unittest.main()

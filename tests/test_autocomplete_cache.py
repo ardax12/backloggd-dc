@@ -3,7 +3,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["TURSO_DATABASE_URL"] = ""
@@ -183,6 +183,64 @@ class AutocompletePersistenceTests(unittest.IsolatedAsyncioTestCase):
         api.search_games.assert_awaited_once_with("Celeste")
         api.get_game.assert_awaited_once_with("celeste")
         self.assertIn("Celeste", interaction.followup.send.call_args.kwargs["embed"].title)
+
+    async def test_single_fallback_storage_lru_eviction_and_reselection(self):
+        now = 10.0
+        slug_a = "long-slug-a-" + ("a" * 95)
+        slug_b = "long-slug-b-" + ("b" * 95)
+        slug_c = "long-slug-c-" + ("c" * 95)
+        api = SimpleNamespace(
+            search_games=AsyncMock(),
+            get_game=AsyncMock(side_effect=lambda s: _fake_game_details(s, f"Title {s[:11]}")),
+        )
+        db = SimpleNamespace(
+            upsert_game=AsyncMock(),
+            get_server_ratings_for_game=AsyncMock(return_value=[]),
+            get_guild_linked_profiles_with_sync_info=AsyncMock(return_value=[]),
+        )
+        cog = GamesCog(SimpleNamespace(backloggd=api, db=db), monotonic_clock=lambda: now)
+
+        self.assertFalse(
+            hasattr(cog, "_autocomplete_slugs"),
+            "GamesCog must keep _fallback_entries as the single fallback token cache",
+        )
+
+        with patch("bot.cogs.games._MAX_FALLBACK_SLUGS", 2):
+            api.search_games.return_value = [SimpleNamespace(title="Game A", release_year=2024, slug=slug_a)]
+            token_a = (await cog.game_autocomplete(SimpleNamespace(), "query a"))[0].value
+            now += 1.0
+            api.search_games.return_value = [SimpleNamespace(title="Game B", release_year=2024, slug=slug_b)]
+            token_b = (await cog.game_autocomplete(SimpleNamespace(), "query b"))[0].value
+            self.assertEqual(len(cog._fallback_entries), 2)
+
+            # Reselect token_a so token_b becomes the least-recently-used entry.
+            await GamesCog.game.callback(cog, _fake_interaction(), token_a)
+            api.get_game.assert_awaited_with(slug_a)
+
+            now += 1.0
+            api.search_games.return_value = [SimpleNamespace(title="Game C", release_year=2024, slug=slug_c)]
+            token_c = (await cog.game_autocomplete(SimpleNamespace(), "query c"))[0].value
+
+        self.assertEqual(len(cog._fallback_entries), 2)
+        self.assertIn(token_a, cog._fallback_entries)
+        self.assertIn(token_c, cog._fallback_entries)
+        self.assertNotIn(token_b, cog._fallback_entries)
+
+        # Evicted token_b must prompt reselection cleanly without calling search_games(token_b).
+        api.search_games.reset_mock()
+        api.get_game.reset_mock()
+        evicted_interaction = _fake_interaction()
+        await GamesCog.game.callback(cog, evicted_interaction, token_b)
+        api.search_games.assert_not_awaited()
+        api.get_game.assert_not_awaited()
+        self.assertIn("expired", evicted_interaction.followup.send.call_args.args[0].lower())
+
+        # Same query "query b" produces a fresh working replacement token after eviction.
+        api.search_games.return_value = [SimpleNamespace(title="Game B", release_year=2024, slug=slug_b)]
+        renewed_b = (await cog.game_autocomplete(SimpleNamespace(), "query b"))[0].value
+        self.assertNotEqual(renewed_b, token_b)
+        await GamesCog.game.callback(cog, _fake_interaction(), renewed_b)
+        api.get_game.assert_awaited_once_with(slug_b)
 
 
 if __name__ == "__main__":

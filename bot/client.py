@@ -23,7 +23,8 @@ class BackloggdBot(commands.Bot):
         super().__init__(
             command_prefix="!",
             intents=intents,
-            help_command=None
+            help_command=None,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
         self.db = Database(DATABASE_PATH)
@@ -87,6 +88,10 @@ class BackloggdBot(commands.Bot):
         feed_cog = self.get_cog("Feed")
         if feed_cog and hasattr(feed_cog, "journal_feed_loop") and feed_cog.journal_feed_loop.is_running():
             feed_cog.journal_feed_loop.cancel()
+
+        social_cog = self.get_cog("Social")
+        if social_cog and hasattr(social_cog, "close"):
+            await social_cog.close()
 
         await self.guild_membership.close()
         await self.library_sync.close()

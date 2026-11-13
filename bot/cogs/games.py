@@ -13,15 +13,12 @@ from uuid import uuid4
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
 from bot.ui.views import LinkButtonView, GameCardView, RatingsView
 from bot.ui.helpers import build_backloggd_game_url
+from bot.input_validation import escape_display_text
 from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
-from bot.services.freshness import (
-    ensure_profiles_fresh,
-    format_aggregate_freshness,
-    summarize_aggregate_freshness,
-)
+from bot.services.freshness import resolve_guild_aggregate_freshness
 
 logger = logging.getLogger("backloggd.cogs.games")
 
@@ -34,6 +31,15 @@ _MAX_INLINE_SLUG_LEN = _DISCORD_CHOICE_LIMIT - len(_SLUG_TAG_PREFIX)
 _MAX_AUTOCOMPLETE_CACHE = 500
 _MAX_FALLBACK_SLUGS = 500
 _FALLBACK_TTL_SECONDS = 1800.0
+_MAX_DISPLAY_EXCERPT_LEN = 120
+
+
+def _format_display_excerpt(value: str, *, max_raw_len: int = _MAX_DISPLAY_EXCERPT_LEN) -> str:
+    """Normalize whitespace, bound length, and escape Markdown/mentions once for display."""
+    collapsed = " ".join(str(value).split())
+    if len(collapsed) > max_raw_len:
+        collapsed = collapsed[: max(1, max_raw_len - 3)].rstrip() + "..."
+    return escape_display_text(collapsed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +57,6 @@ class GamesCog(commands.Cog, name="Games"):
         self._fallback_ttl_seconds = float(fallback_ttl_seconds)
         # Bounded caches kept independent so query-cache pruning never wipes fallback tokens.
         self._autocomplete_cache: OrderedDict[str, List[app_commands.Choice[str]]] = OrderedDict()
-        self._autocomplete_slugs: OrderedDict[str, str] = OrderedDict()
         self._fallback_entries: OrderedDict[str, _FallbackEntry] = OrderedDict()
 
     def _prune_expired_fallbacks(self, now: float) -> Optional[dict[str, str]]:
@@ -59,18 +64,15 @@ class GamesCog(commands.Cog, name="Games"):
         for token, entry in list(self._fallback_entries.items()):
             if now - entry.created_at > self._fallback_ttl_seconds:
                 self._fallback_entries.pop(token, None)
-                self._autocomplete_slugs.pop(token, None)
                 expired_queries[token] = entry.query
         return expired_queries
 
     def _register_fallback_slug(self, slug: str, query: str) -> str:
         now = self._monotonic()
         self._prune_expired_fallbacks(now)
-        while len(self._autocomplete_slugs) >= _MAX_FALLBACK_SLUGS:
-            oldest_token, _ = self._autocomplete_slugs.popitem(last=False)
-            self._fallback_entries.pop(oldest_token, None)
+        while len(self._fallback_entries) >= _MAX_FALLBACK_SLUGS:
+            self._fallback_entries.popitem(last=False)
         token = f"{_FALLBACK_TAG_PREFIX}{uuid4().hex[:24]}"
-        self._autocomplete_slugs[token] = slug
         self._fallback_entries[token] = _FallbackEntry(slug=slug, query=query, created_at=now)
         return token
 
@@ -124,21 +126,6 @@ class GamesCog(commands.Cog, name="Games"):
             logger.warning("Autocomplete search error for '%s': %s", clean_query, e)
             return []
 
-    async def _guild_freshness_note(self, member_ids: List[int]) -> Optional[str]:
-        profile_getter = (
-            getattr(self.bot.db, "get_guild_linked_profiles_with_sync_info", None)
-            or getattr(self.bot.db, "get_guild_linked_profiles", None)
-        )
-        if profile_getter is None:
-            return None
-        profiles = await profile_getter(member_ids)
-        if not profiles:
-            return "No linked Backloggd profiles in cache yet."
-        statuses = await ensure_profiles_fresh(
-            self.bot, profiles, now=self.clock(), require_subscribed=True
-        )
-        return format_aggregate_freshness(summarize_aggregate_freshness(statuses.values()))
-
     @app_commands.command(name="game", description="Search for a game and view Backloggd ratings & server member scores")
     @app_commands.describe(title="Type game title to search with live autocomplete")
     @app_commands.autocomplete(title=game_autocomplete)
@@ -154,6 +141,7 @@ class GamesCog(commands.Cog, name="Games"):
                     await interaction.followup.send(
                         "❌ Please select a game from the autocomplete list or enter a game title.",
                         ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
             elif query.startswith(_FALLBACK_TAG_PREFIX):
@@ -163,46 +151,58 @@ class GamesCog(commands.Cog, name="Games"):
                     slug = entry.slug
                     if isinstance(self._fallback_entries, OrderedDict):
                         self._fallback_entries.move_to_end(query)
-                    if isinstance(self._autocomplete_slugs, OrderedDict) and query in self._autocomplete_slugs:
-                        self._autocomplete_slugs.move_to_end(query)
-                else:
-                    slug = self._autocomplete_slugs.get(query)
                 if not slug:
-                    hint = f' for "{discord.utils.escape_markdown(expired[query])}"' if query in expired else ""
+                    hint = f' for "{_format_display_excerpt(expired[query])}"' if query in expired else ""
                     await interaction.followup.send(
-                        f"⏳ That autocomplete selection{hint} has expired. "
-                        "Please type the game title again and re-select it from the autocomplete list.",
+                        (
+                            f"⏳ That autocomplete selection{hint} has expired. "
+                            "Please type the game title again and re-select it from the autocomplete list."
+                        )[:2000],
                         ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
-            elif query in self._autocomplete_slugs:
-                slug = self._autocomplete_slugs[query]
             else:
                 search_results = await self.bot.backloggd.search_games(query)
                 if not search_results:
+                    safe_query = _format_display_excerpt(query)
                     await interaction.followup.send(
-                        f"❌ No games found matching **{query}** on Backloggd.",
-                        ephemeral=True
+                        f"❌ No games found matching **{safe_query}** on Backloggd."[:2000],
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
                 if len(search_results) > 1:
+                    safe_query = _format_display_excerpt(query)
                     candidates = [
-                        f"{game.title} ({game.release_year})" if getattr(game, "release_year", None) else game.title
+                        _format_display_excerpt(
+                            f"{game.title} ({game.release_year})"
+                            if getattr(game, "release_year", None)
+                            else game.title
+                        )
                         for game in search_results[:5]
                     ]
                     options = "; ".join(candidates)
+                    suffix = ". Select the game from the autocomplete list and run `/game` again."
+                    prefix = f"I found several games matching **{safe_query}**: "
+                    max_opts_len = 2000 - len(prefix) - len(suffix)
+                    if len(options) > max_opts_len:
+                        options = options[: max(0, max_opts_len - 3)].rstrip("; \\") + "..."
                     await interaction.followup.send(
-                        f"I found several games matching **{query}**: {options}. Select the game from the autocomplete list and run `/game` again.",
+                        f"{prefix}{options}{suffix}",
                         ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
                 slug = search_results[0].slug
 
             game_data = await self.bot.backloggd.get_game(slug)
             if not game_data:
+                safe_slug = _format_display_excerpt(slug)
                 await interaction.followup.send(
-                    f"❌ Could not retrieve details for game: **{slug}**.",
-                    ephemeral=True
+                    f"❌ Could not retrieve details for game: **{safe_slug}**."[:2000],
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
@@ -226,7 +226,12 @@ class GamesCog(commands.Cog, name="Games"):
                     return
             else:
                 guild_member_ids = [interaction.user.id]
-            freshness_note = await self._guild_freshness_note(guild_member_ids)
+            freshness_note = await resolve_guild_aggregate_freshness(
+                self.bot,
+                guild_member_ids,
+                now=self.clock(),
+                require_subscribed=True,
+            )
             server_ratings = await self.bot.db.get_server_ratings_for_game(guild_member_ids, game_data.slug)
 
             guild_name = interaction.guild.name if interaction.guild else "Server"
@@ -255,9 +260,11 @@ class GamesCog(commands.Cog, name="Games"):
 
         except Exception as e:
             logger.error("Error looking up game '%s': %s", title, e, exc_info=True)
+            safe_title = _format_display_excerpt(query or title)
             await interaction.followup.send(
-                f"❌ An error occurred while fetching information for **{title}**.",
-                ephemeral=True
+                f"❌ An error occurred while fetching information for **{safe_title}**."[:2000],
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
 
 async def setup(bot):
