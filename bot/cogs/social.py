@@ -1,5 +1,6 @@
 """SocialCog: Handles /compare taste duel and similarity between users."""
 
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -10,12 +11,19 @@ from bot.ui.embeds import create_compare_embed, create_taste_twins_embed
 from bot.ui.views import LinkButtonView, TasteTwinsView
 from bot.ui.helpers import build_backloggd_user_url
 from bot.recommendation_rules import numeric_ratings
+from bot.services.freshness import (
+    ensure_profiles_fresh,
+    format_aggregate_freshness,
+    format_profile_freshness_line,
+    summarize_aggregate_freshness,
+)
 
 logger = logging.getLogger("backloggd.cogs.social")
 
 class SocialCog(commands.Cog, name="Social"):
-    def __init__(self, bot):
+    def __init__(self, bot, *, clock=None):
         self.bot = bot
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def _resolve_username(self, interaction: discord.Interaction, target: Optional[str]) -> Optional[str]:
         """Resolve a parameter into a Backloggd username (supports Discord mention or username)."""
@@ -29,6 +37,28 @@ class SocialCog(commands.Cog, name="Social"):
             return linked["backloggd_username"] if linked else None
 
         return clean.lstrip("@")
+
+    async def _is_subscribed(self, username: str) -> bool:
+        checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
+        if checker is not None:
+            return bool(await checker(username))
+        sync_getter = getattr(self.bot.db, "get_profile_sync_info", None)
+        if sync_getter is not None:
+            info = await sync_getter(username)
+            return info is not None
+        return False
+
+    @staticmethod
+    def _fetching_message(username: str, status) -> str:
+        if status is not None and status.failed_last and not status.refreshing:
+            return (
+                f"⏳ **{username}**'s cached library data is not available yet because the last background refresh failed. "
+                "The bot will retry automatically, or you can run `/refresh`."
+            )
+        return (
+            f"⏳ **{username}**'s cached library data is currently being fetched in the background. "
+            "Try again shortly or use `/refresh`."
+        )
 
     async def _get_or_fetch_ratings(self, username: str) -> Dict[str, Optional[float]]:
         """Fetch user's library ratings mapping (slug -> score)."""
@@ -84,12 +114,37 @@ class SocialCog(commands.Cog, name="Social"):
 
         try:
             import asyncio
+            now = self.clock()
+            statuses = await ensure_profiles_fresh(
+                self.bot,
+                [(u1_name.lower(), u1_name), (u2_name.lower(), u2_name)],
+                now=now,
+                require_subscribed=True,
+            )
+            s1 = statuses.get(u1_name.lower())
+            s2 = statuses.get(u2_name.lower())
+            sub1, sub2 = await asyncio.gather(
+                self._is_subscribed(u1_name),
+                self._is_subscribed(u2_name),
+            )
+
+            async def _load_ratings(name: str, subscribed: bool, status):
+                if subscribed and status is not None and status.missing and getattr(self.bot, "library_sync", None) is not None:
+                    return await self.bot.db.get_profile_ratings_dict(name)
+                return await self._get_or_fetch_ratings(name)
+
             ratings1, ratings2 = await asyncio.gather(
-                self._get_or_fetch_ratings(u1_name),
-                self._get_or_fetch_ratings(u2_name)
+                _load_ratings(u1_name, sub1, s1),
+                _load_ratings(u2_name, sub2, s2),
             )
 
             if not ratings1 or not ratings2:
+                if not ratings1 and sub1 and s1 is not None and s1.missing:
+                    await interaction.followup.send(self._fetching_message(u1_name, s1), ephemeral=True)
+                    return
+                if not ratings2 and sub2 and s2 is not None and s2.missing:
+                    await interaction.followup.send(self._fetching_message(u2_name, s2), ephemeral=True)
+                    return
                 empty_user = u1_name if not ratings1 else u2_name
                 await interaction.followup.send(
                     f"❌ **{empty_user}** does not have any logged games in their library to compare.",
@@ -139,12 +194,17 @@ class SocialCog(commands.Cog, name="Social"):
             shared_loves.sort(key=lambda x: x["avg"], reverse=True)
             disagreements.sort(key=lambda x: x["delta"], reverse=True)
 
+            line1 = format_profile_freshness_line(s1, label=f"**{u1_name}**", unlinked_live=not sub1)
+            line2 = format_profile_freshness_line(s2, label=f"**{u2_name}**", unlinked_live=not sub2)
+            freshness_note = "\n".join(line for line in (line1, line2) if line) or None
+
             embed = create_compare_embed(
                 user1=u1_name,
                 user2=u2_name,
                 match_score=match_pct,
                 shared_loves=shared_loves,
-                disagreements=disagreements
+                disagreements=disagreements,
+                freshness_note=freshness_note,
             )
             view = LinkButtonView(label=f"View {u1_name}'s Profile", url=build_backloggd_user_url(u1_name))
 
@@ -220,17 +280,34 @@ class SocialCog(commands.Cog, name="Social"):
             target_avatar = linked["avatar_url"]
 
         try:
+            now = self.clock()
+            target_key = target_username.lower()
+            target_subscribed = bool(target_discord_id) or await self._is_subscribed(target_username)
+            target_statuses = await ensure_profiles_fresh(
+                self.bot,
+                [(target_key, target_username)],
+                now=now,
+                require_subscribed=True,
+            )
+            target_status = target_statuses.get(target_key)
+
             # 2. Get target ratings
-            if target_discord_id:
+            if target_discord_id or target_subscribed:
                 my_ratings = await self.bot.db.get_profile_ratings_dict(target_username)
             else:
                 my_ratings = await self._get_or_fetch_ratings(target_username)
 
             if not my_ratings:
-                await interaction.followup.send(
-                    f"❌ **{target_username}** does not have any cached ratings yet. Use `/refresh` to sync your library.",
-                    ephemeral=True
-                )
+                if target_subscribed and target_status is not None and target_status.missing:
+                    await interaction.followup.send(
+                        self._fetching_message(target_username, target_status),
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"❌ **{target_username}** does not have any cached ratings yet. Use `/refresh` to sync your library.",
+                        ephemeral=True
+                    )
                 return
 
             my_numeric_ratings = numeric_ratings(my_ratings)
@@ -244,7 +321,7 @@ class SocialCog(commands.Cog, name="Social"):
             # 3. Fetch distinct candidate profiles in this guild, excluding every link to the target.
             guild_member_ids = [m.id for m in interaction.guild.members if m.id != target_discord_id]
             other_linked = await self.bot.db.get_guild_linked_profiles(
-                guild_member_ids, exclude_profile_key=target_username.lower()
+                guild_member_ids, exclude_profile_key=target_key
             )
 
             if not other_linked:
@@ -253,6 +330,13 @@ class SocialCog(commands.Cog, name="Social"):
                     ephemeral=True
                 )
                 return
+
+            other_statuses = await ensure_profiles_fresh(
+                self.bot,
+                other_linked,
+                now=now,
+                require_subscribed=True,
+            )
 
             # 4. Batch fetch ratings once per candidate profile.
             other_profile_keys = [o["profile_key"] for o in other_linked]
@@ -357,7 +441,8 @@ class SocialCog(commands.Cog, name="Social"):
                     return
                 await btn_interaction.response.defer()
                 t1_ratings = my_numeric_ratings
-                t2_ratings = numeric_ratings(all_other_ratings.get(twins[0]["profile_key"], {}))
+                t2_key = twins[0]["profile_key"]
+                t2_ratings = numeric_ratings(all_other_ratings.get(t2_key, {}))
                 final_s, _, _ = calculate_similarity_raw(my_numeric_ratings, t2_ratings)
                 c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
                 c_loves = []
@@ -377,15 +462,24 @@ class SocialCog(commands.Cog, name="Social"):
 
                 c_loves.sort(key=lambda x: x["avg"], reverse=True)
                 c_dis.sort(key=lambda x: x["delta"], reverse=True)
+                l1 = format_profile_freshness_line(target_status, label=f"**{target_username}**", unlinked_live=not target_subscribed)
+                l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{top_twin_name}**")
+                duel_freshness = "\n".join(line for line in (l1, l2) if line) or None
                 comp_embed = create_compare_embed(
                     user1=target_username,
                     user2=top_twin_name,
                     match_score=final_s / 100.0,
                     shared_loves=c_loves,
-                    disagreements=c_dis
+                    disagreements=c_dis,
+                    freshness_note=duel_freshness,
                 )
                 comp_view = LinkButtonView(label=f"View {top_twin_name}'s Profile", url=build_backloggd_user_url(top_twin_name))
                 await btn_interaction.followup.send(embed=comp_embed, view=comp_view)
+
+            contributing = ([target_status] if (target_subscribed and target_status is not None) else []) + list(other_statuses.values())
+            freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
+            if not target_subscribed and freshness_note:
+                freshness_note = f"{target_username}: Fetched live · {freshness_note}"
 
             embed = create_taste_twins_embed(
                 username=target_username,
@@ -393,7 +487,8 @@ class SocialCog(commands.Cog, name="Social"):
                 guild_name=interaction.guild.name,
                 twins=twins,
                 nemesis=nemesis,
-                server_avg_match=server_avg_match
+                server_avg_match=server_avg_match,
+                freshness_note=freshness_note,
             )
             view = TasteTwinsView(
                 user_url=build_backloggd_user_url(target_username),

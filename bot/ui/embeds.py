@@ -25,14 +25,15 @@ from bot.ui.helpers import (
 def create_game_embed(
     game: Any,
     server_ratings: List[Any],
-    guild_name: Optional[str] = "Server"
+    guild_name: Optional[str] = "Server",
+    freshness_note: Optional[str] = None,
 ) -> discord.Embed:
     """Construct embed for /game command with one rating row per server profile."""
     game_url = build_backloggd_game_url(game.slug)
     title = f"{game.title} ({game.release_year})" if game.release_year else game.title
     
     embed = discord.Embed(
-        title=title,
+        title=title[:256],
         url=game_url,
         color=COLOR_PRIMARY
     )
@@ -103,14 +104,17 @@ def create_game_embed(
             remaining = len(server_ratings) - display_limit
             server_lines.append(f"*+ {remaining} more profiles (click 'View All Ratings' below)*")
 
-        field_name = f"👥 {guild_name} Profile Ratings ({len(server_ratings)})"
-        embed.add_field(name=field_name, value="\n".join(server_lines), inline=False)
+        field_name = f"👥 {guild_name} Profile Ratings ({len(server_ratings)})"[:256]
+        embed.add_field(name=field_name, value="\n".join(server_lines)[:1024], inline=False)
     else:
         embed.add_field(
-            name=f"👥 {guild_name} Profile Ratings",
+            name=f"👥 {guild_name} Profile Ratings"[:256],
             value="*No connected Backloggd profiles have rated or logged this game yet.*",
             inline=False
         )
+
+    if freshness_note:
+        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
 
     embed.set_footer(text="Data from Backloggd • Use /link to connect your profile")
     return embed
@@ -122,6 +126,7 @@ def create_profile_embed(
     recent_played: Optional[List[Any]] = None,
     latest_review: Optional[Any] = None,
     fallback_avatar_url: Optional[str] = None,
+    freshness_note: Optional[str] = None,
 ) -> discord.Embed:
     """Construct embed for /profile command with clean formatting and top-left avatar."""
     user_url = build_backloggd_user_url(profile.username)
@@ -143,7 +148,7 @@ def create_profile_embed(
     avatar_url = clean_image_url(raw_avatar) or DEFAULT_BACKLOGGD_AVATAR
 
     embed = discord.Embed(
-        title=f"{profile.username}{badge_suffix}",
+        title=f"{profile.username}{badge_suffix}"[:256],
         url=user_url,
         color=COLOR_PRIMARY
     )
@@ -210,7 +215,7 @@ def create_profile_embed(
             else:
                 title = str(fav)
             fav_lines.append(f"**{i}.** {title}")
-        embed.add_field(name="⭐ Favorite Games", value="\n".join(fav_lines), inline=False)
+        embed.add_field(name="⭐ Favorite Games", value="\n".join(fav_lines)[:1024], inline=False)
 
     # 2. Recently Played (up to 5)
     if recent_played:
@@ -228,7 +233,7 @@ def create_profile_embed(
             date_suffix = f" *({date_str})*" if date_str else ""
             recent_lines.append(f"• **{title}**{stars}{replay}{date_suffix}")
         if recent_lines:
-            embed.add_field(name="🕹️ Recently Played", value="\n".join(recent_lines), inline=False)
+            embed.add_field(name="🕹️ Recently Played", value="\n".join(recent_lines)[:1024], inline=False)
 
     # 3. Latest Review (if present)
     if latest_review and getattr(latest_review, "game_title", None):
@@ -257,7 +262,10 @@ def create_profile_embed(
         else:
             review_content = header
 
-        embed.add_field(name="📝 Latest Review", value=review_content, inline=False)
+        embed.add_field(name="📝 Latest Review", value=review_content[:1024], inline=False)
+
+    if freshness_note:
+        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
 
     embed.set_footer(text="Backloggd Profile Overview • Connect yours with /link")
     return embed
@@ -267,7 +275,8 @@ def create_compare_embed(
     user2: str,
     match_score: float,
     shared_loves: List[dict],
-    disagreements: List[dict]
+    disagreements: List[dict],
+    freshness_note: Optional[str] = None,
 ) -> discord.Embed:
     """Construct embed for /compare taste duel."""
     score_pct = int(round(match_score * 100))
@@ -285,7 +294,7 @@ def create_compare_embed(
         color = COLOR_ERROR
 
     embed = discord.Embed(
-        title=f"⚔️ Taste Duel: {user1} vs {user2}",
+        title=f"⚔️ Taste Duel: {user1} vs {user2}"[:256],
         description=f"## {score_pct}% Taste Match\n**{verdict}**",
         color=color
     )
@@ -295,7 +304,7 @@ def create_compare_embed(
         lines = []
         for g in shared_loves[:5]:
             lines.append(f"• **{g['title']}** ({user1}: `{g['r1']:.1f}` | {user2}: `{g['r2']:.1f}`)")
-        embed.add_field(name="❤️ Shared Loves (Both Rated 4.0+)", value="\n".join(lines), inline=False)
+        embed.add_field(name="❤️ Shared Loves (Both Rated 4.0+)", value="\n".join(lines)[:1024], inline=False)
     else:
         embed.add_field(name="❤️ Shared Loves", value="*No shared 4.0+ ratings found.*", inline=False)
 
@@ -304,35 +313,58 @@ def create_compare_embed(
         lines = []
         for g in disagreements[:5]:
             lines.append(f"• **{g['title']}** ({user1}: `{g['r1']:.1f}` vs {user2}: `{g['r2']:.1f}` — `Δ {g['delta']:.1f}`)")
-        embed.add_field(name="⚡ Biggest Disagreements", value="\n".join(lines), inline=False)
+        embed.add_field(name="⚡ Biggest Disagreements", value="\n".join(lines)[:1024], inline=False)
+
+    if freshness_note:
+        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
 
     embed.set_footer(text="Calculated using Backloggd library similarity metrics")
     return embed
 
-def create_roulette_embed(username: str, game: Any, remaining_backlog: int) -> discord.Embed:
+def _read_field(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict) or (hasattr(item, "keys") and callable(item.keys)):
+        try:
+            return item[key]
+        except (KeyError, IndexError):
+            return default
+    return getattr(item, key, default)
+
+
+def create_roulette_embed(
+    username: str,
+    game: Any,
+    remaining_backlog: int,
+    freshness_note: Optional[str] = None,
+) -> discord.Embed:
     """Construct embed for /roulette unplayed-library pick."""
-    title = f"{game.title} ({game.release_year})" if getattr(game, "release_year", None) else game.title
-    game_url = build_backloggd_game_url(game.slug)
+    raw_title = _read_field(game, "title", "Unknown Game")
+    release_year = _read_field(game, "release_year")
+    slug = _read_field(game, "slug", "")
+    title = f"{raw_title} ({release_year})" if release_year else str(raw_title)
+    game_url = build_backloggd_game_url(slug)
 
     embed = discord.Embed(
-        title=f"🎲 Unplayed Game Roulette for {username}",
+        title=f"🎲 Unplayed Game Roulette for {username}"[:256],
         url=game_url,
         color=COLOR_GOLD
     )
 
-    cover = clean_image_url(getattr(game, "cover_url", None))
+    cover = clean_image_url(_read_field(game, "cover_url"))
     if cover:
         embed.set_thumbnail(url=cover)
 
     desc_lines = [
         f"### [{title}]({game_url})"
     ]
-    if getattr(game, "community_rating", None):
-        stars = rating_to_stars(game.community_rating)
-        desc_lines.append(f"{stars} **{game.community_rating:.1f}** / 5.0")
+    community_rating = _read_field(game, "community_rating")
+    if community_rating:
+        stars = rating_to_stars(community_rating)
+        desc_lines.append(f"{stars} **{community_rating:.1f}** / 5.0")
     
     desc_lines.append(f"\n🎯 **Your Mission:** Pick one of these unrated games to play! ({remaining_backlog} games still waiting)")
-    embed.description = "\n".join(desc_lines)
+    embed.description = "\n".join(desc_lines)[:4096]
+    if freshness_note:
+        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
     embed.set_footer(text="Click [🔄 Reroll] below to spin again")
     return embed
 
@@ -340,16 +372,19 @@ def create_server_top_embed(
     title: str,
     entries: List[Any],
     mode: str,
-    guild_name: str
+    guild_name: str,
+    freshness_note: Optional[str] = None,
 ) -> discord.Embed:
     """Construct embed for /server-top leaderboards."""
     embed = discord.Embed(
-        title=f"🏆 {guild_name} Leaderboard — {title}",
+        title=f"🏆 {guild_name} Leaderboard — {title}"[:256],
         color=COLOR_PRIMARY
     )
 
     if not entries:
         embed.description = "*Not enough server data to generate this leaderboard yet.*"
+        if freshness_note:
+            embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
         return embed
 
     lines = []
@@ -381,14 +416,21 @@ def create_server_top_embed(
         else:
             lines.append(f"{prefix} **[{game_title}]({url})**")
 
-    embed.description = "\n".join(lines)
-    embed.set_footer(text=f"Server rankings across distinct Backloggd profiles linked in {guild_name}")
+    embed.description = "\n".join(lines)[:4096]
+    if freshness_note:
+        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+    embed.set_footer(text=f"Server rankings across distinct Backloggd profiles linked in {guild_name}"[:2048])
     return embed
 
-def create_server_stats_embed(stats: dict, guild_name: str) -> discord.Embed:
+def create_server_stats_embed(
+    stats: dict,
+    guild_name: str,
+    freshness_note: Optional[str] = None,
+) -> discord.Embed:
     """Construct embed for /server-stats overview."""
     embed = discord.Embed(
-        title=f"📊 {guild_name} Gaming Stats",
+        title=f"📊 {guild_name} Gaming Stats"[:256],
+        description=f"⏱ {freshness_note}"[:4096] if freshness_note else None,
         color=COLOR_PRIMARY
     )
 
@@ -404,7 +446,7 @@ def create_server_stats_embed(stats: dict, guild_name: str) -> discord.Embed:
     embed.add_field(name="📚 Games Logged", value=f"**{stats['total_logged']}** games", inline=True)
     embed.add_field(name="🎮 Games Completed", value=f"**{stats['total_played']}** played", inline=True)
     embed.add_field(name="⭐ Server Avg Rating", value=avg_str, inline=True)
-    embed.add_field(name="👑 Most Played Game", value=top_game, inline=True)
+    embed.add_field(name="👑 Most Played Game", value=str(top_game)[:1024], inline=True)
 
     embed.set_footer(text="Community aggregate data from linked Backloggd profiles")
     return embed
@@ -416,11 +458,12 @@ def create_taste_twins_embed(
     guild_name: str,
     twins: List[dict],
     nemesis: Optional[dict] = None,
-    server_avg_match: Optional[float] = None
+    server_avg_match: Optional[float] = None,
+    freshness_note: Optional[str] = None,
 ) -> discord.Embed:
     """Construct embed for /taste-twins command displaying closest taste twins and nemesis."""
     embed = discord.Embed(
-        title=f"👥 {username}'s Server Taste Twins",
+        title=f"👥 {username}'s Server Taste Twins"[:256],
         url=build_backloggd_user_url(username),
         color=COLOR_PLAYED if twins and twins[0]["match_pct"] >= 75 else COLOR_PRIMARY
     )
@@ -431,7 +474,7 @@ def create_taste_twins_embed(
     desc_lines = [f"Comparing gaming taste across **{guild_name}**."]
     if server_avg_match is not None:
         desc_lines.append(f"**Community Compatibility:** `{int(round(server_avg_match))}%` average agreement")
-    embed.description = "\n".join(desc_lines)
+    embed.description = "\n".join(desc_lines)[:4096]
 
     # 1. Top Taste Twins
     if twins:
@@ -444,7 +487,7 @@ def create_taste_twins_embed(
                 f"{medal} **[{t['username']}](https://www.backloggd.com/u/{t['username']}/)** "
                 f"(`{t['match_pct']}%` match, {t['shared_count']} shared){fav_text}"
             )
-        embed.add_field(name="✨ Top Taste Soulmates", value="\n".join(twin_lines), inline=False)
+        embed.add_field(name="✨ Top Taste Soulmates", value="\n".join(twin_lines)[:1024], inline=False)
     else:
         embed.add_field(
             name="✨ Top Taste Soulmates",
@@ -459,7 +502,10 @@ def create_taste_twins_embed(
             f"⚡ **[{nemesis['username']}](https://www.backloggd.com/u/{nemesis['username']}/)** "
             f"(`{nemesis['match_pct']}%` match, {nemesis['shared_count']} shared){nem_fav}"
         )
-        embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=nem_line, inline=False)
+        embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=nem_line[:1024], inline=False)
+
+    if freshness_note:
+        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
 
     embed.set_footer(text="Based on Backloggd library ratings • Use /compare to duel with any member")
     return embed

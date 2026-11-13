@@ -51,7 +51,7 @@ def build_announcements(activities, journal, username):
     return merge_announcements(activity, logs)
 
 
-def merge_announcements(activities, logs):
+def merge_milestones(activities, logs):
     def match_key(event):
         date = calendar_date(event.played_date or event.occurred_at)
         if date and event.action_type in {"playing", "completed", "replay"}:
@@ -67,7 +67,7 @@ def merge_announcements(activities, logs):
         key = match_key(event)
         matches = log_groups.get(key, []) if key else []
         linked = [log for log in logs if log.activity_id in event.event_ids]
-        if len(linked) == 1 or (len(activity_groups[key]) == 1 and len(matches) == 1):
+        if len(linked) == 1 or (key is not None and len(activity_groups[key]) == 1 and len(matches) == 1):
             log = linked[0] if linked else matches[0]
             event = replace(event, played_date=log.played_date,
                             platform=log.platform or event.platform,
@@ -77,6 +77,72 @@ def merge_announcements(activities, logs):
             consumed.add(log.activity_id)
         merged.append(event)
     merged.extend(e for e in logs if e.activity_id not in consumed)
+    return merged
+
+
+def link_backdated_milestones(merged, *, baseline_or_saved_ids=(), uncertain_journal_ids=()):
+    """Link unmatched milestones, holding newly baselined journal evidence as uncertain.
+
+    Returns (events, uncertain_reasons) where uncertain_reasons maps activity_id
+    to the hold reason whenever dated journal evidence cannot be uniquely paired.
+    """
+    saved_ids = set(baseline_or_saved_ids)
+    uncertain_ids = set(uncertain_journal_ids)
+    acts_by_game = defaultdict(list)
+    logs_by_game = defaultdict(list)
+
+    for event in merged:
+        if event.action_type not in {"playing", "completed", "replay"}:
+            continue
+        if event.source == "activity":
+            if (
+                event.played_date is None
+                and not any(str(eid).startswith("journal_") for eid in event.event_ids)
+                and not any(eid in saved_ids for eid in event.event_ids)
+            ):
+                acts_by_game[event.game_slug].append(event)
+        elif event.source == "journal":
+            if event.activity_id in uncertain_ids or not any(eid in saved_ids for eid in event.event_ids):
+                logs_by_game[event.game_slug].append(event)
+
+    replacements = {}
+    consumed_log_ids = set()
+    uncertain_reasons = {}
+
+    for game_slug, acts in acts_by_game.items():
+        game_logs = logs_by_game.get(game_slug, [])
+        if not game_logs:
+            continue
+        if (
+            len(acts) == 1
+            and len(game_logs) == 1
+            and acts[0].action_type == game_logs[0].action_type
+            and game_logs[0].activity_id not in uncertain_ids
+        ):
+            act, log = acts[0], game_logs[0]
+            replacements[act.activity_id] = replace(
+                act,
+                played_date=log.played_date,
+                platform=log.platform or act.platform,
+                is_replay=log.is_replay or act.is_replay,
+                session_labels=log.session_labels,
+                event_ids=tuple(dict.fromkeys((*act.event_ids, *log.event_ids))),
+            )
+            consumed_log_ids.add(log.activity_id)
+        else:
+            for act in acts:
+                uncertain_reasons[act.activity_id] = "uncertain_backdated_journal_linkage"
+
+    updated = []
+    for event in merged:
+        if event.activity_id in consumed_log_ids:
+            continue
+        updated.append(replacements.get(event.activity_id, event))
+    return updated, uncertain_reasons
+
+
+def merge_ratings_and_reviews(merged):
+    merged = list(merged)
     # Review/rating prose can enrich a milestone only when an exact event
     # timestamp or a numeric permalink ties them to the same action.
     result = []
@@ -98,3 +164,7 @@ def merge_announcements(activities, logs):
     # Milestones may have been enriched after they were added to result.
     by_id = {e.activity_id: e for e in merged}
     return [by_id[e.activity_id] for e in result]
+
+
+def merge_announcements(activities, logs):
+    return merge_ratings_and_reviews(merge_milestones(activities, logs))

@@ -192,5 +192,152 @@ class RecommendationCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("same Backloggd profile", message)
 
 
+class StatusAwareRecommendationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.directory.name) / "rec-status.db"), turso_url="")
+        await self.db.connect()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self.directory.cleanup()
+
+    def test_status_aware_exclusion_rules(self):
+        from bot.recommendation_rules import excluded_recommendation_slugs, is_excluded_from_recommendations
+
+        self.assertFalse(is_excluded_from_recommendations("backlog", None))
+        self.assertFalse(is_excluded_from_recommendations("wishlist", None))
+        self.assertTrue(is_excluded_from_recommendations("backlog", 4.0))
+        self.assertTrue(is_excluded_from_recommendations("wishlist", 3.5))
+        self.assertTrue(is_excluded_from_recommendations("played", None))
+        self.assertTrue(is_excluded_from_recommendations("playing", None))
+        self.assertTrue(is_excluded_from_recommendations("unknown", None))
+        self.assertTrue(is_excluded_from_recommendations("custom_unmapped", None))
+
+        excluded = excluded_recommendation_slugs({
+            "wish": {"status": "wishlist", "rating": None},
+            "back": {"status": "backlog", "rating": None},
+            "played": {"status": "played", "rating": None},
+            "playing": {"status": "playing", "rating": None},
+            "rated-wish": {"status": "wishlist", "rating": 4.5},
+            "unk": {"status": "unknown", "rating": None},
+        })
+        self.assertEqual(excluded, {"played", "playing", "rated-wish", "unk"})
+
+    async def test_friend_and_server_recommend_allow_unrated_wishlist_and_backlog_only(self):
+        from datetime import datetime, timezone
+        from backloggd import GameEntry, GameStatus
+
+        now = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+        await self.db.link_user(10, "Alice")
+        await self.db.link_user(20, "Bob")
+
+        alice_items = [
+            GameEntry(slug=f"shared-{i}", title=f"Shared {i}", rating=4.5, status=GameStatus.PLAYED)
+            for i in range(5)
+        ] + [
+            GameEntry(slug="wish-pick", title="Wish Pick", rating=5.0, status=GameStatus.PLAYED),
+            GameEntry(slug="back-pick", title="Back Pick", rating=4.5, status=GameStatus.PLAYED),
+            GameEntry(slug="played-skip", title="Played Skip", rating=5.0, status=GameStatus.PLAYED),
+            GameEntry(slug="playing-skip", title="Playing Skip", rating=5.0, status=GameStatus.PLAYED),
+            GameEntry(slug="rated-skip", title="Rated Skip", rating=5.0, status=GameStatus.PLAYED),
+            GameEntry(slug="unknown-skip", title="Unknown Skip", rating=5.0, status=GameStatus.PLAYED),
+        ]
+        bob_items = [
+            GameEntry(slug=f"shared-{i}", title=f"Shared {i}", rating=4.5, status=GameStatus.PLAYED)
+            for i in range(5)
+        ] + [
+            GameEntry(slug="wish-pick", title="Wish Pick", rating=None, status=GameStatus.WISHLIST),
+            GameEntry(slug="back-pick", title="Back Pick", rating=None, status=GameStatus.BACKLOG),
+            GameEntry(slug="played-skip", title="Played Skip", rating=None, status=GameStatus.PLAYED),
+            GameEntry(slug="playing-skip", title="Playing Skip", rating=None, status=GameStatus.PLAYING),
+            GameEntry(slug="rated-skip", title="Rated Skip", rating=3.5, status=GameStatus.WISHLIST),
+            GameEntry(slug="unknown-skip", title="Unknown Skip", rating=None, status=GameStatus.UNKNOWN),
+        ]
+        await self.db.replace_profile_library("Alice", alice_items, synced_at=now)
+        await self.db.replace_profile_library("Bob", bob_items, synced_at=now)
+
+        members = [SimpleNamespace(id=10, display_name="Alice"), SimpleNamespace(id=20, display_name="Bob")]
+        cog = DiscoveryCog(SimpleNamespace(db=self.db), clock=lambda: now)
+
+        # Mode 2: Alice recommends to Bob -> Bob's unrated wishlist & backlog are eligible.
+        friend_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10, display_name="Alice"),
+            guild=SimpleNamespace(name="Server", members=members),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await DiscoveryCog.recommend.callback(cog, friend_interaction, user=SimpleNamespace(id=20, display_name="Bob"))
+        friend_embed = friend_interaction.followup.send.await_args.kwargs["embed"]
+        friend_titles = [field.name for field in friend_embed.fields]
+        self.assertTrue(any("Wish Pick" in t for t in friend_titles))
+        self.assertTrue(any("Back Pick" in t for t in friend_titles))
+        for skipped in ("Played Skip", "Playing Skip", "Rated Skip", "Unknown Skip", "Shared 0"):
+            self.assertFalse(any(skipped in t for t in friend_titles))
+
+        # Mode 1: Bob asks for server recommendations -> Bob's unrated wishlist & backlog from Alice are eligible.
+        server_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=20, display_name="Bob"),
+            guild=SimpleNamespace(name="Server", members=members),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await DiscoveryCog.recommend.callback(cog, server_interaction)
+        server_embed = server_interaction.followup.send.await_args.kwargs["embed"]
+        server_titles = [field.name for field in server_embed.fields]
+        self.assertTrue(any("Wish Pick" in t for t in server_titles))
+        self.assertTrue(any("Back Pick" in t for t in server_titles))
+        for skipped in ("Played Skip", "Playing Skip", "Rated Skip", "Unknown Skip", "Shared 0"):
+            self.assertFalse(any(skipped in t for t in server_titles))
+
+    async def test_unknown_status_does_not_claim_already_played_everything(self):
+        from datetime import datetime, timezone
+        from backloggd import GameEntry, GameStatus
+
+        now = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+        await self.db.link_user(10, "Alice")
+        await self.db.link_user(20, "Bob")
+
+        alice_items = [
+            GameEntry(slug=f"shared-{i}", title=f"Shared {i}", rating=4.5, status=GameStatus.PLAYED)
+            for i in range(5)
+        ] + [
+            GameEntry(slug="mystery", title="Mystery", rating=5.0, status=GameStatus.PLAYED),
+        ]
+        bob_items = [
+            GameEntry(slug=f"shared-{i}", title=f"Shared {i}", rating=4.5, status=GameStatus.PLAYED)
+            for i in range(5)
+        ] + [
+            GameEntry(slug="mystery", title="Mystery", rating=None, status=GameStatus.UNKNOWN),
+        ]
+        await self.db.replace_profile_library("Alice", alice_items, synced_at=now)
+        await self.db.replace_profile_library("Bob", bob_items, synced_at=now)
+
+        members = [SimpleNamespace(id=10, display_name="Alice"), SimpleNamespace(id=20, display_name="Bob")]
+        cog = DiscoveryCog(SimpleNamespace(db=self.db), clock=lambda: now)
+
+        i_friend = SimpleNamespace(
+            user=SimpleNamespace(id=10, display_name="Alice"),
+            guild=SimpleNamespace(name="Server", members=members),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await DiscoveryCog.recommend.callback(cog, i_friend, user=SimpleNamespace(id=20, display_name="Bob"))
+        msg_friend = i_friend.followup.send.await_args.args[0]
+        self.assertIn("unknown status", msg_friend.lower())
+        self.assertNotIn("already", msg_friend.lower())
+
+        i_server = SimpleNamespace(
+            user=SimpleNamespace(id=20, display_name="Bob"),
+            guild=SimpleNamespace(name="Server", members=members),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await DiscoveryCog.recommend.callback(cog, i_server)
+        msg_server = i_server.followup.send.await_args.args[0]
+        self.assertIn("unknown status", msg_server.lower())
+        self.assertNotIn("already", msg_server.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

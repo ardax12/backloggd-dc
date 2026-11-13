@@ -79,6 +79,9 @@ class BackloggdBot(commands.Bot):
     async def on_ready(self) -> None:
         """Triggered when connection is established and cache is ready."""
         logger.info("Logged in as %s (ID: %d)", self.user.name, self.user.id)
+        feed_cog = self.get_cog("Feed")
+        if feed_cog:
+            await feed_cog.reconcile_legacy_enrollments()
         activity = discord.Activity(
             type=discord.ActivityType.watching,
             name="games on Backloggd | /game"

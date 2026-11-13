@@ -1,5 +1,6 @@
 """DiscoveryCog: Handles profile-based recommendations and an unplayed-game roulette."""
 
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -11,13 +12,44 @@ from bot.ui.embeds import create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url, rating_to_stars
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
-from bot.recommendation_rules import numeric_ratings
+from bot.recommendation_rules import (
+    excluded_recommendation_slugs,
+    has_uncertain_library_exclusion,
+    numeric_ratings,
+)
+from bot.services.freshness import (
+    ensure_profiles_fresh,
+    format_aggregate_freshness,
+    format_profile_freshness_line,
+    summarize_aggregate_freshness,
+)
 
 logger = logging.getLogger("backloggd.cogs.discovery")
 
 class DiscoveryCog(commands.Cog, name="Discovery"):
-    def __init__(self, bot):
+    def __init__(self, bot, *, clock=None):
         self.bot = bot
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @staticmethod
+    def _linked_profile_key(linked) -> str:
+        if isinstance(linked, dict) and "profile_key" in linked:
+            return str(linked["profile_key"]).strip().lower()
+        if hasattr(linked, "keys") and "profile_key" in linked.keys():
+            return str(linked["profile_key"]).strip().lower()
+        return str(linked["backloggd_username"]).strip().lower()
+
+    @staticmethod
+    def _fetching_message(username: str, status) -> str:
+        if status is not None and status.failed_last and not status.refreshing:
+            return (
+                f"⏳ **{username}**'s cached library data is not available yet because the last background refresh failed. "
+                "The bot will retry automatically, or you can run `/refresh`."
+            )
+        return (
+            f"⏳ **{username}**'s cached library data is currently being fetched in the background. "
+            "Try again shortly or use `/refresh`."
+        )
 
     # =========================================================================
     # /roulette (Interactive Backlog Decision Picker)
@@ -40,9 +72,21 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             return
 
         username = linked["backloggd_username"]
+        profile_key = self._linked_profile_key(linked)
+        statuses = await ensure_profiles_fresh(
+            self.bot,
+            [(profile_key, username)],
+            now=self.clock(),
+            require_subscribed=True,
+        )
+        status = statuses.get(profile_key)
+
         backlog_games = await self.bot.db.get_user_backlog(target_discord_id)
 
         if not backlog_games:
+            if status is not None and status.missing:
+                await interaction.followup.send(self._fetching_message(username, status), ephemeral=True)
+                return
             await interaction.followup.send(
                 f"ℹ️ **{username}** has no unrated games in `Backlog` or `Wishlist` in the local cache. Try `/refresh` to sync your latest library.",
                 ephemeral=True
@@ -51,11 +95,14 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         chosen_game = random.choice(backlog_games)
         remaining = len(backlog_games)
+        freshness_note = format_profile_freshness_line(status)
 
         # Reroll callback definition for the interactive view
         async def on_reroll(btn_interaction: discord.Interaction):
             new_choice = random.choice(backlog_games)
-            new_embed = create_roulette_embed(username, new_choice, remaining)
+            new_embed = create_roulette_embed(
+                username, new_choice, remaining, freshness_note=freshness_note
+            )
             new_view = RouletteView(
                 author_id=interaction.user.id,
                 game_url=build_backloggd_game_url(new_choice["slug"]),
@@ -64,7 +111,9 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             new_view.message = btn_interaction.message
             await btn_interaction.response.edit_message(embed=new_embed, view=new_view)
 
-        embed = create_roulette_embed(username, chosen_game, remaining)
+        embed = create_roulette_embed(
+            username, chosen_game, remaining, freshness_note=freshness_note
+        )
         view = RouletteView(
             author_id=interaction.user.id,
             game_url=build_backloggd_game_url(chosen_game["slug"]),
@@ -93,6 +142,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         caller_discord_id = interaction.user.id
         caller_link = await self.bot.db.get_linked_user(caller_discord_id)
+        now = self.clock()
 
         # =====================================================================
         # MODE 2: Recommend caller's games to a specific friend (/recommend @Friend)
@@ -106,27 +156,52 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 return
 
             caller_username = caller_link["backloggd_username"]
-            caller_ratings = await self.bot.db.get_profile_ratings_dict(caller_link["profile_key"])
-            if not caller_ratings:
-                await interaction.followup.send(
-                    f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library first.",
-                    ephemeral=True
-                )
-                return
-
+            caller_key = self._linked_profile_key(caller_link)
             friend_discord_id = user.id
             friend_link = await self.bot.db.get_linked_user(friend_discord_id)
-            if friend_link and friend_link["profile_key"] == caller_link["profile_key"]:
+            if friend_link and self._linked_profile_key(friend_link) == caller_key:
                 await interaction.followup.send(
                     "ℹ️ Both Discord members link to the same Backloggd profile, so there is no separate profile to recommend to.",
                     ephemeral=True,
                 )
                 return
-            friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
-            friend_ratings = (
-                await self.bot.db.get_profile_ratings_dict(friend_link["profile_key"]) if friend_link else {}
+
+            check_profiles = [(caller_key, caller_username)]
+            if friend_link:
+                check_profiles.append((self._linked_profile_key(friend_link), friend_link["backloggd_username"]))
+            statuses = await ensure_profiles_fresh(
+                self.bot, check_profiles, now=now, require_subscribed=True
             )
-            friend_slugs = set(friend_ratings.keys())
+            caller_status = statuses.get(caller_key)
+
+            caller_ratings = await self.bot.db.get_profile_ratings_dict(caller_key)
+            if not caller_ratings:
+                if caller_status is not None and caller_status.missing:
+                    await interaction.followup.send(
+                        self._fetching_message(caller_username, caller_status),
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library first.",
+                        ephemeral=True
+                    )
+                return
+
+            friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
+            friend_key = self._linked_profile_key(friend_link) if friend_link else None
+            friend_ratings = (
+                await self.bot.db.get_profile_ratings_dict(friend_key) if friend_link else {}
+            )
+            get_entries = getattr(self.bot.db, "get_profile_library_entries", None)
+            friend_entries = (
+                await get_entries(friend_key) if (friend_link and get_entries is not None) else None
+            )
+            friend_excluded_slugs = (
+                excluded_recommendation_slugs(friend_entries)
+                if friend_entries is not None
+                else set(friend_ratings.keys())
+            )
 
             # Optional compatibility score if friend is linked and has ratings
             taste_pct = None
@@ -136,24 +211,31 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 sim_score, _, _ = calculate_similarity_raw(caller_numeric, friend_numeric)
                 taste_pct = int(round(sim_score))
 
-            # Pick caller's top-rated games (rated >= 4.0) that friend hasn't logged yet
+            # Pick caller's top-rated games (rated >= 4.0) not played, started, unknown, or rated by friend
             eligible_games = [
                 (slug, rating)
                 for slug, rating in caller_ratings.items()
-                if rating is not None and rating >= 4.0 and slug not in friend_slugs
+                if rating is not None and rating >= 4.0 and slug not in friend_excluded_slugs
             ]
             eligible_games.sort(key=lambda x: x[1], reverse=True)
 
             if not eligible_games:
                 if friend_link:
-                    await interaction.followup.send(
-                        f"🎉 **{friend_username}** already has all of your 4.0+ rated games in their library.",
-                        ephemeral=True
-                    )
+                    if has_uncertain_library_exclusion(caller_ratings, friend_entries):
+                        await interaction.followup.send(
+                            f"ℹ️ No eligible 4.0+ recommendations were found for **{friend_username}** "
+                            "(matching games with an unknown status in their library were conservatively excluded).",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.followup.send(
+                            f"🎉 **{friend_username}** has already played, started, or rated all of your 4.0+ rated games.",
+                            ephemeral=True,
+                        )
                 else:
                     await interaction.followup.send(
-                        f"ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
-                        ephemeral=True
+                        "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
+                        ephemeral=True,
                     )
                 return
 
@@ -186,6 +268,15 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                     inline=False
                 )
 
+            freshness_lines = [format_profile_freshness_line(caller_status, label=f"**{caller_username}**")]
+            if friend_link and friend_key:
+                freshness_lines.append(
+                    format_profile_freshness_line(statuses.get(friend_key), label=f"**{friend_username}**")
+                )
+            freshness_text = "\n".join(line for line in freshness_lines if line)
+            if freshness_text:
+                embed.add_field(name="⏱ Cache Freshness", value=freshness_text[:1024], inline=False)
+
             embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot")
             await interaction.followup.send(embed=embed)
             return
@@ -201,13 +292,25 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             return
 
         caller_username = caller_link["backloggd_username"]
-        my_ratings = await self.bot.db.get_profile_ratings_dict(caller_link["profile_key"])
+        caller_key = self._linked_profile_key(caller_link)
+        caller_statuses = await ensure_profiles_fresh(
+            self.bot, [(caller_key, caller_username)], now=now, require_subscribed=True
+        )
+        caller_status = caller_statuses.get(caller_key)
+
+        my_ratings = await self.bot.db.get_profile_ratings_dict(caller_key)
 
         if not my_ratings:
-            await interaction.followup.send(
-                f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library.",
-                ephemeral=True
-            )
+            if caller_status is not None and caller_status.missing:
+                await interaction.followup.send(
+                    self._fetching_message(caller_username, caller_status),
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ **{caller_username}** has no cached ratings yet. Use `/refresh` to sync your library.",
+                    ephemeral=True
+                )
             return
 
         my_numeric_ratings = numeric_ratings(my_ratings)
@@ -220,7 +323,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         guild_member_ids = [m.id for m in interaction.guild.members if m.id != caller_discord_id]
         other_linked = await self.bot.db.get_guild_linked_profiles(
-            guild_member_ids, exclude_profile_key=caller_link["profile_key"]
+            guild_member_ids, exclude_profile_key=caller_key
         )
 
         if not other_linked:
@@ -229,6 +332,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 ephemeral=True
             )
             return
+
+        other_statuses = await ensure_profiles_fresh(
+            self.bot, other_linked, now=now, require_subscribed=True
+        )
 
         # Batch fetch ratings once per distinct profile.
         other_profile_keys = [other["profile_key"] for other in other_linked]
@@ -267,7 +374,13 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         # Sort profiles by similarity score descending.
         taste_matches.sort(key=lambda x: x[2], reverse=True)
 
-        my_slugs = set(my_ratings.keys())
+        get_entries = getattr(self.bot.db, "get_profile_library_entries", None)
+        my_entries = await get_entries(caller_key) if get_entries is not None else None
+        my_excluded_slugs = (
+            excluded_recommendation_slugs(my_entries)
+            if my_entries is not None
+            else set(my_ratings.keys())
+        )
         raw_candidates = []
         chosen_slugs = set()
 
@@ -278,7 +391,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             user_top_games = [
                 (slug, rating)
                 for slug, rating in other_ratings.items()
-                if rating is not None and rating >= 4.0 and slug not in my_slugs and slug not in chosen_slugs
+                if rating is not None and rating >= 4.0 and slug not in my_excluded_slugs and slug not in chosen_slugs
             ]
             user_top_games.sort(key=lambda x: x[1], reverse=True)
 
@@ -297,7 +410,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 user_top_games = [
                     (slug, rating)
                     for slug, rating in other_ratings.items()
-                    if rating is not None and rating >= 4.0 and slug not in my_slugs and slug not in chosen_slugs
+                    if rating is not None and rating >= 4.0 and slug not in my_excluded_slugs and slug not in chosen_slugs
                 ]
                 user_top_games.sort(key=lambda x: x[1], reverse=True)
 
@@ -310,10 +423,20 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                     break
 
         if not raw_candidates:
-            await interaction.followup.send(
-                "ℹ️ There are no 4.0+ recommendations from similar profiles that are missing from your library.",
-                ephemeral=True
-            )
+            if any(
+                has_uncertain_library_exclusion(other_ratings, my_entries)
+                for _, _, _, other_ratings in taste_matches
+            ):
+                await interaction.followup.send(
+                    "ℹ️ No eligible 4.0+ recommendations were found from similar profiles "
+                    "(matching games with an unknown status in your library were conservatively excluded).",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "ℹ️ There are no eligible 4.0+ recommendations from similar profiles that you haven't already played, started, or rated.",
+                    ephemeral=True,
+                )
             return
 
         # Batch resolve authentic game titles from cache
@@ -350,6 +473,11 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 ),
                 inline=False
             )
+
+        contributing = ([caller_status] if caller_status is not None else []) + list(other_statuses.values())
+        freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
+        if freshness_note:
+            embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
 
         embed.set_footer(text="Diverse recommendations curated across your server taste matches")
         await interaction.followup.send(embed=embed)

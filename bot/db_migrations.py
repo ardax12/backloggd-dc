@@ -198,6 +198,158 @@ async def _migrate_profile_feed_schema(execute: Execute, fetchone: FetchOne) -> 
     await execute("CREATE INDEX IF NOT EXISTS idx_profile_feed_deliveries_lookup ON profile_seen_journal_deliveries(guild_id, profile_key)", ())
 
 
+async def _migrate_guild_feed_preferences(execute: Execute, fetchone: FetchOne) -> None:
+    """Add server-local member enrollment and preserve the one-time legacy scope."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_feed_preferences (
+            guild_id INTEGER NOT NULL,
+            discord_id INTEGER NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, discord_id)
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_feed_legacy_scope (
+            guild_id INTEGER NOT NULL,
+            discord_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            PRIMARY KEY (guild_id, discord_id)
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_feed_legacy_migrations (
+            guild_id INTEGER PRIMARY KEY,
+            completed BOOLEAN NOT NULL DEFAULT 0,
+            completed_at TIMESTAMP
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_profile_feed_activity (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            active BOOLEAN NOT NULL DEFAULT 0,
+            last_active_at TIMESTAMP,
+            PRIMARY KEY (guild_id, profile_key)
+        )
+    """, ())
+
+    await execute("""
+        INSERT OR IGNORE INTO guild_feed_legacy_migrations (guild_id, completed)
+        SELECT guild_id, 0 FROM guild_settings
+    """, ())
+    await execute("""
+        INSERT OR IGNORE INTO guild_feed_legacy_scope (guild_id, discord_id, profile_key)
+        SELECT settings.guild_id, linked.discord_id, linked.profile_key
+        FROM guild_settings AS settings
+        CROSS JOIN linked_users AS linked
+    """, ())
+    await execute("""
+        INSERT OR IGNORE INTO guild_profile_feed_activity
+            (guild_id, profile_key, active, last_active_at)
+        SELECT DISTINCT sources.guild_id, sources.profile_key, 1, CURRENT_TIMESTAMP
+        FROM profile_feed_sources AS sources
+        JOIN guild_settings AS settings ON settings.guild_id = sources.guild_id
+    """, ())
+    await execute("CREATE INDEX IF NOT EXISTS idx_guild_feed_preferences_enabled ON guild_feed_preferences(guild_id, enabled, discord_id)", ())
+    await execute("CREATE INDEX IF NOT EXISTS idx_guild_feed_legacy_scope_guild ON guild_feed_legacy_scope(guild_id, discord_id)", ())
+
+
+async def _migrate_guild_admin_follows(execute: Execute, fetchone: FetchOne) -> None:
+    """Store independent server subscriptions to public Backloggd profiles."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_admin_follows (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            display_username TEXT NOT NULL,
+            avatar_url TEXT,
+            added_by INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, profile_key)
+        )
+    """, ())
+    await execute("CREATE INDEX IF NOT EXISTS idx_guild_admin_follows_profile ON guild_admin_follows(profile_key, guild_id)", ())
+
+
+async def _migrate_feed_event_decisions(execute: Execute, fetchone: FetchOne) -> None:
+    """Persist first-discovery age and uncertainty decisions per feed alias."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_feed_decisions (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            event_date TEXT,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, profile_key, event_id)
+        )
+    """, ())
+    await execute("CREATE INDEX IF NOT EXISTS idx_profile_feed_decisions_reason ON profile_feed_decisions(guild_id, profile_key, decision)", ())
+
+
+async def _migrate_profile_feed_source_health(execute: Execute, fetchone: FetchOne) -> None:
+    """Track validated source attempts, coverage, and unresolved history gaps."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_feed_source_health (
+            profile_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            successes INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TIMESTAMP,
+            last_success_at TIMESTAMP,
+            coverage TEXT,
+            pages_read INTEGER,
+            last_continuous_boundary_event_id TEXT,
+            last_continuous_boundary_at TIMESTAMP,
+            unresolved_gap_since TIMESTAMP,
+            gap_reason TEXT,
+            last_error TEXT,
+            PRIMARY KEY (profile_key, source)
+        )
+    """, ())
+
+
+async def _migrate_profile_sync_and_observations(execute: Execute, fetchone: FetchOne) -> None:
+    """Track separate library sync health, outage gap end times, and observation fingerprints."""
+    profile_row = await fetchone(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'profiles'", ()
+    )
+    profile_sql = (profile_row["sql"] or "") if profile_row else ""
+    if "last_sync_attempt_at" not in profile_sql:
+        await execute("ALTER TABLE profiles ADD COLUMN last_sync_attempt_at TIMESTAMP", ())
+    if "last_sync_error" not in profile_sql:
+        await execute("ALTER TABLE profiles ADD COLUMN last_sync_error TEXT", ())
+
+    health_row = await fetchone(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'profile_feed_source_health'", ()
+    )
+    health_sql = (health_row["sql"] or "") if health_row else ""
+    if "unresolved_gap_until" not in health_sql:
+        await execute("ALTER TABLE profile_feed_source_health ADD COLUMN unresolved_gap_until TIMESTAMP", ())
+
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_activity_observations (
+            profile_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            observation_key TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (profile_key, source, observation_key)
+        )
+    """, ())
+    await execute("""
+        CREATE TABLE IF NOT EXISTS profile_activity_observation_sources (
+            profile_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            initialized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (profile_key, source)
+        )
+    """, ())
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -227,6 +379,21 @@ async def run_migrations(database) -> None:
                 if version < 2:
                     await _migrate_profile_feed_schema(execute, fetchone)
                     await execute("INSERT INTO schema_migrations (version) VALUES (2)")
+                if version < 3:
+                    await _migrate_guild_feed_preferences(execute, fetchone)
+                    await execute("INSERT INTO schema_migrations (version) VALUES (3)")
+                if version < 4:
+                    await _migrate_guild_admin_follows(execute, fetchone)
+                    await execute("INSERT INTO schema_migrations (version) VALUES (4)")
+                if version < 5:
+                    await _migrate_feed_event_decisions(execute, fetchone)
+                    await execute("INSERT INTO schema_migrations (version) VALUES (5)")
+                if version < 6:
+                    await _migrate_profile_feed_source_health(execute, fetchone)
+                    await execute("INSERT INTO schema_migrations (version) VALUES (6)")
+                if version < 7:
+                    await _migrate_profile_sync_and_observations(execute, fetchone)
+                    await execute("INSERT INTO schema_migrations (version) VALUES (7)")
                 await transaction.commit()
             except BaseException:
                 await transaction.rollback()
@@ -252,6 +419,21 @@ async def run_migrations(database) -> None:
             if version < 2:
                 await _migrate_profile_feed_schema(execute, fetchone)
                 await execute("INSERT INTO schema_migrations (version) VALUES (2)")
+            if version < 3:
+                await _migrate_guild_feed_preferences(execute, fetchone)
+                await execute("INSERT INTO schema_migrations (version) VALUES (3)")
+            if version < 4:
+                await _migrate_guild_admin_follows(execute, fetchone)
+                await execute("INSERT INTO schema_migrations (version) VALUES (4)")
+            if version < 5:
+                await _migrate_feed_event_decisions(execute, fetchone)
+                await execute("INSERT INTO schema_migrations (version) VALUES (5)")
+            if version < 6:
+                await _migrate_profile_feed_source_health(execute, fetchone)
+                await execute("INSERT INTO schema_migrations (version) VALUES (6)")
+            if version < 7:
+                await _migrate_profile_sync_and_observations(execute, fetchone)
+                await execute("INSERT INTO schema_migrations (version) VALUES (7)")
             await connection.commit()
         except BaseException:
             await connection.rollback()

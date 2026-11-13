@@ -1,6 +1,7 @@
 """UsersCog: Handles /profile command displaying stats, metrics, and favorite games."""
 
 import asyncio
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -9,12 +10,14 @@ from typing import Optional
 from bot.ui.embeds import create_profile_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_user_url
+from bot.services.freshness import ensure_profiles_fresh, format_profile_freshness_line
 
 logger = logging.getLogger("backloggd.cogs.users")
 
 class UsersCog(commands.Cog, name="Users"):
-    def __init__(self, bot):
+    def __init__(self, bot, *, clock=None):
         self.bot = bot
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     @app_commands.command(name="profile", description="View a Backloggd user's profile, library stats, and favorite games")
     @app_commands.describe(user="Optional: Mention a server member or provide a Backloggd username (defaults to you)")
@@ -85,10 +88,30 @@ class UsersCog(commands.Cog, name="Users"):
             rated_count = None
             recent_played = journal_entries[:5] if journal_entries else []
 
+            canonical_key = profile_data.username.strip().lower()
+            statuses = await ensure_profiles_fresh(
+                self.bot,
+                [(canonical_key, profile_data.username)],
+                now=self.clock(),
+                require_subscribed=True,
+            )
+            status = statuses.get(canonical_key)
+            sub_checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
+            subscribed = bool(await sub_checker(profile_data.username)) if sub_checker is not None else bool(target_discord_id)
+
             stats = await self.bot.db.get_profile_stats(target_username)
             if stats and stats.get("rated_count", 0) > 0:
                 avg_rating = stats.get("average_rating")
                 rated_count = stats.get("rated_count")
+
+            freshness_note = None
+            has_cached_stats = bool(stats and (stats.get("rated_count", 0) > 0 or stats.get("total_games", 0) > 0))
+            if status is not None and (has_cached_stats or subscribed or status.synced_at is not None):
+                freshness_note = format_profile_freshness_line(status, label="Stats cache")
+                if status.missing and subscribed and not has_cached_stats:
+                    freshness_note = f"{freshness_note} — library data is being fetched"
+            elif status is not None:
+                freshness_note = "Overview fetched live from Backloggd (no cached library snapshot)"
 
             latest_review = user_reviews[0] if user_reviews else None
 
@@ -107,7 +130,8 @@ class UsersCog(commands.Cog, name="Users"):
                 rated_count=rated_count,
                 recent_played=recent_played,
                 latest_review=latest_review,
-                fallback_avatar_url=fallback_avatar
+                fallback_avatar_url=fallback_avatar,
+                freshness_note=freshness_note,
             )
 
             extra_buttons = []

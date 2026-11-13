@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,8 +17,14 @@ from bot.db import Database
 from bot.feed_models import FeedEvent
 
 
-def event(event_id):
-    return FeedEvent(event_id, "Game", "game", None, "completed", "completed", None, None, None)
+FIXED_NOW = datetime(2026, 11, 12, 12, tzinfo=timezone.utc)
+
+
+def event(event_id, occurred_at="2026-11-12T10:00:00Z", slug="game"):
+    return FeedEvent(
+        event_id, "Game", slug, None, "completed", "completed",
+        None, None, None, played_date="2026-11-12", occurred_at=occurred_at,
+    )
 
 
 class FeedProfileDedupTests(unittest.IsolatedAsyncioTestCase):
@@ -44,6 +51,9 @@ class FeedProfileDedupTests(unittest.IsolatedAsyncioTestCase):
         await self.db.link_user(20, "MILLERS")
         await self.db.set_feed_channel(1, 101)
         await self.db.set_feed_channel(2, 202)
+        await self.db.set_guild_feed_preference(1, 10, True)
+        await self.db.set_guild_feed_preference(1, 11, True)
+        await self.db.set_guild_feed_preference(2, 20, True)
 
         channel1, channel2 = self.make_channel(101), self.make_channel(202)
         guilds = {
@@ -57,7 +67,7 @@ class FeedProfileDedupTests(unittest.IsolatedAsyncioTestCase):
             ),
         }
         bot = SimpleNamespace(db=self.db, get_guild=lambda guild_id: guilds.get(guild_id))
-        cog = FeedCog(bot)
+        cog = FeedCog(bot, clock=lambda: FIXED_NOW)
         cog._fetch_feed_sources = AsyncMock(return_value={"activity": [event("old")], "journal": []})
 
         with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
@@ -67,7 +77,7 @@ class FeedProfileDedupTests(unittest.IsolatedAsyncioTestCase):
             channel2.send.assert_not_awaited()
 
             cog._fetch_feed_sources.return_value = {
-                "activity": [event("new"), event("old")], "journal": [],
+                "activity": [event("new", "2026-11-12T12:05:00Z", slug="game-2"), event("old")], "journal": [],
             }
             await cog.journal_feed_loop.coro(cog)
 
@@ -137,7 +147,7 @@ class FeedProfileDedupTests(unittest.IsolatedAsyncioTestCase):
             send=AsyncMock(),
             get_partial_message=lambda message_id: SimpleNamespace(edit=edits[message_id]),
         )
-        cog = FeedCog(SimpleNamespace(db=self.db))
+        cog = FeedCog(SimpleNamespace(db=self.db), clock=lambda: FIXED_NOW)
 
         await cog._publish_sources(
             1, "millers", "Millers", None, channel,

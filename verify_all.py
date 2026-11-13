@@ -235,7 +235,7 @@ class VerificationSuite:
 
         # 4. Roulette Embed
         roulette_embed = create_roulette_embed("Nox", DummyGame(), remaining_backlog=118)
-        assert "Backlog Roulette" in roulette_embed.title
+        assert "Unplayed Game Roulette" in roulette_embed.title
         print("✅ Roulette Embed built successfully")
 
         # 5. Leaderboard Embed
@@ -245,7 +245,7 @@ class VerificationSuite:
 
         # 6. Server Stats Embed
         server_stats_embed = create_server_stats_embed(stats, guild_name="TestServer")
-        assert len(server_stats_embed.fields) == 5
+        assert len(server_stats_embed.fields) == 6
         print("✅ Server Stats Embed built successfully")
 
         # 7. Journal & Activity Feed Embed

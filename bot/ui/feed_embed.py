@@ -16,7 +16,9 @@ from bot.ui.helpers import (
 def create_journal_feed_embed(
     username: str,
     avatar_url: str | None,
-    entry: Any
+    entry: Any,
+    *,
+    now: datetime | None = None,
 ) -> discord.Embed:
     """Construct embed for an automatic playthrough journal or activity log announcement."""
     user_url = build_backloggd_user_url(username)
@@ -55,7 +57,10 @@ def create_journal_feed_embed(
         title = f"{username} logged a replay of {game_title}"
     played_date = getattr(entry, "played_date", None)
     played_day = calendar_date(played_date)
-    action_day = calendar_date(getattr(entry, "occurred_at", None)) or datetime.now(timezone.utc).date().isoformat()
+    current_now = now or datetime.now(timezone.utc)
+    if current_now.tzinfo is None:
+        current_now = current_now.replace(tzinfo=timezone.utc)
+    action_day = calendar_date(getattr(entry, "occurred_at", None)) or current_now.astimezone(timezone.utc).date().isoformat()
     is_backdated = played_day and played_day < action_day
     if is_backdated and action_type == "completed":
         title = f"{username} finished {game_title}"

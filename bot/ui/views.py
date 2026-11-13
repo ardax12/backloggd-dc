@@ -134,3 +134,34 @@ class RatingsView(ExpiringView):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def next_button(self, interaction: discord.Interaction, button: Button):
         await self._move(interaction, 1)
+
+
+class FeedListView(ExpiringView):
+    """Page through server-local feed profiles in an ephemeral response."""
+
+    def __init__(self, owner_id: int, pages: list[discord.Embed]):
+        super().__init__()
+        self.owner_id = owner_id
+        self.pages = pages
+        self.page = 0
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= len(self.pages) - 1
+
+    async def _move(self, interaction: discord.Interaction, offset: int):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only the person who opened this feed list can change pages.", ephemeral=True)
+            return
+        self.page = max(0, min(len(self.pages) - 1, self.page + offset))
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.pages[self.page], view=self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: Button):
+        await self._move(interaction, -1)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: Button):
+        await self._move(interaction, 1)

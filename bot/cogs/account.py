@@ -24,6 +24,7 @@ class AccountCog(commands.Cog, name="Account"):
         status_message=None,
         *,
         manual: bool = False,
+        dirty: bool = False,
         freshness_window_seconds: Optional[float] = None,
     ) -> asyncio.Task:
         """Request one shared refresh for the normalized Backloggd profile."""
@@ -32,6 +33,7 @@ class AccountCog(commands.Cog, name="Account"):
             profile_key,
             lambda: self._sync_user_library(discord_id, username),
             manual=manual,
+            dirty=dirty,
             freshness_window_seconds=freshness_window_seconds,
         )
         if status_message:
@@ -48,7 +50,16 @@ class AccountCog(commands.Cog, name="Account"):
         if getter is None:
             return
         info = await getter(username)
-        if not info or not info["last_synced_at"]:
+        if not info:
+            return
+        if hasattr(self.library_sync, "seed_from_sync_info"):
+            try:
+                self.library_sync.seed_from_sync_info(info, profile_key=username.strip().lower())
+                return
+            except (TypeError, ValueError, OverflowError):
+                logger.info("Could not seed library refresh age for %s", username, exc_info=True)
+                return
+        if not info["last_synced_at"]:
             return
         try:
             synced_at = info["last_synced_at"]
@@ -105,19 +116,35 @@ class AccountCog(commands.Cog, name="Account"):
 
     async def _sync_user_library(self, discord_id: int, username: str) -> Optional[int]:
         """Fetch and atomically replace the linked user's cached library."""
+        profile_key = username.strip().lower()
         try:
+            pending_getter = getattr(self.bot.db, "get_profile_refresh_pending_token", None)
+            pending_token = await pending_getter(profile_key) if pending_getter is not None else None
             library = await self.bot.backloggd.get_user_library(username, force_refresh=True)
-            replaced = await self.bot.db.replace_user_library(
-                discord_id, username, library
-            )
+            if pending_token is not None:
+                replaced = await self.bot.db.replace_user_library(
+                    discord_id, username, library, clear_pending_token=pending_token
+                )
+            else:
+                replaced = await self.bot.db.replace_user_library(
+                    discord_id, username, library
+                )
             if not replaced:
                 logger.info("Discarded stale library sync for %s (%d)", username, discord_id)
                 return None
 
             logger.info("Synced library for %s (%d games)", username, len(library))
             return len(library)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error("Error syncing library for %s: %s", username, e, exc_info=True)
+            recorder = getattr(self.bot.db, "record_profile_sync_failure", None)
+            if recorder is not None:
+                try:
+                    await recorder(username, str(e))
+                except Exception:
+                    logger.warning("Could not persist library sync failure for %s", username, exc_info=True)
             return None
 
     @app_commands.command(name="link", description="Link your Discord account to your Backloggd username")
@@ -132,9 +159,19 @@ class AccountCog(commands.Cog, name="Account"):
         if existing_link:
             linked_name = existing_link["backloggd_username"]
             if linked_name.lower() == clean_user.lower():
+                if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
+                    await self.bot.db.set_guild_feed_preference(
+                        interaction.guild_id, interaction.user.id, True
+                    )
+                    participation = " Your profile is also enabled for this server's activity feed."
+                else:
+                    participation = (
+                        " Use `/feed on` in each server where you want activity announcements."
+                        if interaction.guild is None else ""
+                    )
                 await interaction.followup.send(
                     f"ℹ️ You are already linked to Backloggd user **[{linked_name}](https://www.backloggd.com/u/{linked_name}/)**.\n"
-                    f"If you want to sync your latest games and ratings, use `/refresh`.",
+                    f"If you want to sync your latest games and ratings, use `/refresh`." + participation,
                     ephemeral=True
                 )
             else:
@@ -166,6 +203,10 @@ class AccountCog(commands.Cog, name="Account"):
             username=profile.username,
             avatar_url=profile.avatar_url,
         )
+        if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
+            await self.bot.db.set_guild_feed_preference(
+                interaction.guild_id, interaction.user.id, True
+            )
         await self._seed_sync_state(profile.username)
 
         embed = discord.Embed(

@@ -1,20 +1,27 @@
 """GamesCog: Handles /game with live Discord autocomplete and server score shelf."""
 
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands
 import logging
-from typing import List
+from typing import List, Optional
 from uuid import uuid4
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
 from bot.ui.views import LinkButtonView, GameCardView, RatingsView
 from bot.ui.helpers import build_backloggd_game_url
+from bot.services.freshness import (
+    ensure_profiles_fresh,
+    format_aggregate_freshness,
+    summarize_aggregate_freshness,
+)
 
 logger = logging.getLogger("backloggd.cogs.games")
 
 class GamesCog(commands.Cog, name="Games"):
-    def __init__(self, bot):
+    def __init__(self, bot, *, clock=None):
         self.bot = bot
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         # Lightweight in-memory cache for autocomplete queries to avoid hammering search
         self._autocomplete_cache = {}
         self._autocomplete_slugs = {}
@@ -55,6 +62,21 @@ class GamesCog(commands.Cog, name="Games"):
         except Exception as e:
             logger.warning("Autocomplete search error for '%s': %s", clean_query, e)
             return []
+
+    async def _guild_freshness_note(self, member_ids: List[int]) -> Optional[str]:
+        profile_getter = (
+            getattr(self.bot.db, "get_guild_linked_profiles_with_sync_info", None)
+            or getattr(self.bot.db, "get_guild_linked_profiles", None)
+        )
+        if profile_getter is None:
+            return None
+        profiles = await profile_getter(member_ids)
+        if not profiles:
+            return "No linked Backloggd profiles in cache yet."
+        statuses = await ensure_profiles_fresh(
+            self.bot, profiles, now=self.clock(), require_subscribed=True
+        )
+        return format_aggregate_freshness(summarize_aggregate_freshness(statuses.values()))
 
     @app_commands.command(name="game", description="Search for a game and view Backloggd ratings & server member scores")
     @app_commands.describe(title="Type game title to search with live autocomplete")
@@ -106,10 +128,16 @@ class GamesCog(commands.Cog, name="Games"):
 
             # Retrieve scores from server members who linked their Backloggd account
             guild_member_ids = [m.id for m in interaction.guild.members] if interaction.guild else [interaction.user.id]
+            freshness_note = await self._guild_freshness_note(guild_member_ids)
             server_ratings = await self.bot.db.get_server_ratings_for_game(guild_member_ids, game_data.slug)
 
             guild_name = interaction.guild.name if interaction.guild else "Server"
-            embed = create_game_embed(game_data, server_ratings, guild_name=guild_name)
+            embed = create_game_embed(
+                game_data,
+                server_ratings,
+                guild_name=guild_name,
+                freshness_note=freshness_note,
+            )
             game_url = build_backloggd_game_url(game_data.slug)
 
             async def on_view_all(btn_interaction: discord.Interaction):

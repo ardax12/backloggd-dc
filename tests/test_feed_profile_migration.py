@@ -51,7 +51,7 @@ class FeedProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def migrate_feed_state(self):
         await self.add_legacy_feed_rows()
-        await self.db._execute("DELETE FROM schema_migrations WHERE version = 2")
+        await self.db._execute("DELETE FROM schema_migrations WHERE version >= 2")
         await run_migrations(self.db)
 
     async def test_migration_deduplicates_profile_rows_and_keeps_unmapped_legacy_records(self):
@@ -109,11 +109,11 @@ class FeedProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
             2,
         )
         version = await self.db._fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-        self.assertEqual(version["version"], 2)
+        self.assertEqual(version["version"], 7)
 
     async def test_interrupted_feed_migration_rolls_back_and_can_retry(self):
         await self.add_legacy_feed_rows()
-        await self.db._execute("DELETE FROM schema_migrations WHERE version = 2")
+        await self.db._execute("DELETE FROM schema_migrations WHERE version >= 2")
 
         async def fail_after_partial_feed_schema(execute, fetchone):
             await execute("CREATE TABLE migration_partial_feed (value INTEGER)", ())

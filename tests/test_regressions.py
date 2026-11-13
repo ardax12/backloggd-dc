@@ -79,31 +79,38 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_poll_baselines_then_delivers_and_retries_failed_send(self):
         import tempfile
         import discord
+        from datetime import datetime, timezone
         from pathlib import Path
         from unittest.mock import MagicMock, patch
         from bot.db import Database
         from bot.cogs.feed import FeedCog
         from bot.feed_models import FeedEvent
-        def event(identifier):
-            return FeedEvent(identifier, "Hades", "hades", None, "completed", "completed", None, None, None)
+        def event(identifier, occurred_at="2026-11-12T10:00:00Z", slug="hades"):
+            return FeedEvent(
+                identifier, "Hades", slug, None, "completed", "completed",
+                None, None, None, played_date="2026-11-12", occurred_at=occurred_at,
+            )
         with tempfile.TemporaryDirectory() as directory:
             db = Database(str(Path(directory) / "test.db"), turso_url="")
             await db.connect()
             try:
                 await db.link_user(10, "Tester")
                 await db.set_feed_channel(1, 100)
+                await db.set_guild_feed_preference(1, 10, True)
                 channel = MagicMock(spec=discord.TextChannel)
                 channel.permissions_for.return_value = SimpleNamespace(send_messages=True, embed_links=True)
                 channel.id = 100
                 channel.send = AsyncMock(return_value=SimpleNamespace(id=999))
                 guild = SimpleNamespace(members=[SimpleNamespace(id=10)], me=object(), get_channel=lambda _: channel)
                 bot = SimpleNamespace(db=db, get_guild=lambda _: guild)
-                cog = FeedCog(bot)
+                cog = FeedCog(bot, clock=lambda: datetime(2026, 11, 12, 12, tzinfo=timezone.utc))
                 cog._fetch_feed_sources = AsyncMock(return_value={"activity": [event("old")]})
                 with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
                     await cog.journal_feed_loop.coro(cog)
                     channel.send.assert_not_awaited()
-                    cog._fetch_feed_sources.return_value = {"activity": [event("new"), event("old")]}
+                    cog._fetch_feed_sources.return_value = {
+                        "activity": [event("new", "2026-11-12T12:05:00Z", slug="celeste"), event("old")]
+                    }
                     channel.send.side_effect = discord.Forbidden(
                         SimpleNamespace(status=403, reason="Forbidden"),
                         {"message": "temporary permission rejection"},
