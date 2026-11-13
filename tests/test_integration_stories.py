@@ -2,7 +2,9 @@ import os
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import asyncio
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -29,7 +31,10 @@ FIXED_NOW = datetime(2026, 11, 13, 12, 0, 0, tzinfo=timezone.utc)
 def make_channel(channel_id: int):
     channel = MagicMock(spec=discord.TextChannel)
     channel.id = channel_id
-    channel.permissions_for.return_value = SimpleNamespace(send_messages=True, embed_links=True)
+    channel.mention = f"<#{channel_id}>"
+    channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True, send_messages=True, embed_links=True
+    )
     channel.send = AsyncMock(return_value=SimpleNamespace(id=channel_id * 100))
     channel.get_partial_message.return_value.edit = AsyncMock()
     return channel
@@ -439,6 +444,316 @@ class CombinedIntegrationStoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.db.get_profile_ratings_dict("SoloA"), {})
         self.assertEqual(await self.db.get_profile_ratings_dict("SoloB"), {})
+
+    async def test_large_guild_duplicate_profiles_and_incomplete_membership(self):
+        # 1. Incomplete membership blocks server aggregates instead of returning partial counts.
+        incomplete_guild = SimpleNamespace(
+            id=1, name="Huge Guild", members=[SimpleNamespace(id=1)], chunked=False, member_count=1200, me=object()
+        )
+        bot = SimpleNamespace(db=self.db, backloggd=self.api, library_sync=self.library_sync)
+        stats = StatsCog(bot, clock=lambda: self.now)
+        discovery = DiscoveryCog(bot, clock=lambda: self.now)
+        social = SocialCog(bot, clock=lambda: self.now)
+
+        await self.db.link_user(1, "Solo")
+        await self.db.replace_profile_library(
+            "Solo",
+            [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)],
+            synced_at=self.now,
+        )
+        for cog_cb, args in (
+            (StatsCog.server_stats.callback, (stats,)),
+            (StatsCog.server_top.callback, (stats,)),
+            (DiscoveryCog.recommend.callback, (discovery,)),
+            (SocialCog.taste_twins.callback, (social,)),
+        ):
+            inter = self._interaction(user_id=1, guild=incomplete_guild)
+            await cog_cb(*args, inter)
+            msg = inter.followup.send.call_args.args[0]
+            self.assertIn("member", msg.lower())
+
+        # 2. Large guild (>1,000 members) with duplicate accounts sharing profiles counts distinct profiles once.
+        await self.db.upsert_game("hades", "Hades", release_year=2020)
+        await self.db.upsert_game("celeste", "Celeste", release_year=2018)
+        all_members = [SimpleNamespace(id=uid, display_name=f"M{uid}") for uid in range(1, 1205)]
+        # Link 100 members across 50 distinct profiles (2 members per profile), with identical game scores.
+        for idx in range(50):
+            uname = f"Player{idx}"
+            uid_a = 1 + idx * 2
+            uid_b = 2 + idx * 2
+            await self.db.link_user(uid_a, uname)
+            await self.db.link_user(uid_b, uname.lower())
+            await self.db.replace_profile_library(
+                uname,
+                [
+                    GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED),
+                    GameEntry(slug="celeste", title="Celeste", rating=5.0, status=GameStatus.PLAYED),
+                ],
+                synced_at=self.now,
+            )
+
+        self.api.get_user_profile.return_value = SimpleNamespace(played_count=2)
+        large_guild = SimpleNamespace(
+            id=1, name="Huge Guild", members=all_members, chunked=True, member_count=len(all_members), me=object()
+        )
+        i_top = self._interaction(user_id=1, guild=large_guild)
+        await StatsCog.server_top.callback(stats, i_top, mode="Highest Rated")
+        top_embed = i_top.followup.send.call_args.kwargs["embed"]
+        self.assertIn("Celeste", top_embed.description)
+        self.assertIn("50 profile ratings", top_embed.description)
+
+        i_stats = self._interaction(user_id=1, guild=large_guild)
+        await StatsCog.server_stats.callback(stats, i_stats)
+        stats_embed = i_stats.followup.send.call_args.kwargs["embed"]
+        members_field = next(f for f in stats_embed.fields if "Linked Members" in f.name)
+        profiles_field = next(f for f in stats_embed.fields if "Unique Backloggd Profiles" in f.name)
+        self.assertIn("**100**", members_field.value)
+        self.assertIn("**50**", profiles_field.value)
+
+    async def test_setup_with_delayed_journal_initialization(self):
+        channel = make_channel(101)
+        guild = SimpleNamespace(
+            id=1,
+            name="Setup Guild",
+            members=[SimpleNamespace(id=10, display_name="Ten")],
+            chunked=True,
+            me=object(),
+            get_channel=lambda cid: channel if cid == 101 else None,
+        )
+        await self.db.link_user(10, "Millers")
+        await self.db.set_guild_feed_preference(1, 10, True)
+
+        bot = SimpleNamespace(
+            db=self.db,
+            backloggd=self.api,
+            library_sync=self.library_sync,
+            get_guild=lambda gid: guild if gid == 1 else None,
+            guilds=[guild],
+        )
+        feed = FeedCog(bot, clock=lambda: self.now)
+
+        # /setchannel responds immediately without calling Backloggd SDK.
+        setup_inter = self._interaction(user_id=99, guild=guild, manage_channels=True)
+        await FeedCog.setchannel.callback(feed, setup_inter, channel)
+        self.api.get_user_activity.assert_not_awaited()
+        self.api.get_user_journal.assert_not_awaited()
+
+        # Poll 1: activity succeeds with a backdated completion (yesterday), journal fails!
+        backdated_activity = FeedEvent(
+            "act-yesterday", "Hades", "hades", None, "completed", "completed",
+            None, None, None, played_date=None, occurred_at="2026-11-12T10:00:00Z",
+        )
+        self.api.get_user_activity.return_value = [backdated_activity]
+        self.api.get_user_journal.side_effect = RuntimeError("journal temporarily 503")
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await feed.journal_feed_loop.coro(feed)
+        channel.send.assert_not_awaited()
+        self.assertTrue(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+        self.assertFalse(await self.db.has_feed_source(1, "millers", "journal-display-v1"))
+
+        # Poll 2: a fresh activity happens today while journal finally succeeds with an old log for Hades ->
+        # old backdated Hades is NOT announced when journal catches up; genuinely new Elden Ring IS announced.
+        old_journal = SimpleNamespace(
+            game_title="Hades",
+            game_slug="hades",
+            cover_url=None,
+            played_date="2026-10-01",
+            platform=None,
+            is_replay=False,
+            session_labels=("Finished",),
+            rating=None,
+            review_notes=None,
+        )
+        new_today = FeedEvent(
+            "act-today", "Elden Ring", "elden-ring", None, "completed", "completed",
+            5.0, None, None, played_date="2026-11-13", occurred_at="2026-11-13T12:05:00Z",
+        )
+        self.api.get_user_activity.return_value = [new_today, backdated_activity]
+        self.api.get_user_journal.side_effect = None
+        self.api.get_user_journal.return_value = [old_journal]
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await feed.journal_feed_loop.coro(feed)
+
+        channel.send.assert_awaited_once()
+        self.assertIn("Elden Ring", channel.send.call_args.kwargs["embed"].title)
+        self.assertTrue(await self.db.has_feed_source(1, "millers", "journal-display-v1"))
+
+    async def test_unchanged_polls_during_manual_refresh(self):
+        channel = make_channel(101)
+        guild = SimpleNamespace(
+            id=1,
+            name="Refresh Guild",
+            members=[SimpleNamespace(id=10, display_name="Ten")],
+            chunked=True,
+            me=object(),
+            get_channel=lambda cid: channel if cid == 101 else None,
+        )
+        await self.db.link_user(10, "Millers")
+        await self.db.set_feed_channel(1, 101)
+        await self.db.set_guild_feed_preference(1, 10, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers"], now=self.now)
+
+        # Seed prior recent sync & unchanged observation so automatic poll is within debounce and unchanged.
+        await self.db.replace_profile_library(
+            "Millers",
+            [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)],
+            synced_at=self.now,
+        )
+        ev = FeedEvent(
+            "obs-1", "Hades", "hades", None, "rated", "rated",
+            4.5, None, None, played_date=None, occurred_at="2026-11-13T12:00:00Z",
+        )
+        self.api.get_user_activity.return_value = [ev]
+        self.api.get_user_journal.return_value = []
+
+        bot = SimpleNamespace(
+            db=self.db,
+            backloggd=self.api,
+            library_sync=self.library_sync,
+            get_guild=lambda gid: guild if gid == 1 else None,
+            guilds=[guild],
+        )
+        account = AccountCog(bot)
+        feed = FeedCog(bot, clock=lambda: self.now)
+
+        # Baseline poll records obs-1.
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await feed.journal_feed_loop.coro(feed)
+        self.assertEqual(self.api.get_user_library.await_count, 0)
+
+        # Manual /refresh bypasses debounce and blocks mid-fetch.
+        started = asyncio.Event()
+        release = asyncio.Event()
+        fetch_calls = 0
+
+        async def slow_manual(username, force_refresh=False):
+            nonlocal fetch_calls
+            fetch_calls += 1
+            started.set()
+            await release.wait()
+            return [GameEntry(slug="hades", title="Hades", rating=5.0, status=GameStatus.PLAYED)]
+
+        self.api.get_user_library.side_effect = slow_manual
+        inter = self._interaction(user_id=10, guild=guild)
+        await AccountCog.refresh.callback(account, inter)
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        inter.followup.send.assert_awaited()
+
+        # Unchanged feed poll runs while manual refresh is in flight -> zero extra scrapes!
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await feed.journal_feed_loop.coro(feed)
+        release.set()
+        await self._drain_syncs()
+
+        self.assertEqual(fetch_calls, 1)
+        self.assertEqual(await self.db.get_profile_ratings_dict("Millers"), {"hades": 5.0})
+
+    async def test_failed_edit_followed_by_independent_new_activity(self):
+        channel = make_channel(101)
+        partial_msg = SimpleNamespace(edit=AsyncMock())
+        channel.get_partial_message.return_value = partial_msg
+        guild = SimpleNamespace(
+            id=1,
+            name="Edit Guild",
+            members=[SimpleNamespace(id=10, display_name="Ten")],
+            chunked=True,
+            me=object(),
+            get_channel=lambda cid: channel if cid == 101 else None,
+        )
+        await self.db.link_user(10, "Millers")
+        await self.db.set_feed_channel(1, 101)
+        await self.db.set_guild_feed_preference(1, 10, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers"], now=self.now)
+
+        # Already-posted review (message_id=777) + new independent completion on another game.
+        await self.db.seed_feed_source(1, "millers", "activity-display-v1", [])
+        await self.db.seed_feed_source(1, "millers", "journal-display-v1", [])
+        await self.db.record_feed_source_success(
+            "millers", "activity", coverage="boundary_reached", pages_read=1, boundary_event_id="ev-edit"
+        )
+        posted_v1 = FeedEvent(
+            "ev-edit", "Signalis", "signalis", None, "reviewed", "reviewed",
+            4.5, "Initial thoughts", "rev-1", played_date="2026-11-12", occurred_at="2026-11-12T10:00:00Z",
+            event_ids=("ev-edit",),
+        )
+        posted_v1_payload = json.dumps(asdict(posted_v1), sort_keys=True)
+        await self.db.store_feed_message(
+            1, "millers", ["ev-edit"], posted_v1_payload, message_id=777, channel_id=101
+        )
+        await self.db.record_feed_event_decision(
+            1, "millers", "ev-edit", source="activity", event_date="2026-11-12",
+            decision="eligible", reason="recent", payload=posted_v1_payload, observed_at=self.now,
+        )
+
+        # Poll A: edit on ev-edit hits retryable HTTP 503 while independent new game Balatro arrives!
+        posted_v2 = FeedEvent(
+            "ev-edit", "Signalis", "signalis", None, "reviewed", "reviewed",
+            5.0, "Updated masterwork review", "rev-1", played_date="2026-11-12", occurred_at="2026-11-12T10:00:00Z",
+            event_ids=("ev-edit",),
+        )
+        new_event = FeedEvent(
+            "ev-new", "Balatro", "balatro", None, "completed", "completed",
+            4.5, None, None, played_date="2026-11-13", occurred_at="2026-11-13T12:05:00Z",
+            event_ids=("ev-new",),
+        )
+        partial_msg.edit.side_effect = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Service Unavailable"), "upstream 503"
+        )
+
+        class _SnapshotApi:
+            def __init__(self, entries):
+                self.entries = entries
+
+            async def get_user_activity_snapshot(self, username, *, stop_at_ids=(), max_pages=5):
+                boundary = next((e.activity_id for e in self.entries if e.activity_id in stop_at_ids), None)
+                return SimpleNamespace(
+                    entries=self.entries,
+                    coverage="boundary_reached" if boundary else "unsupported",
+                    pages_read=1,
+                )
+
+            async def get_user_journal(self, username, **kwargs):
+                return []
+
+            async def get_user_library(self, username, force_refresh=False):
+                return []
+
+        snap_api = _SnapshotApi([new_event, posted_v2])
+        bot = SimpleNamespace(
+            db=self.db,
+            backloggd=snap_api,
+            library_sync=self.library_sync,
+            get_guild=lambda gid: guild if gid == 1 else None,
+            guilds=[guild],
+        )
+        feed = FeedCog(bot, clock=lambda: self.now)
+
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await feed.journal_feed_loop.coro(feed)
+        await self._drain_syncs()
+
+        # Independent new event posted cleanly, failed edit kept old payload, boundary NOT advanced to ev-new yet!
+        channel.send.assert_awaited_once()
+        self.assertIn("Balatro", channel.send.call_args.kwargs["embed"].title)
+        saved_msgs = {row["event_id"]: row for row in await self.db.get_feed_messages(1, "millers")}
+        self.assertIn("Initial thoughts", saved_msgs["ev-edit"]["payload"])
+        health = await self.db.get_profile_feed_source("millers", "activity")
+        self.assertEqual(health["last_continuous_boundary_event_id"], "ev-edit")
+
+        # Poll B: Discord recovers -> edit succeeds in place on msg 777, boundary advances, no duplicate Balatro send!
+        channel.send.reset_mock()
+        partial_msg.edit.reset_mock()
+        partial_msg.edit.side_effect = None
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await feed.journal_feed_loop.coro(feed)
+        await self._drain_syncs()
+
+        channel.send.assert_not_awaited()
+        partial_msg.edit.assert_awaited_once()
+        updated_msgs = {row["event_id"]: row for row in await self.db.get_feed_messages(1, "millers")}
+        self.assertIn("Updated masterwork review", updated_msgs["ev-edit"]["payload"])
+        health_after = await self.db.get_profile_feed_source("millers", "activity")
+        self.assertEqual(health_after["last_continuous_boundary_event_id"], "ev-new")
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field, is_dataclass, replace
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
+from types import SimpleNamespace
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger("backloggd.library_sync")
 
@@ -245,10 +246,203 @@ class LibrarySyncService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def seed_profile_sync_state(
+    bot,
+    username: str,
+    *,
+    service: Optional[LibrarySyncService] = None,
+    now=None,
+) -> None:
+    """Seed coordinator cooldown/backoff state from persisted profile sync metadata."""
+    target_service = service if service is not None else getattr(bot, "library_sync", None)
+    db = getattr(bot, "db", None)
+    if target_service is None or db is None:
+        return
+    getter = getattr(db, "get_profile_sync_info", None)
+    if getter is None:
+        return
+    profile_key = username.strip().lower()
+    info = await getter(profile_key)
+    if not info:
+        return
+    if hasattr(target_service, "seed_from_sync_info"):
+        try:
+            target_service.seed_from_sync_info(info, now=now, profile_key=profile_key)
+            return
+        except (TypeError, ValueError, OverflowError):
+            logger.info("Could not seed library refresh age for %s", username, exc_info=True)
+            return
+    keys = info.keys() if hasattr(info, "keys") else ()
+    synced_dt = parse_sync_timestamp(info["last_synced_at"] if "last_synced_at" in keys else None)
+    if synced_dt is None:
+        return
+    from datetime import datetime, timezone
+
+    current_now = now or datetime.now(timezone.utc)
+    if current_now.tzinfo is None:
+        current_now = current_now.replace(tzinfo=timezone.utc)
+    age_seconds = max(0.0, (current_now - synced_dt).total_seconds())
+    game_count = int((info["game_count"] if "game_count" in keys else 0) or 0)
+    target_service.seed_success(profile_key, age_seconds=age_seconds, game_count=game_count)
+
+
+_COLLECTION_STATUS_PRECEDENCE = {
+    "played": 4,
+    "playing": 3,
+    "backlog": 2,
+    "wishlist": 1,
+    "unknown": 0,
+}
+_PLAYING_SINGLE_PAGE_LIMIT = 70
+
+
+def _entry_status_key(status: Any) -> str:
+    raw = status.value if hasattr(status, "value") else str(status or "unknown")
+    return raw.strip().lower() or "unknown"
+
+
+def _merge_entry(existing: Any, incoming: Any) -> Any:
+    cur_status = getattr(existing, "status", "unknown")
+    new_status = getattr(incoming, "status", "unknown")
+    cur_rank = _COLLECTION_STATUS_PRECEDENCE.get(_entry_status_key(cur_status), 0)
+    new_rank = _COLLECTION_STATUS_PRECEDENCE.get(_entry_status_key(new_status), 0)
+    primary, secondary = (incoming, existing) if new_rank > cur_rank else (existing, incoming)
+
+    rating = getattr(primary, "rating", None)
+    if rating is None:
+        rating = getattr(secondary, "rating", None)
+    is_liked = bool(getattr(primary, "is_liked", False) or getattr(secondary, "is_liked", False))
+    cover_url = getattr(primary, "cover_url", None) or getattr(secondary, "cover_url", None)
+    title = getattr(primary, "title", None) or getattr(secondary, "title", None) or getattr(primary, "slug", "")
+    release_year = getattr(primary, "release_year", None)
+    if release_year is None:
+        release_year = getattr(secondary, "release_year", None)
+    community_rating = getattr(primary, "community_rating", None)
+    if community_rating is None:
+        community_rating = getattr(secondary, "community_rating", None)
+
+    if is_dataclass(primary):
+        updates: dict[str, Any] = {
+            "rating": rating,
+            "is_liked": is_liked,
+            "cover_url": cover_url,
+            "title": title,
+        }
+        return replace(primary, **updates)
+    return SimpleNamespace(
+        slug=primary.slug,
+        title=title,
+        rating=rating,
+        status=getattr(primary, "status", "unknown"),
+        is_liked=is_liked,
+        cover_url=cover_url,
+        release_year=release_year,
+        community_rating=community_rating,
+    )
+
+
+def _with_fallback_status(entry: Any, fallback_status: Optional[str]) -> Any:
+    if not fallback_status:
+        return entry
+    if _entry_status_key(getattr(entry, "status", "unknown")) != "unknown":
+        return entry
+    if is_dataclass(entry):
+        from backloggd.models.game import GameStatus
+        try:
+            return replace(entry, status=GameStatus(fallback_status))
+        except ValueError:
+            return entry
+    return SimpleNamespace(
+        slug=entry.slug,
+        title=getattr(entry, "title", entry.slug),
+        rating=getattr(entry, "rating", None),
+        status=fallback_status,
+        is_liked=bool(getattr(entry, "is_liked", False)),
+        cover_url=getattr(entry, "cover_url", None),
+        release_year=getattr(entry, "release_year", None),
+        community_rating=getattr(entry, "community_rating", None),
+    )
+
+
+def compose_library_entries(
+    played_entries,
+    *,
+    playing_entries=(),
+    backlog_entries=(),
+    wishlist_entries=(),
+) -> list[Any]:
+    """Merge Played/Playing/Backlog/Wishlist collections by slug deterministically."""
+    merged: dict[str, Any] = {}
+    for entries, default_status in (
+        (played_entries, None),
+        (playing_entries, "playing"),
+        (backlog_entries, "backlog"),
+        (wishlist_entries, "wishlist"),
+    ):
+        for raw_entry in entries:
+            slug = getattr(raw_entry, "slug", None)
+            if not slug:
+                continue
+            entry = _with_fallback_status(raw_entry, default_status)
+            existing = merged.get(slug)
+            merged[slug] = entry if existing is None else _merge_entry(existing, entry)
+    return list(merged.values())
+
+
+async def _fetch_complete_library(api: Any, username: str):
+    """Fetch Played plus any exposed Playing/Backlog/Wishlist collections atomically."""
+    get_playing = getattr(api, "get_user_playing", None)
+    get_backlog = getattr(api, "get_user_backlog", None)
+    get_wishlist = getattr(api, "get_user_wishlist", None)
+
+    has_extra_collections = any(callable(fn) for fn in (get_playing, get_backlog, get_wishlist))
+    if not has_extra_collections:
+        return await api.get_user_library(username, force_refresh=True)
+
+    names = ["played"]
+    coros = [api.get_user_library(username, force_refresh=True)]
+    if callable(get_playing):
+        names.append("playing")
+        coros.append(get_playing(username))
+    if callable(get_backlog):
+        names.append("backlog")
+        coros.append(get_backlog(username))
+    if callable(get_wishlist):
+        names.append("wishlist")
+        coros.append(get_wishlist(username))
+
+    tasks = [asyncio.create_task(coro) for coro in coros]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    collected = dict(zip(names, results))
+    playing_entries = collected.get("playing", ())
+    if callable(get_playing) and len(playing_entries) >= _PLAYING_SINGLE_PAGE_LIMIT:
+        raise RuntimeError(
+            f"SDK get_user_playing returned {len(playing_entries)} entries "
+            f"(single-page limit {_PLAYING_SINGLE_PAGE_LIMIT}) without pagination confirmation; "
+            "refusing to mark potentially partial library complete"
+        )
+
+    return compose_library_entries(
+        collected["played"],
+        playing_entries=playing_entries,
+        backlog_entries=collected.get("backlog", ()),
+        wishlist_entries=collected.get("wishlist", ()),
+    )
+
+
 async def sync_profile_library(
     bot,
     username: str,
     *,
+    discord_id: int = 0,
     synced_at=None,
 ) -> Optional[int]:
     """Fetch and atomically replace a linked profile's cached library."""
@@ -256,7 +450,7 @@ async def sync_profile_library(
     try:
         pending_getter = getattr(bot.db, "get_profile_refresh_pending_token", None)
         pending_token = await pending_getter(profile_key) if pending_getter is not None else None
-        library = await bot.backloggd.get_user_library(username, force_refresh=True)
+        library = await _fetch_complete_library(bot.backloggd, username)
         replacer = getattr(bot.db, "replace_profile_library", None)
         if replacer is not None:
             kwargs = {"require_linked": True}
@@ -269,7 +463,7 @@ async def sync_profile_library(
             replace_kwargs = {}
             if pending_token is not None:
                 replace_kwargs["clear_pending_token"] = pending_token
-            replaced = await bot.db.replace_user_library(0, username, library, **replace_kwargs)
+            replaced = await bot.db.replace_user_library(discord_id, username, library, **replace_kwargs)
         if not replaced:
             logger.info("Discarded stale library sync for %s", username)
             return None
@@ -307,9 +501,7 @@ async def schedule_profile_refresh(
     if require_subscribed and hasattr(bot.db, "is_profile_library_subscribed"):
         if not await bot.db.is_profile_library_subscribed(profile_key):
             return None
-    if hasattr(bot.db, "get_profile_sync_info"):
-        info = await bot.db.get_profile_sync_info(profile_key)
-        service.seed_from_sync_info(info, now=now, profile_key=profile_key)
+    await seed_profile_sync_state(bot, username, service=service, now=now)
     return service.request(
         profile_key,
         lambda: sync_profile_library(bot, username, synced_at=now),

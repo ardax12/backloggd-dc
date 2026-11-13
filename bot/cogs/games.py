@@ -1,6 +1,9 @@
 """GamesCog: Handles /game with live Discord autocomplete and server score shelf."""
 
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -10,6 +13,10 @@ from uuid import uuid4
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
 from bot.ui.views import LinkButtonView, GameCardView, RatingsView
 from bot.ui.helpers import build_backloggd_game_url
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
+)
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -18,13 +25,54 @@ from bot.services.freshness import (
 
 logger = logging.getLogger("backloggd.cogs.games")
 
+# Reserved Discord autocomplete option.value tag prefixes.
+# Discord limits choice names and values to 100 characters.
+_DISCORD_CHOICE_LIMIT = 100
+_SLUG_TAG_PREFIX = "slug:"
+_FALLBACK_TAG_PREFIX = "slugref:"
+_MAX_INLINE_SLUG_LEN = _DISCORD_CHOICE_LIMIT - len(_SLUG_TAG_PREFIX)
+_MAX_AUTOCOMPLETE_CACHE = 500
+_MAX_FALLBACK_SLUGS = 500
+_FALLBACK_TTL_SECONDS = 1800.0
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackEntry:
+    slug: str
+    query: str
+    created_at: float
+
+
 class GamesCog(commands.Cog, name="Games"):
-    def __init__(self, bot, *, clock=None):
+    def __init__(self, bot, *, clock=None, monotonic_clock=None, fallback_ttl_seconds: float = _FALLBACK_TTL_SECONDS):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        # Lightweight in-memory cache for autocomplete queries to avoid hammering search
-        self._autocomplete_cache = {}
-        self._autocomplete_slugs = {}
+        self._monotonic = monotonic_clock or time.monotonic
+        self._fallback_ttl_seconds = float(fallback_ttl_seconds)
+        # Bounded caches kept independent so query-cache pruning never wipes fallback tokens.
+        self._autocomplete_cache: OrderedDict[str, List[app_commands.Choice[str]]] = OrderedDict()
+        self._autocomplete_slugs: OrderedDict[str, str] = OrderedDict()
+        self._fallback_entries: OrderedDict[str, _FallbackEntry] = OrderedDict()
+
+    def _prune_expired_fallbacks(self, now: float) -> Optional[dict[str, str]]:
+        expired_queries: dict[str, str] = {}
+        for token, entry in list(self._fallback_entries.items()):
+            if now - entry.created_at > self._fallback_ttl_seconds:
+                self._fallback_entries.pop(token, None)
+                self._autocomplete_slugs.pop(token, None)
+                expired_queries[token] = entry.query
+        return expired_queries
+
+    def _register_fallback_slug(self, slug: str, query: str) -> str:
+        now = self._monotonic()
+        self._prune_expired_fallbacks(now)
+        while len(self._autocomplete_slugs) >= _MAX_FALLBACK_SLUGS:
+            oldest_token, _ = self._autocomplete_slugs.popitem(last=False)
+            self._fallback_entries.pop(oldest_token, None)
+        token = f"{_FALLBACK_TAG_PREFIX}{uuid4().hex[:24]}"
+        self._autocomplete_slugs[token] = slug
+        self._fallback_entries[token] = _FallbackEntry(slug=slug, query=query, created_at=now)
+        return token
 
     async def game_autocomplete(
         self,
@@ -36,28 +84,41 @@ class GamesCog(commands.Cog, name="Games"):
         if len(clean_query) < 2:
             return []
 
-        # Check in-memory autocomplete cache
-        if clean_query.lower() in self._autocomplete_cache:
-            return self._autocomplete_cache[clean_query.lower()]
-
-        # Prevent unbounded memory growth by pruning cache if it grows too large
-        if len(self._autocomplete_cache) > 500:
-            self._autocomplete_cache.clear()
-            self._autocomplete_slugs.clear()
+        cache_key = clean_query.lower()
+        self._prune_expired_fallbacks(self._monotonic())
+        if cache_key in self._autocomplete_cache:
+            cached = self._autocomplete_cache[cache_key]
+            if all(
+                not choice.value.startswith(_FALLBACK_TAG_PREFIX)
+                or choice.value in self._fallback_entries
+                for choice in cached
+            ):
+                if isinstance(self._autocomplete_cache, OrderedDict):
+                    self._autocomplete_cache.move_to_end(cache_key)
+                return cached
+            # TTL and capacity eviction can invalidate choices while the query
+            # remains cached. A repeat query must offer resolvable selections.
+            self._autocomplete_cache.pop(cache_key)
 
         try:
             results = await self.bot.backloggd.search_games(clean_query)
             choices = []
             for g in results[:15]:  # Discord limit is 25, 15 keeps it fast
                 name = f"{g.title} ({g.release_year})" if g.release_year else g.title
-                # Discord choice name limit is 100 characters
-                if len(name) > 100:
-                    name = name[:97] + "..."
-                token = f"g{uuid4().hex}"
-                self._autocomplete_slugs[token] = g.slug
-                choices.append(app_commands.Choice(name=name, value=token))
+                if len(name) > _DISCORD_CHOICE_LIMIT:
+                    name = name[: _DISCORD_CHOICE_LIMIT - 3] + "..."
+                if len(g.slug) <= _MAX_INLINE_SLUG_LEN:
+                    value = f"{_SLUG_TAG_PREFIX}{g.slug}"
+                else:
+                    value = self._register_fallback_slug(g.slug, clean_query)
+                choices.append(app_commands.Choice(name=name, value=value))
 
-            self._autocomplete_cache[clean_query.lower()] = choices
+            while len(self._autocomplete_cache) >= _MAX_AUTOCOMPLETE_CACHE:
+                if isinstance(self._autocomplete_cache, OrderedDict):
+                    self._autocomplete_cache.popitem(last=False)
+                else:
+                    self._autocomplete_cache.pop(next(iter(self._autocomplete_cache)))
+            self._autocomplete_cache[cache_key] = choices
             return choices
         except Exception as e:
             logger.warning("Autocomplete search error for '%s': %s", clean_query, e)
@@ -84,11 +145,39 @@ class GamesCog(commands.Cog, name="Games"):
     async def game(self, interaction: discord.Interaction, title: str):
         await interaction.response.defer()
 
-        # Autocomplete values are opaque tokens so free text is always searched.
         query = title.strip()
         try:
-            slug = self._autocomplete_slugs.get(query)
-            if not slug:
+            slug = None
+            if query.startswith(_SLUG_TAG_PREFIX):
+                slug = query[len(_SLUG_TAG_PREFIX):].strip()
+                if not slug:
+                    await interaction.followup.send(
+                        "❌ Please select a game from the autocomplete list or enter a game title.",
+                        ephemeral=True,
+                    )
+                    return
+            elif query.startswith(_FALLBACK_TAG_PREFIX):
+                expired = self._prune_expired_fallbacks(self._monotonic()) or {}
+                entry = self._fallback_entries.get(query)
+                if entry is not None:
+                    slug = entry.slug
+                    if isinstance(self._fallback_entries, OrderedDict):
+                        self._fallback_entries.move_to_end(query)
+                    if isinstance(self._autocomplete_slugs, OrderedDict) and query in self._autocomplete_slugs:
+                        self._autocomplete_slugs.move_to_end(query)
+                else:
+                    slug = self._autocomplete_slugs.get(query)
+                if not slug:
+                    hint = f' for "{discord.utils.escape_markdown(expired[query])}"' if query in expired else ""
+                    await interaction.followup.send(
+                        f"⏳ That autocomplete selection{hint} has expired. "
+                        "Please type the game title again and re-select it from the autocomplete list.",
+                        ephemeral=True,
+                    )
+                    return
+            elif query in self._autocomplete_slugs:
+                slug = self._autocomplete_slugs[query]
+            else:
                 search_results = await self.bot.backloggd.search_games(query)
                 if not search_results:
                     await interaction.followup.send(
@@ -127,7 +216,16 @@ class GamesCog(commands.Cog, name="Games"):
             )
 
             # Retrieve scores from server members who linked their Backloggd account
-            guild_member_ids = [m.id for m in interaction.guild.members] if interaction.guild else [interaction.user.id]
+            if interaction.guild:
+                guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
+                if guild_member_ids is None:
+                    await interaction.followup.send(
+                        GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+                        ephemeral=True,
+                    )
+                    return
+            else:
+                guild_member_ids = [interaction.user.id]
             freshness_note = await self._guild_freshness_note(guild_member_ids)
             server_ratings = await self.bot.db.get_server_ratings_for_game(guild_member_ids, game_data.slug)
 

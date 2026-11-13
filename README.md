@@ -29,23 +29,24 @@ Designed for gaming communities and friend groups: search games with live autoco
 
 | Command | Description |
 | :--- | :--- |
-| `/game <title>` | Search any game with live autocomplete. Displays community score, global statistics, distinct-profile Server Ratings Shelf, and aggregate cache freshness. |
-| `/profile [user]` | View user profile card, bio quote, library metrics (*Played, Playing, Backlog, Wishlist*), 4 pinned favorites, and library cache age. |
-| `/compare <user1> [user2]` | Compare video game tastes between two members (or yourself vs another member), using distinct profiles and serving cached data promptly with background refresh when stale. |
-| `/roulette [user]` | Pick a random title from unrated `backlog` / `wishlist` titles with an interactive `[ Reroll ]` button and freshness disclosure. |
-| `/recommend [user]` | Get game recommendations from distinct taste-matched profiles (numeric ratings determine similarity; `played`, `playing`, and rated titles are excluded). |
+| `/game <title>` | Search any game with live autocomplete (using stable `slug:` choices and bounded temporary fallback tokens). Displays community score, global statistics, distinct-profile Server Ratings Shelf, and aggregate cache freshness. |
+| `/profile [user]` | View user profile card, bio quote, library metrics (*Played, Playing, Backlog, Wishlist*), 4 pinned favorites, and library cache age (accepts `@mention`, Backloggd username, or exact profile URL). |
+| `/compare <user1> [user2]` | Compare video game tastes between two users (`@mention`, Backloggd username, or exact profile URL), using distinct profiles and coalesced/bounded live fetches for uncached profiles or prompt cached results with background refresh when stale. |
+| `/taste-twins` | Find your closest distinct-profile taste matches across the server using Bayesian similarity on cached numeric ratings. |
+| `/roulette [@member]` | Pick a random title from a member's unrated `backlog` / `wishlist` titles with an interactive `[ Reroll ]` button and freshness disclosure. |
+| `/recommend [@member]` | Get game recommendations from distinct taste-matched profiles (or recommend your 4.0+ titles to a server member; `played`, `playing`, and rated titles are excluded). |
 | `/server-top [mode]` | Distinct-profile server rankings: `Highest Rated`, `Most Played`, `Most Polarizing`, `Hidden Gems`, `Server Shame List`. |
 | `/server-stats` | Community metrics and cache age. Games Logged sums Played-tab totals across distinct linked Backloggd profiles; duplicate links count once. |
 | `/link <username>` | Connect your Discord account to a public Backloggd profile (nonexclusive; server-scoped duplicate notice only; never exposes other servers or DMs), schedule a shared sync, and enable local feed participation when run in a server. |
 | `/unlink` | Disconnect only your personal Backloggd link and server enrollments without erasing shared caches, other connected members, or archived feed posts. |
-| `/refresh [user]` | Request an immediate on-demand library sync (bypasses automatic cooldown/backoff and coalesces concurrent duplicate requests). |
+| `/refresh [@member]` | Queue an immediate on-demand library sync (bypasses automatic cooldown/backoff, coalesces duplicate requests, confirms promptly, and updates the status message best-effort upon completion). |
 | `/feed on` | Enable or re-enable activity feed announcements for your currently `/link`ed profile in this server only. |
 | `/feed off` | Opt out of member feed announcements in this server (notes when another member or admin follow still keeps the profile active). |
-| `/feed status` | Inspect your effective feed eligibility, active participation source (`member`, `admin`, `both`), channel, pending baseline, source health/gaps, and suppression counts (ephemeral; hides review text and other servers). |
+| `/feed status` | Inspect your effective feed eligibility, active participation source (`member`, `admin`, `both`), channel/target availability, pending baseline, source health/gaps, and suppression counts (ephemeral; hides review text and other servers). |
 | `/feed add <username>` | Follow any public Backloggd profile in this server's feed independently of personal `/link`s *(Manage Channels required)*. |
 | `/feed remove <username>` | Remove an admin public-profile follow without altering personal `/link`s or other members' feed enrollments *(Manage Channels required)*. |
 | `/feed list` | Paginated server list of enrolled and admin-followed feed profiles with participation sources and effective/pending states *(Manage Channels required)*. |
-| `/setchannel <channel>` | Designate a channel for automatic playthrough journal broadcasts and initialize required baselines *(Manage Channels required)*. |
+| `/setchannel <channel>` | Validate permissions, save the feed channel immediately, and let each source (`activity` / `journal`) initialize its baseline silently on its first successful poll *(Manage Channels required)*. |
 | `/unsetchannel` | Pause automatic journal broadcasts for the server while preserving subscriptions and archived message mappings *(Manage Channels required)*. |
 
 ---
@@ -53,14 +54,17 @@ Designed for gaming communities and friend groups: search games with live autoco
 ## Profile Connections, Feeds & Freshness Behavior
 
 - **Nonexclusive public profile connections**: There is no ownership verification. Multiple Discord members can `/link` to the same Backloggd username (normalized case-insensitively by `profile_key`). Duplicate notices mention only other connected members currently present in that server and never appear in DMs. Server ratings shelves, `/server-top`, `/server-stats`, `/taste-twins`, and `/recommend` count each distinct profile once, attribute profiles canonically, and never treat two Discord accounts sharing the same profile as taste twins.
+- **Complete guild membership & bounded lookups**: Server-wide commands (`/game`, `/server-top`, `/server-stats`, `/taste-twins`, `/recommend`) require a complete Discord member snapshot (coalescing guild member chunks when incomplete) and refuse to fall back to partial member lists. Database lookups and atomic library replacements run in bounded SQL parameter chunks across both local SQLite and Turso/libSQL, while leaderboard/statistics aggregates combine chunk metrics globally in Python before filtering, sorting, or applying `LIMIT`.
+- **Input validation & command error boundary**: Username inputs accept `@name` or exact `https://www.backloggd.com/u/<username>/` profile URLs, reject invalid paths, control characters, markdown injection, or inputs exceeding the bot's conservative 100-character limit before calling the SDK, and escape user-controlled display names in replies. A global application-command error boundary classifies expected permission/guild errors, logs unexpected failures once, and sends a single safe ephemeral reply without exposing internals.
 - **Server Games Logged**: This is the sum of each present linked profile's Played-tab total, obtained through the SDK's public profile API, with profile counts cached for up to one hour and at most two concurrent profile fetches. It is not the number of cached library rows or dated sessions. The same game contributes once for each distinct profile that includes it. Missing counts are disclosed as unavailable or as a partial lower bound; they are never silently treated as zero. The separate Games Completed field has been removed.
+- **Multi-collection library sync & `0.2.1` Playing-page limit**: Library syncs fetch `Played` (`get_user_library`) alongside `Playing` (`get_user_playing`), `Backlog` (`get_user_backlog`), and `Wishlist` (`get_user_wishlist`) when exposed by `backloggd-py`, merge overlapping slugs with deterministic precedence (`played > playing > backlog > wishlist > unknown`) while preserving owner ratings/likes, and atomically replace the cached library only after every collection fetch succeeds. Because published `backloggd-py` `0.2.1` reads only page 1 (up to 70 entries) of `get_user_playing()` with no pagination/continuation flag, the bot treats 70+ `Playing` entries as potentially truncated, refuses to overwrite the cache or mark the sync complete, and records a sync error until SDK pagination support is available.
 - **Per-server feed enrollment & preference isolation**: Feed preferences are keyed by `(guild_id, discord_id)` and default to **off**. Running `/link` inside a server or running `/feed on` explicitly enrolls (or re-enrolls) that server only; linking in a DM, passively joining another server, or configuring a channel in another guild enrolls nobody. Preferences persist across `/unlink`, relinks, departures, and `/unsetchannel` without resetting other servers.
 - **Independent admin follows (`/feed add|remove|list`)**: Server admins (`Manage Channels`) can follow any public Backloggd profile directly. Admin follows and member `/feed on` participation operate independently: a member running `/feed off` never deletes an admin follow, and `/feed remove` never removes member enrollments or personal links. Profiles followed solely via admin follow never enter server statistics, leaderboards, `/compare`, `/taste-twins`, or `/recommend`, and do not trigger unnecessary full-library syncs.
 - **One-time legacy grandfathering exception**: Upgrades from pre-v3 schemas preserve existing feed participation in servers that already had a feed channel configured once Discord provides a complete initial member snapshot (respecting any explicit `/feed off` choice). New joins, later `/link`s in other guilds, or newly configured feed channels are never grandfathered automatically.
-- **Seven-day cutoff & conservative edit reconciliation**: Newly discovered `Started`, `Finished`, or replay milestones older than 7 UTC calendar days at discovery (and future-dated or uncertain sessions) are suppressed, while new explicit ratings and written reviews remain eligible independently without being discarded alongside an old milestone. Ambiguous edits (such as same-game updates lacking strong persisted aliases or stable IDs) are held rather than duplicating announcements.
-- **Archived Discord posts**: Removing entries on Backloggd, opting out, or unlinking does not delete already posted Discord announcements. Confirmed source updates edit existing posts in place; manual Discord deletion (`NotFound`) records permanent suppression for that event so future updates never repost it.
+- **Prompt setup, seven-day cutoff & conservative edit reconciliation**: `/setchannel` validates permissions and saves immediately; each source (`activity` and `journal`) baselines existing history silently on its first successful poll so a temporary failure in one source does not reset or block the other. Newly discovered `Started`, `Finished`, or replay milestones older than 7 UTC calendar days at discovery (and future-dated or uncertain sessions) are suppressed, while new explicit ratings and written reviews remain eligible independently without being discarded alongside an old milestone. Ambiguous edits (such as same-game updates lacking strong persisted aliases or stable IDs) are held rather than duplicating announcements.
+- **Unavailable target resilience, retryable edits & archives**: Feed polling checks target availability (`View Channel`, `Send Messages`, `Embed Links`, cached guild/channel) before fetching, preserves subscriptions/archives while unavailable, logs transitions once, and recovers automatically when access returns. Removing entries on Backloggd, opting out, or unlinking does not delete already posted Discord announcements. Confirmed source updates edit existing posts in place; retryable HTTP edit failures retain the prior payload for the next poll without blocking later events or other guilds or advancing source continuity prematurely, while manual Discord deletion (`NotFound`) records permanent suppression so future updates never repost it.
 - **On-use library freshness & shared sync**: Social/discovery/stats commands (`/profile`, `/game`, `/compare`, `/taste-twins`, `/roulette`, `/recommend`, `/server-top`, `/server-stats`) treat cached libraries older than 1 hour as stale, serve cached results immediately with Discord `<t:unix:R>` timestamps (or disclose that a missing subscribed cache is currently being fetched instead of claiming an empty library), and coalesce background syncs (2 workers, 5-minute automatic debounce/failure backoff). Aggregates disclose the oldest contributing cache and stale/missing counts.
-- **Bounded activity recovery & source limits**: Activity feeds poll once per distinct profile per cycle across servers and consume bounded snapshots (`max_pages=5`, stopping at known boundary IDs when supported by the SDK). With published `backloggd-py` `0.2.0`, activity polling falls back to `get_user_activity()` (`coverage="unsupported"`) covering only the latest activity page; bounded pagination (`boundary_reached` / `exhausted` / `limited`) applies when an updated SDK exposes `get_user_activity_snapshot()`. Unresolved source outage gaps are tracked independently from library cache freshness and never cleared by a newest-page success alone until continuity is re-established.
+- **Bounded activity recovery & source limits**: Activity feeds poll once per distinct profile per cycle across servers and consume bounded snapshots (`max_pages=5`, stopping at known boundary IDs when supported by the SDK). Published `backloggd-py` `0.2.1` exposes `get_user_activity_snapshot()` with explicit coverage. Current public activity pages expose no validated pagination controls, so snapshots cover the latest page and report `unsupported` unless a known boundary ID is reached. A page budget does not guarantee recoverable history; bounded pagination (`exhausted` / `limited`) requires source pagination support. Unresolved source outage gaps are tracked independently from library cache freshness and never cleared by a newest-page success alone until continuity is re-established.
 
 ---
 
@@ -73,7 +77,8 @@ Designed for gaming communities and friend groups: search games with live autoco
 ### 2. Configure Gateway Intents
 In the Discord Developer Portal, navigate to your application -> **Bot** and enable:
 - **Server Members Intent** *(needed to match server members)*
-- **Message Content Intent**
+
+**Message Content Intent** is not needed because the bot uses slash commands only.
 
 ### 3. Installation
 
@@ -147,13 +152,26 @@ Schema upgrades in `bot/db_migrations.py` run atomically inside a transaction on
 
 ## Docker Deployment
 
-The bot includes a multi-stage, production-ready `Dockerfile` and `.dockerignore`:
+The repository includes a single-stage `Dockerfile` (`python:3.12-slim`) and `.dockerignore`. Dependencies are installed from the compiled `requirements.lock` using prebuilt Linux `x86_64` wheels (`--no-deps --only-binary=:all:`, no `gcc` required in the runtime image), and the container executes as non-root user `app` (UID `10001`, GID `10001`).
+
+Regenerate `requirements.lock` for the Linux/Python 3.12 target without touching `requirements.txt`:
+
+```bash
+uv pip compile requirements.txt --python-version 3.12 --python-platform x86_64-unknown-linux-gnu -o requirements.lock
+```
+
+> [!NOTE]
+> Local Windows / Python 3.14 testing uses `requirements.txt` and platform-specific environment markers (for example `audioop-lts` on Python 3.13+ and Windows wheels/packages such as `colorama`), whereas `requirements.lock` pins the exact transitive set for the Linux Python 3.12 container image while retaining `backloggd-py>=0.2.1,<0.3.0`.
 
 ```bash
 # Build the Docker image
 docker build -t backloggd-dc .
 
-# Run with persistent SQLite volume
+# Ensure an existing host SQLite directory is writable by container UID/GID 10001:10001
+mkdir -p ./data
+sudo chown -R 10001:10001 ./data
+
+# Run with persistent SQLite volume (or set DATABASE_PATH / TURSO_DATABASE_URL)
 docker run -d \
   --name backloggd-dc \
   --restart always \
@@ -162,6 +180,19 @@ docker run -d \
   backloggd-dc
 ```
 
+The SDK cache lives in `sdk-cache/backloggd_cache.db` beside the configured bot
+database (`/app/data/sdk-cache/backloggd_cache.db` by default in Docker). This
+keeps startup and cache writes inside the non-root user's writable data directory,
+including when the bot database uses Turso. Developer SDK caches are excluded
+from the Docker build context. Existing cache files are disposable; profile and
+feed history remain in the bot database.
+
+When another server can still poll a shared profile, eligible observations for
+temporarily unavailable, previously active feed recipients are retained for
+recovery. The shared activity continuity boundary stays pinned until those
+recipients can be processed. Recovery still requires complete server membership
+and the configured channel permissions; archived announcements are not replayed.
+
 ---
 
 ## Architecture & Codebase Layout
@@ -169,15 +200,19 @@ docker run -d \
 ```text
 backloggd-dc/
 ├── bot/
-│   ├── client.py          # Custom Discord Bot class, lifecycle hooks, shared LibrarySyncService
+│   ├── client.py          # Custom Discord Bot class, lifecycle hooks, global error boundary
+│   ├── command_errors.py  # Safe application-command error classification and ephemeral replies
 │   ├── config.py          # Bot settings and embed color constants
 │   ├── db.py              # Asynchronous SQLite/libSQL database manager
+│   ├── db_adapter.py      # Shared SQLite/libSQL transaction, batch, and lock adapter
 │   ├── db_migrations.py   # Atomic versioned schema migrations (v1-v7)
 │   ├── feed_models.py     # Normalized feed event models and parsing
 │   ├── feed_rules.py      # Action classification, journal normalization, conservative merging
 │   ├── feed_policy.py     # 7-day cutoff, future/uncertain handling, and ambiguity policy
+│   ├── input_validation.py# Mention resolution, Backloggd username/URL validation, markdown escaping
 │   ├── services/
-│   │   ├── library_sync.py# Coalesced per-profile background library sync coordinator
+│   │   ├── guild_membership.py # Complete, coalesced Discord guild membership resolution
+│   │   ├── library_sync.py# Coalesced per-profile background multi-collection sync coordinator
 │   │   └── freshness.py   # 1-hour cache freshness checks and Discord timestamp summaries
 │   ├── ui/
 │   │   ├── embeds.py      # Native Discord Embed builders with freshness disclosures & size clamps
@@ -194,9 +229,10 @@ backloggd-dc/
 │       └── feed.py        # /feed on|off|status|add|remove|list, /setchannel, /unsetchannel, poller
 ├── tests/                 # Unit, migration, freshness, policy, feed pipeline, and integration tests
 ├── data/                  # SQLite database directory (gitignored)
-├── Dockerfile             # Production container build
+├── Dockerfile             # Non-root production container build from compiled lockfile
 ├── main.py                # Application entrypoint
-├── requirements.txt       # Python package requirements
+├── requirements.txt       # Human-readable Python package requirements
+├── requirements.lock      # Compiled transitive pins for Linux/Python 3.12 container builds
 └── verify_all.py          # Comprehensive verification & smoke test script
 ```
 
@@ -241,16 +277,27 @@ This project is licensed under the [MIT License](LICENSE).
 All Backloggd HTTP requests, security/layout validation, pagination, and HTML
 parsing belong to `backloggd-py`. The bot calls only its public
 `get_user_activity()`, `get_user_journal()`, `get_user_profile()`,
-`get_user_library()`, `get_game()`, `search_games()`, and (when available)
+`get_user_library()`, `get_user_playing()`, `get_user_backlog()`,
+`get_user_wishlist()`, `get_game()`, `search_games()`, and (when available)
 `get_user_activity_snapshot()` APIs while keeping feed policy and announcement
 state in `bot/feed_models.py` and `bot/feed_policy.py`. HTML fixtures and
 parser regression tests live in the SDK repository; bot tests use typed SDK
 samples.
 
-The bot uses the published `backloggd-py` 0.2.0 API (`>=0.2.0,<0.3.0`) with an
-honest fallback to `get_user_activity()` (`unsupported` pagination coverage)
-when `get_user_activity_snapshot()` is unavailable. Install it with the other
-requirements and run the bot's checks:
+The bot requires published `backloggd-py` 0.2.1 or newer (`>=0.2.1,<0.3.0`),
+including profile-owner status parsing and the public
+`get_user_activity_snapshot()` API. Snapshots report `unsupported` pagination
+coverage when Backloggd exposes no validated pagination controls. The bot retains
+a compatibility fallback to `get_user_activity()` for older client adapters.
+For full-library refreshes, `bot/services/library_sync.py` composes
+`get_user_library()` (Played) with `get_user_playing()`, `get_user_backlog()`,
+and `get_user_wishlist()`; because published `0.2.1` `get_user_playing()` only
+fetches page 1 (`70` entries max) without a continuation flag, 70+ returned
+Playing items are treated as potentially incomplete so partial collections never
+overwrite complete caches.
+The SDK invalidates its old library caches automatically; library data copied
+into the bot database is corrected on the next successful library refresh.
+Install it with the other requirements and run the bot's checks:
 
 ```shell
 python -m pip install -r requirements.txt

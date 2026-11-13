@@ -5,6 +5,7 @@ Supports both local SQLite (aiosqlite) and Turso / libSQL Cloud Database (libsql
 
 import logging
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
@@ -12,8 +13,58 @@ import aiosqlite
 import libsql_client
 
 from bot.config import DATABASE_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
+from bot.db_adapter import execute_batch_statements, open_transaction
 
 logger = logging.getLogger("backloggd.db")
+
+_MAX_SQL_BIND_PARAMS = 800
+_MAX_SQL_BATCH_BYTES = 56 * 1024
+
+
+def _iter_sql_chunks(items: list[Any], *, fixed_params: int = 0) -> Iterable[list[Any]]:
+    """Yield non-empty slices sized so fixed_params + len(chunk) <= _MAX_SQL_BIND_PARAMS."""
+    chunk_size = max(1, _MAX_SQL_BIND_PARAMS - fixed_params)
+    for start in range(0, len(items), chunk_size):
+        yield items[start:start + chunk_size]
+
+
+def _estimate_row_payload_bytes(row: tuple[Any, ...]) -> int:
+    """Conservatively estimate JSON/SQL serialized byte cost for one multi-row VALUES tuple."""
+    total = 16 + len(row) * 4
+    for value in row:
+        if value is None:
+            total += 6
+        elif isinstance(value, bool):
+            total += 6
+        elif isinstance(value, (int, float)):
+            total += 24
+        else:
+            total += len(str(value).encode("utf-8")) + 8
+    return total
+
+
+def _iter_bounded_row_batches(
+    rows: list[tuple[Any, ...]],
+    *,
+    params_per_row: int,
+    fixed_params: int = 0,
+    fixed_sql_bytes: int = 512,
+    max_bytes: int = _MAX_SQL_BATCH_BYTES,
+) -> Iterable[list[tuple[Any, ...]]]:
+    """Yield row batches respecting both bind-parameter budget and serialized statement size."""
+    max_rows_by_params = max(1, (_MAX_SQL_BIND_PARAMS - fixed_params) // max(1, params_per_row))
+    batch: list[tuple[Any, ...]] = []
+    current_bytes = fixed_sql_bytes
+    for row in rows:
+        row_bytes = _estimate_row_payload_bytes(row)
+        if batch and (len(batch) >= max_rows_by_params or current_bytes + row_bytes > max_bytes):
+            yield batch
+            batch = []
+            current_bytes = fixed_sql_bytes
+        batch.append(row)
+        current_bytes += row_bytes
+    if batch:
+        yield batch
 
 
 class Database:
@@ -52,6 +103,7 @@ class Database:
         self._conn: Optional[aiosqlite.Connection] = None
         self._client: Optional[libsql_client.Client] = None
         self._operation_lock = asyncio.Lock()
+        self._lock_owner_task: Optional[asyncio.Task] = None
 
     @property
     def is_turso(self) -> bool:
@@ -88,9 +140,24 @@ class Database:
             return self._client is not None and not is_closed
         return self._conn is not None and getattr(self._conn, "_running", False)
 
+    @asynccontextmanager
+    async def _acquire_operation_lock(self):
+        current = asyncio.current_task()
+        if current is not None and self._lock_owner_task is current:
+            raise RuntimeError("Re-entrant acquisition of non-reentrant Database._operation_lock")
+        async with self._operation_lock:
+            self._lock_owner_task = current
+            try:
+                yield
+            finally:
+                self._lock_owner_task = None
+
+    def _transaction(self):
+        return open_transaction(self)
+
     async def close(self) -> None:
         """Close active database connection."""
-        async with self._operation_lock:
+        async with self._acquire_operation_lock():
             if self._client:
                 await self._client.close()
                 self._client = None
@@ -106,7 +173,7 @@ class Database:
 
     async def _execute(self, query: str, params: tuple | list = ()) -> None:
         """Execute a write statement (INSERT/UPDATE/CREATE/DELETE)."""
-        async with self._operation_lock:
+        async with self._acquire_operation_lock():
             if self.is_turso:
                 await self._client.execute(query, list(params))
             else:
@@ -115,7 +182,7 @@ class Database:
 
     async def _fetchone(self, query: str, params: tuple | list = ()) -> Optional[Any]:
         """Fetch a single row."""
-        async with self._operation_lock:
+        async with self._acquire_operation_lock():
             if self.is_turso:
                 rs = await self._client.execute(query, list(params))
                 return rs.rows[0] if rs.rows else None
@@ -124,7 +191,7 @@ class Database:
 
     async def _fetchall(self, query: str, params: tuple | list = ()) -> List[Any]:
         """Fetch all rows."""
-        async with self._operation_lock:
+        async with self._acquire_operation_lock():
             if self.is_turso:
                 rs = await self._client.execute(query, list(params))
                 return list(rs.rows)
@@ -133,7 +200,7 @@ class Database:
 
     async def _rowcount_execute(self, query: str, params: tuple | list = ()) -> int:
         """Execute a write statement and return affected rows count."""
-        async with self._operation_lock:
+        async with self._acquire_operation_lock():
             if self.is_turso:
                 rs = await self._client.execute(query, list(params))
                 return rs.rows_affected
@@ -240,22 +307,15 @@ class Database:
             CROSS JOIN guild_settings AS gs;
         """)
 
+    async def _execute_batch_results(
+        self, statements: List[tuple[str, tuple | list]]
+    ) -> List[Any]:
+        """Execute multiple statements atomically and return Turso result sets when applicable."""
+        return await execute_batch_statements(self, statements)
+
     async def _execute_batch(self, statements: List[tuple[str, tuple | list]]) -> None:
         """Execute multiple write statements atomically on SQLite or Turso."""
-        if not statements:
-            return
-        async with self._operation_lock:
-            if self.is_turso:
-                await self._client.batch([(sql, list(args)) for sql, args in statements])
-                return
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                for sql, args in statements:
-                    await self._conn.execute(sql, args)
-                await self._conn.commit()
-            except BaseException:
-                await self._conn.rollback()
-                raise
+        await self._execute_batch_results(statements)
 
     @staticmethod
     def _format_utc_sql_timestamp(value: Optional[Any]) -> Optional[str]:
@@ -298,127 +358,56 @@ class Database:
 
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove this member's connection and deactivate guild feeds with no remaining source."""
-        async with self._operation_lock:
-            if self.is_turso:
-                transaction = self._client.transaction()
-                try:
-                    row_rs = await transaction.execute(
-                        "SELECT profile_key FROM linked_users WHERE discord_id = ?", [discord_id]
+        async with self._transaction() as tx:
+            row = await tx.fetchone(
+                "SELECT profile_key FROM linked_users WHERE discord_id = ?;", (discord_id,)
+            )
+            if not row:
+                return False
+            profile_key = row["profile_key"]
+            deleted = await tx.execute(
+                "DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,)
+            )
+            if deleted <= 0:
+                return False
+            active_guilds = await tx.fetchall(
+                "SELECT guild_id FROM guild_profile_feed_activity WHERE profile_key = ? AND active = 1",
+                (profile_key,),
+            )
+            for active_row in active_guilds:
+                guild_id = active_row["guild_id"]
+                has_member = await tx.fetchone(
+                    """SELECT 1 FROM linked_users AS u
+                       JOIN guild_feed_preferences AS pref ON pref.discord_id = u.discord_id
+                       WHERE u.profile_key = ? AND pref.guild_id = ? AND pref.enabled = 1
+                       LIMIT 1""",
+                    (profile_key, guild_id),
+                )
+                has_admin = await tx.fetchone(
+                    "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
+                    (guild_id, profile_key),
+                )
+                if has_member is None and has_admin is None:
+                    await tx.execute(
+                        "UPDATE guild_profile_feed_activity SET active = 0 WHERE guild_id = ? AND profile_key = ?",
+                        (guild_id, profile_key),
                     )
-                    row = row_rs.rows[0] if row_rs.rows else None
-                    if not row:
-                        await transaction.commit()
-                        return False
-                    profile_key = row["profile_key"]
-                    del_rs = await transaction.execute(
-                        "DELETE FROM linked_users WHERE discord_id = ?", [discord_id]
+                    await tx.execute(
+                        "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
+                        (guild_id, profile_key),
                     )
-                    if del_rs.rows_affected <= 0:
-                        await transaction.commit()
-                        return False
-                    active_rs = await transaction.execute(
-                        "SELECT guild_id FROM guild_profile_feed_activity WHERE profile_key = ? AND active = 1",
-                        [profile_key],
+                    await tx.execute(
+                        """DELETE FROM profile_feed_decisions
+                           WHERE guild_id = ? AND profile_key = ?
+                             AND decision IN ('baseline', 'eligible')
+                             AND event_id NOT IN (
+                                 SELECT event_id FROM profile_feed_messages
+                                 WHERE guild_id = ? AND profile_key = ?
+                                   AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
+                             )""",
+                        (guild_id, profile_key, guild_id, profile_key),
                     )
-                    for active_row in active_rs.rows:
-                        guild_id = active_row["guild_id"]
-                        other_member = await transaction.execute(
-                            """SELECT 1 FROM linked_users AS u
-                               JOIN guild_feed_preferences AS pref ON pref.discord_id = u.discord_id
-                               WHERE u.profile_key = ? AND pref.guild_id = ? AND pref.enabled = 1
-                               LIMIT 1""",
-                            [profile_key, guild_id],
-                        )
-                        admin_follow = await transaction.execute(
-                            "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
-                            [guild_id, profile_key],
-                        )
-                        if not other_member.rows and not admin_follow.rows:
-                            await transaction.execute(
-                                "UPDATE guild_profile_feed_activity SET active = 0 WHERE guild_id = ? AND profile_key = ?",
-                                [guild_id, profile_key],
-                            )
-                            await transaction.execute(
-                                "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                                [guild_id, profile_key],
-                            )
-                            await transaction.execute(
-                                """DELETE FROM profile_feed_decisions
-                                   WHERE guild_id = ? AND profile_key = ?
-                                     AND decision IN ('baseline', 'eligible')
-                                     AND event_id NOT IN (
-                                         SELECT event_id FROM profile_feed_messages
-                                         WHERE guild_id = ? AND profile_key = ?
-                                           AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
-                                     )""",
-                                [guild_id, profile_key, guild_id, profile_key],
-                            )
-                    await transaction.commit()
-                    return True
-                except BaseException:
-                    await transaction.rollback()
-                    raise
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                async with self._conn.execute(
-                    "SELECT profile_key FROM linked_users WHERE discord_id = ?;", (discord_id,)
-                ) as cursor:
-                    row = await cursor.fetchone()
-                if not row:
-                    await self._conn.commit()
-                    return False
-                profile_key = row["profile_key"]
-                async with self._conn.execute(
-                    "DELETE FROM linked_users WHERE discord_id = ?;", (discord_id,)
-                ) as cursor:
-                    deleted = cursor.rowcount
-                if deleted > 0:
-                    async with self._conn.execute(
-                        "SELECT guild_id FROM guild_profile_feed_activity WHERE profile_key = ? AND active = 1",
-                        (profile_key,),
-                    ) as cursor:
-                        active_guilds = await cursor.fetchall()
-                    for active_row in active_guilds:
-                        guild_id = active_row["guild_id"]
-                        async with self._conn.execute(
-                            """SELECT 1 FROM linked_users AS u
-                               JOIN guild_feed_preferences AS pref ON pref.discord_id = u.discord_id
-                               WHERE u.profile_key = ? AND pref.guild_id = ? AND pref.enabled = 1
-                               LIMIT 1""",
-                            (profile_key, guild_id),
-                        ) as cursor:
-                            has_member = await cursor.fetchone() is not None
-                        async with self._conn.execute(
-                            "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
-                            (guild_id, profile_key),
-                        ) as cursor:
-                            has_admin = await cursor.fetchone() is not None
-                        if not has_member and not has_admin:
-                            await self._conn.execute(
-                                "UPDATE guild_profile_feed_activity SET active = 0 WHERE guild_id = ? AND profile_key = ?",
-                                (guild_id, profile_key),
-                            )
-                            await self._conn.execute(
-                                "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                                (guild_id, profile_key),
-                            )
-                            await self._conn.execute(
-                                """DELETE FROM profile_feed_decisions
-                                   WHERE guild_id = ? AND profile_key = ?
-                                     AND decision IN ('baseline', 'eligible')
-                                     AND event_id NOT IN (
-                                         SELECT event_id FROM profile_feed_messages
-                                         WHERE guild_id = ? AND profile_key = ?
-                                           AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
-                                     )""",
-                                (guild_id, profile_key, guild_id, profile_key),
-                            )
-                await self._conn.commit()
-                return deleted > 0
-            except BaseException:
-                await self._conn.rollback()
-                raise
+            return True
 
     async def get_linked_user(self, discord_id: int) -> Optional[Any]:
         """Fetch linked user record by Discord ID."""
@@ -434,12 +423,13 @@ class Database:
         exclude_discord_id: Optional[int] = None,
     ) -> List[Any]:
         """List only this profile's links among explicitly supplied guild members."""
-        if not member_ids:
+        members = list(dict.fromkeys(int(value) for value in member_ids))
+        if not members:
             return []
         excluded = exclude_discord_id if exclude_discord_id is not None else -1
         connections = []
-        for start in range(0, len(member_ids), 800):
-            member_chunk = member_ids[start:start + 800]
+        clean_username = username.strip()
+        for member_chunk in _iter_sql_chunks(members, fixed_params=2):
             placeholders = ",".join("?" for _ in member_chunk)
             query = f"""
                 SELECT discord_id FROM linked_users
@@ -448,8 +438,9 @@ class Database:
                   AND discord_id <> ?
                 ORDER BY discord_id
             """
-            params = [username.strip(), *member_chunk, excluded]
+            params = [clean_username, *member_chunk, excluded]
             connections.extend(await self._fetchall(query, params))
+        connections.sort(key=lambda row: row["discord_id"])
         return connections
 
     async def get_profile_sync_info(self, username: str) -> Optional[Any]:
@@ -471,8 +462,7 @@ class Database:
         """Return sync freshness metadata keyed by normalized profile_key."""
         normalized = list(dict.fromkeys(key.strip().lower() for key in profile_keys if key and key.strip()))
         result: dict[str, Any] = {}
-        for start in range(0, len(normalized), 800):
-            chunk = normalized[start:start + 800]
+        for chunk in _iter_sql_chunks(normalized):
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._fetchall(f"""
                 SELECT profiles.profile_key, profiles.display_username,
@@ -544,17 +534,18 @@ class Database:
             ),
         }
 
-    async def get_all_linked_users(self) -> List[Any]:
-        """Fetch all linked users."""
-        return await self._fetchall("SELECT discord_id, profile_key, backloggd_username, avatar_url FROM linked_users;")
-
     async def get_guild_linked_users(self, member_ids: List[int]) -> List[Any]:
         """Fetch all linked users present in a specific guild."""
-        if not member_ids:
+        members = list(dict.fromkeys(int(value) for value in member_ids))
+        if not members:
             return []
-        placeholders = ",".join("?" for _ in member_ids)
-        query = f"SELECT discord_id, profile_key, backloggd_username, avatar_url FROM linked_users WHERE discord_id IN ({placeholders});"
-        return await self._fetchall(query, member_ids)
+        rows: List[Any] = []
+        for chunk in _iter_sql_chunks(members):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"SELECT discord_id, profile_key, backloggd_username, avatar_url FROM linked_users WHERE discord_id IN ({placeholders});"
+            rows.extend(await self._fetchall(query, chunk))
+        rows.sort(key=lambda row: row["discord_id"])
+        return rows
 
     async def get_guild_linked_profiles(
         self,
@@ -562,21 +553,28 @@ class Database:
         exclude_profile_key: Optional[str] = None,
     ) -> List[Any]:
         """Fetch distinct linked profiles present among the supplied guild members."""
-        if not member_ids:
+        members = list(dict.fromkeys(int(value) for value in member_ids))
+        if not members:
             return []
-        placeholders = ",".join("?" for _ in member_ids)
-        exclusion = " AND p.profile_key <> ?" if exclude_profile_key else ""
-        params = list(member_ids)
-        if exclude_profile_key:
-            params.append(exclude_profile_key.strip().lower())
-        query = f"""
-            SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url
-            FROM linked_users AS u
-            JOIN profiles AS p ON p.profile_key = u.profile_key
-            WHERE u.discord_id IN ({placeholders}){exclusion}
-            ORDER BY p.profile_key
-        """
-        return await self._fetchall(query, params)
+        excluded = exclude_profile_key.strip().lower() if exclude_profile_key and exclude_profile_key.strip() else None
+        exclusion = " AND p.profile_key <> ?" if excluded else ""
+        fixed_params = 1 if excluded else 0
+        profiles: dict[str, Any] = {}
+        for chunk in _iter_sql_chunks(members, fixed_params=fixed_params):
+            placeholders = ",".join("?" for _ in chunk)
+            params: list[Any] = list(chunk)
+            if excluded:
+                params.append(excluded)
+            query = f"""
+                SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url
+                FROM linked_users AS u
+                JOIN profiles AS p ON p.profile_key = u.profile_key
+                WHERE u.discord_id IN ({placeholders}){exclusion}
+                ORDER BY p.profile_key
+            """
+            for row in await self._fetchall(query, params):
+                profiles[row["profile_key"]] = row
+        return [profiles[key] for key in sorted(profiles)]
 
     async def get_guild_linked_profiles_with_sync_info(
         self,
@@ -584,22 +582,29 @@ class Database:
         exclude_profile_key: Optional[str] = None,
     ) -> List[Any]:
         """Fetch distinct linked guild profiles with library sync timestamps and errors."""
-        if not member_ids:
+        members = list(dict.fromkeys(int(value) for value in member_ids))
+        if not members:
             return []
-        placeholders = ",".join("?" for _ in member_ids)
-        exclusion = " AND p.profile_key <> ?" if exclude_profile_key else ""
-        params = list(member_ids)
-        if exclude_profile_key:
-            params.append(exclude_profile_key.strip().lower())
-        query = f"""
-            SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url,
-                   p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error
-            FROM linked_users AS u
-            JOIN profiles AS p ON p.profile_key = u.profile_key
-            WHERE u.discord_id IN ({placeholders}){exclusion}
-            ORDER BY p.profile_key
-        """
-        return await self._fetchall(query, params)
+        excluded = exclude_profile_key.strip().lower() if exclude_profile_key and exclude_profile_key.strip() else None
+        exclusion = " AND p.profile_key <> ?" if excluded else ""
+        fixed_params = 1 if excluded else 0
+        profiles: dict[str, Any] = {}
+        for chunk in _iter_sql_chunks(members, fixed_params=fixed_params):
+            placeholders = ",".join("?" for _ in chunk)
+            params: list[Any] = list(chunk)
+            if excluded:
+                params.append(excluded)
+            query = f"""
+                SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url,
+                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error
+                FROM linked_users AS u
+                JOIN profiles AS p ON p.profile_key = u.profile_key
+                WHERE u.discord_id IN ({placeholders}){exclusion}
+                ORDER BY p.profile_key
+            """
+            for row in await self._fetchall(query, params):
+                profiles[row["profile_key"]] = row
+        return [profiles[key] for key in sorted(profiles)]
 
     async def set_guild_feed_preference(
         self, guild_id: int, discord_id: int, enabled: bool
@@ -628,11 +633,10 @@ class Database:
     async def get_guild_feed_profiles(
         self, guild_id: int, member_ids: Iterable[int]
     ) -> List[Any]:
-        """Return distinct enabled member profiles among current guild members."""
+        """Retained member-only opt-in profile lookup isolating member preferences from admin follows."""
         members = list(dict.fromkeys(int(value) for value in member_ids))
         profiles = {}
-        for start in range(0, len(members), 800):
-            chunk = members[start:start + 800]
+        for chunk in _iter_sql_chunks(members, fixed_params=1):
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._fetchall(
                 f"""SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url
@@ -643,7 +647,7 @@ class Database:
                       AND pref.discord_id IN ({placeholders})
                     ORDER BY p.profile_key""",
                 [guild_id, *chunk],
-            ) if chunk else []
+            )
             profiles.update((row["profile_key"], row) for row in rows)
         return [profiles[key] for key in sorted(profiles)]
 
@@ -662,92 +666,37 @@ class Database:
     ) -> bool:
         """Enroll only migration-scope links present in a complete member snapshot."""
         members = list(dict.fromkeys(int(value) for value in present_member_ids))
-        async with self._operation_lock:
-            if self.is_turso:
-                transaction = self._client.transaction()
-                try:
-                    pending_rs = await transaction.execute(
-                        "SELECT completed FROM guild_feed_legacy_migrations WHERE guild_id = ?",
-                        [guild_id],
-                    )
-                    pending = pending_rs.rows[0] if pending_rs.rows else None
-                    if not pending or pending["completed"]:
-                        await transaction.commit()
-                        return False
-                    for start in range(0, len(members), 800):
-                        chunk = members[start:start + 800]
-                        if not chunk:
-                            continue
-                        placeholders = ",".join("?" for _ in chunk)
-                        eligible_rs = await transaction.execute(
-                            f"""SELECT scope.discord_id
-                                FROM guild_feed_legacy_scope AS scope
-                                JOIN linked_users AS linked
-                                  ON linked.discord_id = scope.discord_id
-                                 AND linked.profile_key = scope.profile_key
-                                WHERE scope.guild_id = ? AND scope.discord_id IN ({placeholders})""",
-                            [guild_id, *chunk],
-                        )
-                        for row in eligible_rs.rows:
-                            await transaction.execute(
-                                """INSERT OR IGNORE INTO guild_feed_preferences
-                                   (guild_id, discord_id, enabled) VALUES (?, ?, 1)""",
-                                [guild_id, row["discord_id"]],
-                            )
-                    await transaction.execute(
-                        """UPDATE guild_feed_legacy_migrations
-                           SET completed = 1, completed_at = CURRENT_TIMESTAMP
-                           WHERE guild_id = ? AND completed = 0""",
-                        [guild_id],
-                    )
-                    await transaction.commit()
-                    return True
-                except BaseException:
-                    await transaction.rollback()
-                    raise
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                async with self._conn.execute(
-                    "SELECT completed FROM guild_feed_legacy_migrations WHERE guild_id = ?",
-                    (guild_id,),
-                ) as cursor:
-                    pending = await cursor.fetchone()
-                if not pending or pending["completed"]:
-                    await self._conn.commit()
-                    return False
-                for start in range(0, len(members), 800):
-                    chunk = members[start:start + 800]
-                    if not chunk:
-                        continue
-                    placeholders = ",".join("?" for _ in chunk)
-                    async with self._conn.execute(
-                        f"""SELECT scope.discord_id
-                            FROM guild_feed_legacy_scope AS scope
-                            JOIN linked_users AS linked
-                              ON linked.discord_id = scope.discord_id
-                             AND linked.profile_key = scope.profile_key
-                            WHERE scope.guild_id = ? AND scope.discord_id IN ({placeholders})""",
-                        [guild_id, *chunk],
-                    ) as cursor:
-                        eligible = await cursor.fetchall()
-                    for row in eligible:
-                        await self._conn.execute(
-                            """INSERT OR IGNORE INTO guild_feed_preferences
-                               (guild_id, discord_id, enabled) VALUES (?, ?, 1)""",
-                            (guild_id, row["discord_id"]),
-                        )
-                await self._conn.execute(
-                    """UPDATE guild_feed_legacy_migrations
-                       SET completed = 1, completed_at = CURRENT_TIMESTAMP
-                       WHERE guild_id = ? AND completed = 0""",
-                    (guild_id,),
+        async with self._transaction() as tx:
+            pending = await tx.fetchone(
+                "SELECT completed FROM guild_feed_legacy_migrations WHERE guild_id = ?",
+                (guild_id,),
+            )
+            if not pending or pending["completed"]:
+                return False
+            for chunk in _iter_sql_chunks(members, fixed_params=1):
+                placeholders = ",".join("?" for _ in chunk)
+                eligible = await tx.fetchall(
+                    f"""SELECT scope.discord_id
+                        FROM guild_feed_legacy_scope AS scope
+                        JOIN linked_users AS linked
+                          ON linked.discord_id = scope.discord_id
+                         AND linked.profile_key = scope.profile_key
+                        WHERE scope.guild_id = ? AND scope.discord_id IN ({placeholders})""",
+                    [guild_id, *chunk],
                 )
-                await self._conn.commit()
-                return True
-            except BaseException:
-                await self._conn.rollback()
-                raise
+                for row in eligible:
+                    await tx.execute(
+                        """INSERT OR IGNORE INTO guild_feed_preferences
+                           (guild_id, discord_id, enabled) VALUES (?, ?, 1)""",
+                        (guild_id, row["discord_id"]),
+                    )
+            await tx.execute(
+                """UPDATE guild_feed_legacy_migrations
+                   SET completed = 1, completed_at = CURRENT_TIMESTAMP
+                   WHERE guild_id = ? AND completed = 0""",
+                (guild_id,),
+            )
+            return True
 
     async def reconcile_guild_feed_activity(
         self,
@@ -770,159 +719,67 @@ class Database:
                     AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
               )
         """
-        async with self._operation_lock:
-            if self.is_turso:
-                transaction = self._client.transaction()
-                try:
-                    existing_rs = await transaction.execute(
-                        "SELECT profile_key, active FROM guild_profile_feed_activity WHERE guild_id = ?",
-                        [guild_id],
+        async with self._transaction() as tx:
+            existing = await tx.fetchall(
+                "SELECT profile_key, active FROM guild_profile_feed_activity WHERE guild_id = ?",
+                (guild_id,),
+            )
+            states = {row["profile_key"]: bool(row["active"]) for row in existing}
+            for profile_key, was_active in states.items():
+                if was_active and profile_key not in eligible:
+                    await tx.execute(
+                        """UPDATE guild_profile_feed_activity SET active = 0
+                           WHERE guild_id = ? AND profile_key = ?""",
+                        (guild_id, profile_key),
                     )
-                    states = {row["profile_key"]: bool(row["active"]) for row in existing_rs.rows}
-                    for profile_key, was_active in states.items():
-                        if was_active and profile_key not in eligible:
-                            await transaction.execute(
-                                """UPDATE guild_profile_feed_activity SET active = 0
-                                   WHERE guild_id = ? AND profile_key = ?""",
-                                [guild_id, profile_key],
-                            )
-                            await transaction.execute(
-                                "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                                [guild_id, profile_key],
-                            )
-                            await transaction.execute(
-                                clear_unsent_decisions_sql,
-                                [guild_id, profile_key, guild_id, profile_key],
-                            )
-                            deactivated.append(profile_key)
-                    for profile_key in sorted(eligible):
-                        if not states.get(profile_key, False):
-                            if now_sql is not None:
-                                await transaction.execute(
-                                    """INSERT INTO guild_profile_feed_activity
-                                       (guild_id, profile_key, active, last_active_at)
-                                       VALUES (?, ?, 1, ?)
-                                       ON CONFLICT(guild_id, profile_key) DO UPDATE SET
-                                           active = 1, last_active_at = excluded.last_active_at""",
-                                    [guild_id, profile_key, now_sql],
-                                )
-                            else:
-                                await transaction.execute(
-                                    """INSERT INTO guild_profile_feed_activity
-                                       (guild_id, profile_key, active, last_active_at)
-                                       VALUES (?, ?, 1, CURRENT_TIMESTAMP)
-                                       ON CONFLICT(guild_id, profile_key) DO UPDATE SET
-                                           active = 1, last_active_at = CURRENT_TIMESTAMP""",
-                                    [guild_id, profile_key],
-                                )
-                            await transaction.execute(
-                                "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                                [guild_id, profile_key],
-                            )
-                            await transaction.execute(
-                                clear_unsent_decisions_sql,
-                                [guild_id, profile_key, guild_id, profile_key],
-                            )
-                            activated.append(profile_key)
-                    await transaction.commit()
-                    return {"activated": activated, "deactivated": deactivated}
-                except BaseException:
-                    await transaction.rollback()
-                    raise
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                async with self._conn.execute(
-                    "SELECT profile_key, active FROM guild_profile_feed_activity WHERE guild_id = ?",
-                    (guild_id,),
-                ) as cursor:
-                    existing = await cursor.fetchall()
-                states = {row["profile_key"]: bool(row["active"]) for row in existing}
-                for profile_key, was_active in states.items():
-                    if was_active and profile_key not in eligible:
-                        await self._conn.execute(
-                            """UPDATE guild_profile_feed_activity SET active = 0
-                               WHERE guild_id = ? AND profile_key = ?""",
+                    await tx.execute(
+                        "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
+                        (guild_id, profile_key),
+                    )
+                    await tx.execute(
+                        clear_unsent_decisions_sql,
+                        (guild_id, profile_key, guild_id, profile_key),
+                    )
+                    deactivated.append(profile_key)
+            for profile_key in sorted(eligible):
+                if not states.get(profile_key, False):
+                    if now_sql is not None:
+                        await tx.execute(
+                            """INSERT INTO guild_profile_feed_activity
+                               (guild_id, profile_key, active, last_active_at)
+                               VALUES (?, ?, 1, ?)
+                               ON CONFLICT(guild_id, profile_key) DO UPDATE SET
+                                   active = 1, last_active_at = excluded.last_active_at""",
+                            (guild_id, profile_key, now_sql),
+                        )
+                    else:
+                        await tx.execute(
+                            """INSERT INTO guild_profile_feed_activity
+                               (guild_id, profile_key, active, last_active_at)
+                               VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+                               ON CONFLICT(guild_id, profile_key) DO UPDATE SET
+                                   active = 1, last_active_at = CURRENT_TIMESTAMP""",
                             (guild_id, profile_key),
                         )
-                        await self._conn.execute(
-                            "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                            (guild_id, profile_key),
-                        )
-                        await self._conn.execute(
-                            clear_unsent_decisions_sql,
-                            (guild_id, profile_key, guild_id, profile_key),
-                        )
-                        deactivated.append(profile_key)
-                for profile_key in sorted(eligible):
-                    if not states.get(profile_key, False):
-                        if now_sql is not None:
-                            await self._conn.execute(
-                                """INSERT INTO guild_profile_feed_activity
-                                   (guild_id, profile_key, active, last_active_at)
-                                   VALUES (?, ?, 1, ?)
-                                   ON CONFLICT(guild_id, profile_key) DO UPDATE SET
-                                       active = 1, last_active_at = excluded.last_active_at""",
-                                (guild_id, profile_key, now_sql),
-                            )
-                        else:
-                            await self._conn.execute(
-                                """INSERT INTO guild_profile_feed_activity
-                                   (guild_id, profile_key, active, last_active_at)
-                                   VALUES (?, ?, 1, CURRENT_TIMESTAMP)
-                                   ON CONFLICT(guild_id, profile_key) DO UPDATE SET
-                                       active = 1, last_active_at = CURRENT_TIMESTAMP""",
-                                (guild_id, profile_key),
-                            )
-                        await self._conn.execute(
-                            "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                            (guild_id, profile_key),
-                        )
-                        await self._conn.execute(
-                            clear_unsent_decisions_sql,
-                            (guild_id, profile_key, guild_id, profile_key),
-                        )
-                        activated.append(profile_key)
-                await self._conn.commit()
-                return {"activated": activated, "deactivated": deactivated}
-            except BaseException:
-                await self._conn.rollback()
-                raise
-
-    async def pause_guild_feed_activity(self, guild_id: int) -> None:
-        """Pause all subscriptions while preserving archived messages and aliases."""
-        await self._execute_batch([
-            (
-                """UPDATE guild_profile_feed_activity SET active = 0
-                   WHERE guild_id = ? AND active = 1""",
-                (guild_id,),
-            ),
-            (
-                "DELETE FROM profile_feed_sources WHERE guild_id = ?",
-                (guild_id,),
-            ),
-            (
-                """DELETE FROM profile_feed_decisions
-                   WHERE guild_id = ?
-                     AND decision IN ('baseline', 'eligible')
-                     AND event_id NOT IN (
-                         SELECT event_id FROM profile_feed_messages
-                         WHERE guild_id = ?
-                           AND profile_key = profile_feed_decisions.profile_key
-                           AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
-                     )""",
-                (guild_id, guild_id),
-            ),
-        ])
+                    await tx.execute(
+                        "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
+                        (guild_id, profile_key),
+                    )
+                    await tx.execute(
+                        clear_unsent_decisions_sql,
+                        (guild_id, profile_key, guild_id, profile_key),
+                    )
+                    activated.append(profile_key)
+            return {"activated": activated, "deactivated": deactivated}
 
     async def get_guild_profile_member_sources(
         self, guild_id: int, profile_key: str, member_ids: Iterable[int]
     ) -> List[int]:
         """Return current member IDs that actively enroll the given profile."""
         members = list(dict.fromkeys(int(value) for value in member_ids))
+        normalized_key = profile_key.strip().lower()
         matching = []
-        for start in range(0, len(members), 800):
-            chunk = members[start:start + 800]
+        for chunk in _iter_sql_chunks(members, fixed_params=2):
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._fetchall(
                 f"""SELECT pref.discord_id FROM guild_feed_preferences AS pref
@@ -931,9 +788,10 @@ class Database:
                       AND linked.profile_key = ?
                       AND pref.discord_id IN ({placeholders})
                     ORDER BY pref.discord_id""",
-                [guild_id, profile_key.strip().lower(), *chunk],
-            ) if chunk else []
+                [guild_id, normalized_key, *chunk],
+            )
             matching.extend(row["discord_id"] for row in rows)
+        matching.sort()
         return matching
 
     async def add_guild_admin_follow(
@@ -1259,16 +1117,52 @@ class Database:
             (guild_id,),
         )
 
+    async def get_guild_feed_recovery_profiles(self, guild_id: int) -> List[Any]:
+        """Last active recipients still enrolled, when Discord membership is unavailable.
+
+        This is recovery bookkeeping only: cached membership never authorizes a
+        Discord send. A complete member snapshot must still precede delivery.
+        """
+        return await self._fetchall(
+            """SELECT p.profile_key, p.display_username, p.avatar_url
+               FROM guild_profile_feed_activity AS active
+               JOIN profiles AS p ON p.profile_key = active.profile_key
+               WHERE active.guild_id = ? AND active.active = 1
+                 AND (
+                     EXISTS (
+                         SELECT 1 FROM guild_feed_preferences AS pref
+                         JOIN linked_users AS linked ON linked.discord_id = pref.discord_id
+                         WHERE pref.guild_id = active.guild_id AND pref.enabled = 1
+                           AND linked.profile_key = active.profile_key
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM guild_admin_follows AS follow
+                         WHERE follow.guild_id = active.guild_id
+                           AND follow.profile_key = active.profile_key
+                     )
+                 ) ORDER BY p.profile_key""",
+            (guild_id,),
+        )
+
+    async def record_feed_target_gap(self, profile_key: str) -> None:
+        """Disclose incomplete recipient processing without claiming an upstream error."""
+        await self._execute(
+            """UPDATE profile_feed_source_health
+               SET unresolved_gap_since = COALESCE(unresolved_gap_since,
+                       last_continuous_boundary_at, last_success_at, CURRENT_TIMESTAMP),
+                   unresolved_gap_until = CURRENT_TIMESTAMP,
+                   gap_reason = COALESCE(gap_reason, 'unavailable_feed_target')
+               WHERE profile_key = ? AND source = 'activity'""",
+            (profile_key,),
+        )
+
     async def get_guild_feed_candidates(
         self, guild_id: int, member_ids: Iterable[int]
     ) -> List[dict]:
         """Union current member enrollment and admin follows by public profile."""
         members = list(dict.fromkeys(int(value) for value in member_ids))
         candidates: dict[str, dict] = {}
-        for start in range(0, len(members), 800):
-            chunk = members[start:start + 800]
-            if not chunk:
-                continue
+        for chunk in _iter_sql_chunks(members, fixed_params=1):
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._fetchall(
                 f"""SELECT p.profile_key, p.display_username, p.avatar_url, pref.discord_id
@@ -1300,6 +1194,7 @@ class Database:
             candidate["admin"] = True
             candidate["avatar_url"] = candidate["avatar_url"] or row["avatar_url"]
         for candidate in candidates.values():
+            candidate["member_ids"].sort()
             member = bool(candidate["member_ids"])
             candidate["sources"] = "both" if member and candidate["admin"] else "member" if member else "admin"
         return [candidates[key] for key in sorted(candidates)]
@@ -1338,7 +1233,7 @@ class Database:
         status: str,
         is_liked: bool = False
     ) -> None:
-        """Insert or update a game row in the linked profile's shared library."""
+        """Retained Discord-ID compatibility shim writing through linked_users to shared profile_ratings."""
         query = """
             INSERT INTO profile_ratings (profile_key, game_slug, rating, status, is_liked, updated_at)
             SELECT profile_key, ?, ?, ?, ?, CURRENT_TIMESTAMP
@@ -1355,50 +1250,29 @@ class Database:
         """Fetch one rating/status row per Backloggd profile connected in this guild."""
         if not guild_member_ids:
             return []
-        placeholders = ",".join("?" for _ in guild_member_ids)
-        query = f"""
-            SELECT r.profile_key, p.display_username AS backloggd_username,
-                   p.avatar_url, r.rating, r.status, r.is_liked
-            FROM profile_ratings r
-            JOIN profiles p ON p.profile_key = r.profile_key
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.game_slug = ?
-            ORDER BY (r.rating IS NULL), r.rating DESC, p.display_username ASC;
-        """
-        params = list(guild_member_ids) + [game_slug]
-        return await self._fetchall(query, params)
-
-    async def get_user_stats(self, discord_id: int) -> dict:
-        """Fetch user's aggregate stats from cached ratings."""
-        query = """
-            SELECT COUNT(*) as total_games,
-                   COUNT(rating) as rated_count,
-                   AVG(rating) as average_rating
-            FROM user_ratings
-            WHERE discord_id = ?;
-        """
-        row = await self._fetchone(query, (discord_id,))
-        if not row or not row["total_games"]:
-            return {"total_games": 0, "rated_count": 0, "average_rating": None}
-        return {
-            "total_games": row["total_games"],
-            "rated_count": row["rated_count"],
-            "average_rating": round(row["average_rating"], 2) if row["average_rating"] is not None else None
-        }
-
-    async def get_user_recent_ratings(self, discord_id: int, limit: int = 5) -> List[Any]:
-        """Fetch user's most recently logged ratings from database."""
-        query = """
-            SELECT g.title as game_title, g.slug as game_slug, r.rating, r.status, r.updated_at
-            FROM user_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.discord_id = ?
-            ORDER BY r.updated_at DESC
-            LIMIT ?;
-        """
-        return await self._fetchall(query, (discord_id, limit))
+        profiles = await self.get_guild_linked_profiles(guild_member_ids)
+        profile_keys = [row["profile_key"] for row in profiles]
+        if not profile_keys:
+            return []
+        rows: List[Any] = []
+        for chunk in _iter_sql_chunks(profile_keys, fixed_params=1):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT r.profile_key, p.display_username AS backloggd_username,
+                       p.avatar_url, r.rating, r.status, r.is_liked
+                FROM profile_ratings r
+                JOIN profiles p ON p.profile_key = r.profile_key
+                WHERE r.profile_key IN ({placeholders}) AND r.game_slug = ?;
+            """
+            rows.extend(await self._fetchall(query, [*chunk, game_slug]))
+        rows.sort(
+            key=lambda r: (
+                r["rating"] is None,
+                -(r["rating"] if r["rating"] is not None else 0.0),
+                r["backloggd_username"],
+            )
+        )
+        return rows
 
     async def get_user_backlog(self, discord_id: int) -> List[Any]:
         """Retrieve unrated backlog and wishlist games for a user."""
@@ -1426,7 +1300,7 @@ class Database:
         synced_at: Optional[Any] = None,
         clear_pending_token: Optional[str] = None,
     ) -> bool:
-        """Atomically replace the shared profile library if the link still matches."""
+        """Retained Discord-ID fallback delegating to replace_profile_library(..., require_linked=True)."""
         return await self.replace_profile_library(
             expected_username,
             games,
@@ -1447,176 +1321,211 @@ class Database:
         """Atomically replace the shared profile library and record sync completion."""
         from bot.ui.helpers import clean_image_url
 
-        game_rows = [
-            (
-                game.slug,
+        profile_key = username.strip().lower()
+        cached_game_rows: list[tuple[Any, ...]] = []
+        rating_rows: list[tuple[Any, ...]] = []
+        sqlite_rating_rows: list[tuple[Any, ...]] = []
+        for game in games:
+            slug = game.slug
+            status_val = game.status.value if hasattr(game.status, "value") else str(game.status)
+            rating_val = getattr(game, "rating", None)
+            liked_val = bool(getattr(game, "is_liked", False))
+            cached_game_rows.append((
+                slug,
                 game.title,
                 clean_image_url(getattr(game, "cover_url", None)),
                 getattr(game, "release_year", None),
                 getattr(game, "community_rating", None),
-                getattr(game, "rating", None),
-                game.status.value if hasattr(game.status, "value") else str(game.status),
-                bool(getattr(game, "is_liked", False)),
-            )
-            for game in games
-        ]
-        profile_key = username.strip().lower()
+            ))
+            rating_rows.append((slug, rating_val, status_val, liked_val))
+            sqlite_rating_rows.append((profile_key, slug, rating_val, status_val, liked_val))
+
         synced_sql = self._format_utc_sql_timestamp(synced_at)
         ownership_sql = "SELECT 1 FROM linked_users WHERE profile_key = ? LIMIT 1"
 
-        async with self._operation_lock:
-            if self.is_turso:
-                statements = []
+        if self.is_turso:
+            statements = []
+            if require_linked:
+                statements.append((ownership_sql, (profile_key,)))
+                guard = f"AND EXISTS ({ownership_sql})"
+                profile_args = (profile_key, profile_key)
+            else:
+                guard = ""
+                profile_args = (profile_key,)
+            if synced_sql is not None:
+                statements.append((
+                    f"""UPDATE profiles
+                        SET last_synced_at = ?, last_sync_attempt_at = ?, last_sync_error = NULL
+                        WHERE profile_key = ? {guard}""",
+                    (synced_sql, synced_sql, *profile_args),
+                ))
+                statements.append((
+                    f"""UPDATE linked_users SET last_synced_at = ?
+                        WHERE profile_key = ? {guard}""",
+                    (synced_sql, *profile_args),
+                ))
+            else:
+                statements.append((
+                    f"""UPDATE profiles
+                        SET last_synced_at = CURRENT_TIMESTAMP, last_sync_attempt_at = CURRENT_TIMESTAMP, last_sync_error = NULL
+                        WHERE profile_key = ? {guard}""",
+                    profile_args,
+                ))
+                statements.append((
+                    f"""UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
+                        WHERE profile_key = ? {guard}""",
+                    profile_args,
+                ))
+
+            for batch in _iter_bounded_row_batches(
+                cached_game_rows,
+                params_per_row=5,
+                fixed_params=1 if require_linked else 0,
+                fixed_sql_bytes=480,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, ?)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
                 if require_linked:
-                    statements.append((ownership_sql, (profile_key,)))
-                    guard = f"AND EXISTS ({ownership_sql})"
-                    profile_args = (profile_key, profile_key)
-                else:
-                    guard = ""
-                    profile_args = (profile_key,)
-                if synced_sql is not None:
-                    statements.append((
-                        f"""UPDATE profiles
-                            SET last_synced_at = ?, last_sync_attempt_at = ?, last_sync_error = NULL
-                            WHERE profile_key = ? {guard}""",
-                        (synced_sql, synced_sql, *profile_args),
-                    ))
-                    statements.append((
-                        f"""UPDATE linked_users SET last_synced_at = ?
-                            WHERE profile_key = ? {guard}""",
-                        (synced_sql, *profile_args),
-                    ))
-                else:
-                    statements.append((
-                        f"""UPDATE profiles
-                            SET last_synced_at = CURRENT_TIMESTAMP, last_sync_attempt_at = CURRENT_TIMESTAMP, last_sync_error = NULL
-                            WHERE profile_key = ? {guard}""",
-                        profile_args,
-                    ))
-                    statements.append((
-                        f"""UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP
-                            WHERE profile_key = ? {guard}""",
-                        profile_args,
-                    ))
-                for row in game_rows:
-                    statements.append(("""
+                    statements.append((f"""
                         INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
-                        VALUES (?, ?, ?, ?, ?)
+                        SELECT v.column1, v.column2, v.column3, v.column4, v.column5
+                        FROM (VALUES {values_sql}) AS v
+                        WHERE EXISTS ({ownership_sql})
                         ON CONFLICT(slug) DO UPDATE SET
                             title = excluded.title,
                             cover_url = COALESCE(excluded.cover_url, cached_games.cover_url),
                             release_year = COALESCE(excluded.release_year, cached_games.release_year),
                             community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
-                    """, row[:5]))
-                statements.append((
-                    f"DELETE FROM profile_ratings WHERE profile_key = ? {guard}",
-                    profile_args,
-                ))
-                where_clause = f"WHERE EXISTS ({ownership_sql})" if require_linked else ""
-                for row in game_rows:
-                    insert_args = (profile_key, row[0], row[5], row[6], row[7])
-                    if require_linked:
-                        insert_args = (*insert_args, profile_key)
+                    """, (*flat_params, profile_key)))
+                else:
                     statements.append((f"""
-                        INSERT INTO profile_ratings
-                            (profile_key, game_slug, rating, status, is_liked, updated_at)
-                        SELECT ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
-                        {where_clause}
-                        ON CONFLICT(profile_key, game_slug) DO UPDATE SET
-                            rating = excluded.rating,
-                            status = excluded.status,
-                            is_liked = excluded.is_liked,
-                            updated_at = CURRENT_TIMESTAMP
-                    """, insert_args))
-                if clear_pending_token is not None:
-                    clear_args = (
+                        INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
+                        VALUES {values_sql}
+                        ON CONFLICT(slug) DO UPDATE SET
+                            title = excluded.title,
+                            cover_url = COALESCE(excluded.cover_url, cached_games.cover_url),
+                            release_year = COALESCE(excluded.release_year, cached_games.release_year),
+                            community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
+                    """, tuple(flat_params)))
+
+            statements.append((
+                f"DELETE FROM profile_ratings WHERE profile_key = ? {guard}",
+                profile_args,
+            ))
+
+            where_clause = f"WHERE EXISTS ({ownership_sql})" if require_linked else "WHERE 1 = 1"
+            fixed_rating_params = 2 if require_linked else 1
+            for batch in _iter_bounded_row_batches(
+                rating_rows,
+                params_per_row=4,
+                fixed_params=fixed_rating_params,
+                fixed_sql_bytes=480,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                insert_args = (profile_key, *flat_params)
+                if require_linked:
+                    insert_args = (*insert_args, profile_key)
+                statements.append((f"""
+                    INSERT INTO profile_ratings
+                        (profile_key, game_slug, rating, status, is_liked, updated_at)
+                    SELECT ?, v.column1, v.column2, v.column3, v.column4, CURRENT_TIMESTAMP
+                    FROM (VALUES {values_sql}) AS v
+                    {where_clause}
+                    ON CONFLICT(profile_key, game_slug) DO UPDATE SET
+                        rating = excluded.rating,
+                        status = excluded.status,
+                        is_liked = excluded.is_liked,
+                        updated_at = CURRENT_TIMESTAMP
+                """, insert_args))
+
+            if clear_pending_token is not None:
+                clear_args = (
+                    profile_key,
+                    self._LIBRARY_SYNC_SOURCE,
+                    self._PENDING_REFRESH_KEY,
+                    clear_pending_token,
+                )
+                if require_linked:
+                    clear_args = (*clear_args, profile_key)
+                statements.append((
+                    f"""DELETE FROM profile_activity_observations
+                        WHERE profile_key = ? AND source = ? AND observation_key = ?
+                          AND fingerprint = ? {guard}""",
+                    clear_args,
+                ))
+            results = await self._execute_batch_results(statements)
+            if require_linked:
+                return bool(results and results[0].rows)
+            return True
+
+        async with self._transaction() as tx:
+            if require_linked:
+                link = await tx.fetchone(ownership_sql, (profile_key,))
+                if not link:
+                    return False
+
+            if synced_sql is not None:
+                await tx.execute(
+                    """UPDATE profiles
+                       SET last_synced_at = ?, last_sync_attempt_at = ?, last_sync_error = NULL
+                       WHERE profile_key = ?""",
+                    (synced_sql, synced_sql, profile_key),
+                )
+                await tx.execute(
+                    "UPDATE linked_users SET last_synced_at = ? WHERE profile_key = ?",
+                    (synced_sql, profile_key),
+                )
+            else:
+                await tx.execute(
+                    """UPDATE profiles
+                       SET last_synced_at = CURRENT_TIMESTAMP,
+                           last_sync_attempt_at = CURRENT_TIMESTAMP,
+                           last_sync_error = NULL
+                       WHERE profile_key = ?""",
+                    (profile_key,),
+                )
+                await tx.execute(
+                    "UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP WHERE profile_key = ?",
+                    (profile_key,),
+                )
+            if cached_game_rows:
+                await tx.executemany("""
+                    INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(slug) DO UPDATE SET
+                        title = excluded.title,
+                        cover_url = COALESCE(excluded.cover_url, cached_games.cover_url),
+                        release_year = COALESCE(excluded.release_year, cached_games.release_year),
+                        community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
+                """, cached_game_rows)
+            await tx.execute(
+                "DELETE FROM profile_ratings WHERE profile_key = ?;", (profile_key,)
+            )
+            if sqlite_rating_rows:
+                await tx.executemany("""
+                    INSERT INTO profile_ratings
+                        (profile_key, game_slug, rating, status, is_liked, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(profile_key, game_slug) DO UPDATE SET
+                        rating = excluded.rating,
+                        status = excluded.status,
+                        is_liked = excluded.is_liked,
+                        updated_at = CURRENT_TIMESTAMP
+                """, sqlite_rating_rows)
+            if clear_pending_token is not None:
+                await tx.execute(
+                    """DELETE FROM profile_activity_observations
+                       WHERE profile_key = ? AND source = ? AND observation_key = ?
+                         AND fingerprint = ?""",
+                    (
                         profile_key,
                         self._LIBRARY_SYNC_SOURCE,
                         self._PENDING_REFRESH_KEY,
                         clear_pending_token,
-                    )
-                    if require_linked:
-                        clear_args = (*clear_args, profile_key)
-                    statements.append((
-                        f"""DELETE FROM profile_activity_observations
-                            WHERE profile_key = ? AND source = ? AND observation_key = ?
-                              AND fingerprint = ? {guard}""",
-                        clear_args,
-                    ))
-                results = await self._client.batch(statements)
-                if require_linked:
-                    return bool(results and results[0].rows)
-                return True
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                if require_linked:
-                    async with self._conn.execute(ownership_sql, (profile_key,)) as cursor:
-                        link = await cursor.fetchone()
-                    if not link:
-                        await self._conn.rollback()
-                        return False
-
-                if synced_sql is not None:
-                    await self._conn.execute(
-                        """UPDATE profiles
-                           SET last_synced_at = ?, last_sync_attempt_at = ?, last_sync_error = NULL
-                           WHERE profile_key = ?""",
-                        (synced_sql, synced_sql, profile_key),
-                    )
-                    await self._conn.execute(
-                        "UPDATE linked_users SET last_synced_at = ? WHERE profile_key = ?",
-                        (synced_sql, profile_key),
-                    )
-                else:
-                    await self._conn.execute(
-                        """UPDATE profiles
-                           SET last_synced_at = CURRENT_TIMESTAMP,
-                               last_sync_attempt_at = CURRENT_TIMESTAMP,
-                               last_sync_error = NULL
-                           WHERE profile_key = ?""",
-                        (profile_key,),
-                    )
-                    await self._conn.execute(
-                        "UPDATE linked_users SET last_synced_at = CURRENT_TIMESTAMP WHERE profile_key = ?",
-                        (profile_key,),
-                    )
-                for row in game_rows:
-                    await self._conn.execute("""
-                        INSERT INTO cached_games (slug, title, cover_url, release_year, community_rating)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(slug) DO UPDATE SET
-                            title = excluded.title,
-                            cover_url = COALESCE(excluded.cover_url, cached_games.cover_url),
-                            release_year = COALESCE(excluded.release_year, cached_games.release_year),
-                            community_rating = COALESCE(excluded.community_rating, cached_games.community_rating)
-                    """, row[:5])
-                await self._conn.execute(
-                    "DELETE FROM profile_ratings WHERE profile_key = ?;", (profile_key,)
+                    ),
                 )
-                for row in game_rows:
-                    await self._conn.execute("""
-                        INSERT INTO profile_ratings
-                            (profile_key, game_slug, rating, status, is_liked, updated_at)
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (profile_key, row[0], row[5], row[6], row[7]))
-                if clear_pending_token is not None:
-                    await self._conn.execute(
-                        """DELETE FROM profile_activity_observations
-                           WHERE profile_key = ? AND source = ? AND observation_key = ?
-                             AND fingerprint = ?""",
-                        (
-                            profile_key,
-                            self._LIBRARY_SYNC_SOURCE,
-                            self._PENDING_REFRESH_KEY,
-                            clear_pending_token,
-                        ),
-                    )
-                await self._conn.commit()
-                return True
-            except BaseException:
-                await self._conn.rollback()
-                raise
+            return True
 
     async def record_profile_sync_failure(
         self,
@@ -1644,24 +1553,6 @@ class Database:
                 (error_text, profile_key),
             )
 
-    async def get_user_ratings_dict(self, discord_id: int) -> dict[str, Optional[float]]:
-        """Return slug -> rating dictionary for similarity computation."""
-        query = "SELECT game_slug, rating FROM user_ratings WHERE discord_id = ?;"
-        rows = await self._fetchall(query, (discord_id,))
-        return {row["game_slug"]: row["rating"] for row in rows}
-
-    async def get_multi_user_ratings_dict(self, discord_ids: List[int]) -> dict[int, dict[str, Optional[float]]]:
-        """Return discord_id -> {slug: rating} for multiple users in a single batch query (eliminating N+1)."""
-        if not discord_ids:
-            return {}
-        placeholders = ",".join("?" for _ in discord_ids)
-        query = f"SELECT discord_id, game_slug, rating FROM user_ratings WHERE discord_id IN ({placeholders});"
-        rows = await self._fetchall(query, discord_ids)
-        result: dict[int, dict[str, Optional[float]]] = {uid: {} for uid in discord_ids}
-        for row in rows:
-            result[row["discord_id"]][row["game_slug"]] = row["rating"]
-        return result
-
     async def get_multi_profile_ratings_dict(
         self,
         profile_keys: List[str],
@@ -1669,8 +1560,7 @@ class Database:
         """Return one cached rating map per normalized Backloggd profile."""
         normalized_keys = list(dict.fromkeys(key.strip().lower() for key in profile_keys if key.strip()))
         result: dict[str, dict[str, Optional[float]]] = {key: {} for key in normalized_keys}
-        for start in range(0, len(normalized_keys), 800):
-            key_chunk = normalized_keys[start:start + 800]
+        for key_chunk in _iter_sql_chunks(normalized_keys):
             placeholders = ",".join("?" for _ in key_chunk)
             rows = await self._fetchall(
                 f"""SELECT profile_key, game_slug, rating
@@ -1682,130 +1572,280 @@ class Database:
         return result
 
     async def get_games_by_slugs(self, slugs: List[str]) -> dict[str, Any]:
-        """Fetch cached game records by slugs in a single batch query."""
-        if not slugs:
+        """Fetch cached game records by slugs in bounded batch queries."""
+        clean_slugs = list(dict.fromkeys(slug for slug in slugs if slug))
+        if not clean_slugs:
             return {}
-        placeholders = ",".join("?" for _ in slugs)
-        query = f"SELECT slug, title, cover_url, release_year, community_rating FROM cached_games WHERE slug IN ({placeholders});"
-        rows = await self._fetchall(query, slugs)
-        return {row["slug"]: row for row in rows}
+        result: dict[str, Any] = {}
+        for chunk in _iter_sql_chunks(clean_slugs):
+            placeholders = ",".join("?" for _ in chunk)
+            query = (
+                "SELECT slug, title, cover_url, release_year, community_rating "
+                f"FROM cached_games WHERE slug IN ({placeholders});"
+            )
+            for row in await self._fetchall(query, chunk):
+                result[row["slug"]] = row
+        return result
 
     # =========================================================================
     # Server Leaderboards & Statistics
     # =========================================================================
 
-    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
-        """Get top games by average rating among distinct linked profiles."""
+    async def _get_guild_linked_profile_keys(self, guild_member_ids: List[int]) -> List[str]:
         if not guild_member_ids:
             return []
-        placeholders = ",".join("?" for _ in guild_member_ids)
-        query = f"""
-            SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   AVG(r.rating) as avg_rating,
-                   COUNT(r.rating) as rating_count
-            FROM profile_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.rating IS NOT NULL
-            GROUP BY g.slug
-            HAVING rating_count >= ?
-            ORDER BY avg_rating DESC, rating_count DESC
-            LIMIT ?;
-        """
-        params = list(guild_member_ids) + [min_ratings, limit]
-        return await self._fetchall(query, params)
+        profiles = await self.get_guild_linked_profiles(guild_member_ids)
+        return [row["profile_key"] for row in profiles]
+
+    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
+        """Get top games by average rating among distinct linked profiles."""
+        if not guild_member_ids or limit <= 0:
+            return []
+        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
+        if not profile_keys:
+            return []
+        aggregates: dict[str, dict[str, Any]] = {}
+        for chunk in _iter_sql_chunks(profile_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT g.slug, g.title, g.cover_url, g.release_year,
+                       SUM(r.rating) AS rating_sum,
+                       COUNT(r.rating) AS rating_count
+                FROM profile_ratings r
+                JOIN cached_games g ON r.game_slug = g.slug
+                WHERE r.profile_key IN ({placeholders}) AND r.rating IS NOT NULL
+                GROUP BY g.slug;
+            """
+            for row in await self._fetchall(query, chunk):
+                entry = aggregates.setdefault(
+                    row["slug"],
+                    {
+                        "slug": row["slug"],
+                        "title": row["title"],
+                        "cover_url": row["cover_url"],
+                        "release_year": row["release_year"],
+                        "rating_sum": 0.0,
+                        "rating_count": 0,
+                    },
+                )
+                entry["rating_sum"] += float(row["rating_sum"] or 0.0)
+                entry["rating_count"] += int(row["rating_count"] or 0)
+        results = []
+        for entry in aggregates.values():
+            count = entry["rating_count"]
+            if count >= min_ratings and count > 0:
+                results.append({
+                    "slug": entry["slug"],
+                    "title": entry["title"],
+                    "cover_url": entry["cover_url"],
+                    "release_year": entry["release_year"],
+                    "avg_rating": entry["rating_sum"] / count,
+                    "rating_count": count,
+                })
+        results.sort(key=lambda row: (-row["avg_rating"], -row["rating_count"], row["slug"]))
+        return results[:limit]
 
     async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
         """Get most completed games by distinct linked profiles."""
-        if not guild_member_ids:
+        if not guild_member_ids or limit <= 0:
             return []
-        placeholders = ",".join("?" for _ in guild_member_ids)
-        query = f"""
-            SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   COUNT(r.profile_key) as play_count,
-                   AVG(r.rating) as avg_rating
-            FROM profile_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.status = 'played'
-            GROUP BY g.slug
-            ORDER BY play_count DESC, avg_rating DESC
-            LIMIT ?;
-        """
-        params = list(guild_member_ids) + [limit]
-        return await self._fetchall(query, params)
+        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
+        if not profile_keys:
+            return []
+        aggregates: dict[str, dict[str, Any]] = {}
+        for chunk in _iter_sql_chunks(profile_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT g.slug, g.title, g.cover_url, g.release_year,
+                       COUNT(r.profile_key) AS play_count,
+                       SUM(r.rating) AS rating_sum,
+                       COUNT(r.rating) AS rating_count
+                FROM profile_ratings r
+                JOIN cached_games g ON r.game_slug = g.slug
+                WHERE r.profile_key IN ({placeholders}) AND r.status = 'played'
+                GROUP BY g.slug;
+            """
+            for row in await self._fetchall(query, chunk):
+                entry = aggregates.setdefault(
+                    row["slug"],
+                    {
+                        "slug": row["slug"],
+                        "title": row["title"],
+                        "cover_url": row["cover_url"],
+                        "release_year": row["release_year"],
+                        "play_count": 0,
+                        "rating_sum": 0.0,
+                        "rating_count": 0,
+                    },
+                )
+                entry["play_count"] += int(row["play_count"] or 0)
+                if row["rating_sum"] is not None:
+                    entry["rating_sum"] += float(row["rating_sum"])
+                entry["rating_count"] += int(row["rating_count"] or 0)
+        results = []
+        for entry in aggregates.values():
+            rating_count = entry["rating_count"]
+            results.append({
+                "slug": entry["slug"],
+                "title": entry["title"],
+                "cover_url": entry["cover_url"],
+                "release_year": entry["release_year"],
+                "play_count": entry["play_count"],
+                "avg_rating": (entry["rating_sum"] / rating_count) if rating_count > 0 else None,
+            })
+        results.sort(
+            key=lambda row: (
+                -row["play_count"],
+                row["avg_rating"] is None,
+                -(row["avg_rating"] if row["avg_rating"] is not None else 0.0),
+                row["slug"],
+            )
+        )
+        return results[:limit]
 
     async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
         """Get games most frequently sitting unplayed in linked profiles' backlogs."""
-        if not guild_member_ids:
+        if not guild_member_ids or limit <= 0:
             return []
-        placeholders = ",".join("?" for _ in guild_member_ids)
-        query = f"""
-            SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   COUNT(r.profile_key) as backlog_count
-            FROM profile_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.status = 'backlog'
-            GROUP BY g.slug
-            ORDER BY backlog_count DESC
-            LIMIT ?;
-        """
-        params = list(guild_member_ids) + [limit]
-        return await self._fetchall(query, params)
+        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
+        if not profile_keys:
+            return []
+        aggregates: dict[str, dict[str, Any]] = {}
+        for chunk in _iter_sql_chunks(profile_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT g.slug, g.title, g.cover_url, g.release_year,
+                       COUNT(r.profile_key) AS backlog_count
+                FROM profile_ratings r
+                JOIN cached_games g ON r.game_slug = g.slug
+                WHERE r.profile_key IN ({placeholders}) AND r.status = 'backlog'
+                GROUP BY g.slug;
+            """
+            for row in await self._fetchall(query, chunk):
+                entry = aggregates.setdefault(
+                    row["slug"],
+                    {
+                        "slug": row["slug"],
+                        "title": row["title"],
+                        "cover_url": row["cover_url"],
+                        "release_year": row["release_year"],
+                        "backlog_count": 0,
+                    },
+                )
+                entry["backlog_count"] += int(row["backlog_count"] or 0)
+        results = list(aggregates.values())
+        results.sort(key=lambda row: (-row["backlog_count"], row["slug"]))
+        return results[:limit]
 
     async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
-        """Get games with the highest rating disparity/variance among server members."""
-        if not guild_member_ids:
+        """Get games with the highest rating disparity (max - min) among distinct linked profiles."""
+        if not guild_member_ids or limit <= 0:
             return []
-        placeholders = ",".join("?" for _ in guild_member_ids)
-        query = f"""
-            SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   (MAX(r.rating) - MIN(r.rating)) as rating_delta,
-                   AVG(r.rating) as avg_rating,
-                   COUNT(r.rating) as rating_count
-            FROM profile_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.rating IS NOT NULL
-            GROUP BY g.slug
-            HAVING rating_count >= ? AND rating_delta > 0
-            ORDER BY rating_delta DESC, rating_count DESC
-            LIMIT ?;
-        """
-        params = list(guild_member_ids) + [min_ratings, limit]
-        return await self._fetchall(query, params)
+        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
+        if not profile_keys:
+            return []
+        aggregates: dict[str, dict[str, Any]] = {}
+        for chunk in _iter_sql_chunks(profile_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT g.slug, g.title, g.cover_url, g.release_year,
+                       MAX(r.rating) AS max_rating,
+                       MIN(r.rating) AS min_rating,
+                       SUM(r.rating) AS rating_sum,
+                       COUNT(r.rating) AS rating_count
+                FROM profile_ratings r
+                JOIN cached_games g ON r.game_slug = g.slug
+                WHERE r.profile_key IN ({placeholders}) AND r.rating IS NOT NULL
+                GROUP BY g.slug;
+            """
+            for row in await self._fetchall(query, chunk):
+                row_max = float(row["max_rating"])
+                row_min = float(row["min_rating"])
+                entry = aggregates.get(row["slug"])
+                if entry is None:
+                    aggregates[row["slug"]] = {
+                        "slug": row["slug"],
+                        "title": row["title"],
+                        "cover_url": row["cover_url"],
+                        "release_year": row["release_year"],
+                        "max_rating": row_max,
+                        "min_rating": row_min,
+                        "rating_sum": float(row["rating_sum"] or 0.0),
+                        "rating_count": int(row["rating_count"] or 0),
+                    }
+                else:
+                    if row_max > entry["max_rating"]:
+                        entry["max_rating"] = row_max
+                    if row_min < entry["min_rating"]:
+                        entry["min_rating"] = row_min
+                    entry["rating_sum"] += float(row["rating_sum"] or 0.0)
+                    entry["rating_count"] += int(row["rating_count"] or 0)
+        results = []
+        for entry in aggregates.values():
+            count = entry["rating_count"]
+            delta = entry["max_rating"] - entry["min_rating"]
+            if count >= min_ratings and delta > 0:
+                results.append({
+                    "slug": entry["slug"],
+                    "title": entry["title"],
+                    "cover_url": entry["cover_url"],
+                    "release_year": entry["release_year"],
+                    "rating_delta": delta,
+                    "avg_rating": entry["rating_sum"] / count,
+                    "rating_count": count,
+                })
+        results.sort(key=lambda row: (-row["rating_delta"], -row["rating_count"], row["slug"]))
+        return results[:limit]
 
     async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
-        """Get high-scoring games (>= 4.5) played by only 1 or 2 server members."""
-        if not guild_member_ids:
+        """Get high-scoring games (>= 4.5) rated by only 1 or 2 distinct linked profiles."""
+        if not guild_member_ids or limit <= 0:
             return []
-        placeholders = ",".join("?" for _ in guild_member_ids)
-        query = f"""
-            SELECT g.slug, g.title, g.cover_url, g.release_year,
-                   AVG(r.rating) as avg_rating,
-                   COUNT(r.rating) as rating_count
-            FROM profile_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.rating IS NOT NULL
-            GROUP BY g.slug
-            HAVING avg_rating >= 4.5 AND rating_count <= 2
-            ORDER BY avg_rating DESC, rating_count ASC
-            LIMIT ?;
-        """
-        params = list(guild_member_ids) + [limit]
-        return await self._fetchall(query, params)
+        profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
+        if not profile_keys:
+            return []
+        aggregates: dict[str, dict[str, Any]] = {}
+        for chunk in _iter_sql_chunks(profile_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"""
+                SELECT g.slug, g.title, g.cover_url, g.release_year,
+                       SUM(r.rating) AS rating_sum,
+                       COUNT(r.rating) AS rating_count
+                FROM profile_ratings r
+                JOIN cached_games g ON r.game_slug = g.slug
+                WHERE r.profile_key IN ({placeholders}) AND r.rating IS NOT NULL
+                GROUP BY g.slug;
+            """
+            for row in await self._fetchall(query, chunk):
+                entry = aggregates.setdefault(
+                    row["slug"],
+                    {
+                        "slug": row["slug"],
+                        "title": row["title"],
+                        "cover_url": row["cover_url"],
+                        "release_year": row["release_year"],
+                        "rating_sum": 0.0,
+                        "rating_count": 0,
+                    },
+                )
+                entry["rating_sum"] += float(row["rating_sum"] or 0.0)
+                entry["rating_count"] += int(row["rating_count"] or 0)
+        results = []
+        for entry in aggregates.values():
+            count = entry["rating_count"]
+            if 0 < count <= 2:
+                avg_rating = entry["rating_sum"] / count
+                if avg_rating >= 4.5:
+                    results.append({
+                        "slug": entry["slug"],
+                        "title": entry["title"],
+                        "cover_url": entry["cover_url"],
+                        "release_year": entry["release_year"],
+                        "avg_rating": avg_rating,
+                        "rating_count": count,
+                    })
+        results.sort(key=lambda row: (-row["avg_rating"], row["rating_count"], row["slug"]))
+        return results[:limit]
 
     async def get_server_stats(self, guild_member_ids: List[int]) -> dict:
         """Compute aggregate community metrics for a server."""
@@ -1816,55 +1856,73 @@ class Database:
                 "total_logged": 0,
                 "total_played": 0,
                 "server_avg_rating": None,
-                "top_game": None
+                "top_game": None,
             }
 
-        placeholders = ",".join("?" for _ in guild_member_ids)
+        # 1. Distinct member connections and distinct Backloggd profiles across bounded chunks.
+        linked_rows = await self.get_guild_linked_users(guild_member_ids)
+        linked_members = len(linked_rows)
+        profile_keys = sorted({row["profile_key"] for row in linked_rows if row["profile_key"]})
+        profile_count = len(profile_keys)
+        if not profile_keys:
+            return {
+                "linked_members": linked_members,
+                "profile_count": 0,
+                "total_logged": 0,
+                "total_played": 0,
+                "server_avg_rating": None,
+                "top_game": None,
+            }
 
-        # 1. Distinct member connections and distinct Backloggd profiles.
-        link_row = await self._fetchone(
-            f"""SELECT COUNT(DISTINCT discord_id) AS member_count,
-                       COUNT(DISTINCT profile_key) AS profile_count
-                FROM linked_users WHERE discord_id IN ({placeholders});""",
-            guild_member_ids
-        )
-        linked_members = link_row["member_count"] if link_row else 0
-        profile_count = link_row["profile_count"] if link_row else 0
+        # 2 & 3. Logs, Played count, rating sum/count, and top game over bounded profile chunks.
+        total_logged = 0
+        total_played = 0
+        rating_sum = 0.0
+        rating_count = 0
+        played_counts: dict[str, dict[str, Any]] = {}
 
-        # 2. Logs, Played count, and average rating
-        query_metrics = f"""
-            SELECT COUNT(*) as total_logged,
-                   SUM(CASE WHEN status = 'played' THEN 1 ELSE 0 END) as total_played,
-                   AVG(rating) as avg_rating
-            FROM profile_ratings
-            WHERE profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            );
-        """
-        row = await self._fetchone(query_metrics, guild_member_ids)
-        total_logged = (row["total_logged"] if row else 0) or 0
-        total_played = (row["total_played"] if row else 0) or 0
-        avg_rating = round(row["avg_rating"], 2) if row and row["avg_rating"] is not None else None
+        for chunk in _iter_sql_chunks(profile_keys):
+            placeholders = ",".join("?" for _ in chunk)
+            row = await self._fetchone(
+                f"""
+                SELECT COUNT(*) AS total_logged,
+                       SUM(CASE WHEN status = 'played' THEN 1 ELSE 0 END) AS total_played,
+                       SUM(rating) AS rating_sum,
+                       COUNT(rating) AS rating_count
+                FROM profile_ratings
+                WHERE profile_key IN ({placeholders});
+                """,
+                chunk,
+            )
+            if row:
+                total_logged += int(row["total_logged"] or 0)
+                total_played += int(row["total_played"] or 0)
+                if row["rating_sum"] is not None:
+                    rating_sum += float(row["rating_sum"])
+                rating_count += int(row["rating_count"] or 0)
 
-        # 3. Most popular game
-        query_top_game = f"""
-            SELECT g.title, COUNT(r.profile_key) as count
-            FROM profile_ratings r
-            JOIN cached_games g ON r.game_slug = g.slug
-            WHERE r.profile_key IN (
-                SELECT DISTINCT profile_key FROM linked_users
-                WHERE discord_id IN ({placeholders})
-            ) AND r.status = 'played'
-            GROUP BY g.slug
-            ORDER BY count DESC
-            LIMIT 1;
-        """
-        top_row = await self._fetchone(query_top_game, guild_member_ids)
-        top_game = (
-            f"{top_row['title']} ({top_row['count']} profile{'s' if top_row['count'] != 1 else ''})"
-            if top_row else None
-        )
+            top_rows = await self._fetchall(
+                f"""
+                SELECT g.slug, g.title, COUNT(r.profile_key) AS count
+                FROM profile_ratings r
+                JOIN cached_games g ON r.game_slug = g.slug
+                WHERE r.profile_key IN ({placeholders}) AND r.status = 'played'
+                GROUP BY g.slug;
+                """,
+                chunk,
+            )
+            for top_row in top_rows:
+                entry = played_counts.setdefault(
+                    top_row["slug"],
+                    {"slug": top_row["slug"], "title": top_row["title"], "count": 0},
+                )
+                entry["count"] += int(top_row["count"] or 0)
+
+        avg_rating = round(rating_sum / rating_count, 2) if rating_count > 0 else None
+        top_game = None
+        if played_counts:
+            best = min(played_counts.values(), key=lambda item: (-item["count"], item["slug"]))
+            top_game = f"{best['title']} ({best['count']} profile{'s' if best['count'] != 1 else ''})"
 
         return {
             "linked_members": linked_members,
@@ -1872,7 +1930,7 @@ class Database:
             "total_logged": total_logged,
             "total_played": total_played,
             "server_avg_rating": avg_rating,
-            "top_game": top_game
+            "top_game": top_game,
         }
 
     # =========================================================================
@@ -1913,36 +1971,14 @@ class Database:
                 (guild_id, guild_id),
             ),
         ]
-        async with self._operation_lock:
-            if self.is_turso:
-                transaction = self._client.transaction()
-                try:
-                    del_rs = await transaction.execute(
-                        "DELETE FROM guild_settings WHERE guild_id = ?;", [guild_id]
-                    )
-                    if del_rs.rows_affected > 0:
-                        for sql, args in pause_statements:
-                            await transaction.execute(sql, list(args))
-                    await transaction.commit()
-                    return del_rs.rows_affected > 0
-                except BaseException:
-                    await transaction.rollback()
-                    raise
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                async with self._conn.execute(
-                    "DELETE FROM guild_settings WHERE guild_id = ?;", (guild_id,)
-                ) as cursor:
-                    deleted = cursor.rowcount
-                if deleted > 0:
-                    for sql, args in pause_statements:
-                        await self._conn.execute(sql, args)
-                await self._conn.commit()
-                return deleted > 0
-            except BaseException:
-                await self._conn.rollback()
-                raise
+        async with self._transaction() as tx:
+            deleted = await tx.execute(
+                "DELETE FROM guild_settings WHERE guild_id = ?;", (guild_id,)
+            )
+            if deleted > 0:
+                for sql, args in pause_statements:
+                    await tx.execute(sql, args)
+            return deleted > 0
 
     async def get_feed_channel(self, guild_id: int) -> Optional[int]:
         """Get designated feed channel ID for a guild."""
@@ -1952,18 +1988,6 @@ class Database:
     async def get_all_guild_settings(self) -> List[Any]:
         """Retrieve all guilds with a configured feed channel."""
         return await self._fetchall("SELECT guild_id, feed_channel_id FROM guild_settings;")
-
-    async def is_journal_entry_seen(self, entry_id: str) -> bool:
-        """Check if a playthrough journal entry was already recorded/posted."""
-        row = await self._fetchone("SELECT 1 FROM seen_journal_logs WHERE entry_id = ?;", (entry_id,))
-        return row is not None
-
-    async def mark_journal_entry_seen(self, entry_id: str, discord_id: int) -> None:
-        """Record a journal entry as seen to prevent duplicate posts."""
-        await self._execute(
-            "INSERT OR IGNORE INTO seen_journal_logs (entry_id, discord_id) VALUES (?, ?);",
-            (entry_id, discord_id)
-        )
 
     async def is_journal_entry_delivered(
         self, guild_id: int, profile_key: str, entry_id: str
@@ -1976,58 +2000,26 @@ class Database:
         )
         return row is not None
 
-    async def mark_journal_entry_delivered(
-        self, guild_id: int, profile_key: str, entry_id: str
-    ) -> None:
-        """Record a journal entry only after its guild feed send succeeds."""
-        await self._execute(
-            """INSERT OR IGNORE INTO profile_seen_journal_deliveries
-                (guild_id, profile_key, entry_id) VALUES (?, ?, ?);""",
-            (guild_id, profile_key.strip().lower(), entry_id),
-        )
-
-    async def seed_journal_entries_for_guild(
-        self, guild_id: int, profile_key: str, entry_ids: Iterable[str]
-    ) -> None:
-        """Mark current journal entries as already present when a feed is enabled."""
-        for entry_id in set(entry_ids):
-            if entry_id:
-                await self.mark_journal_entry_delivered(guild_id, profile_key, entry_id)
-
-
     async def seed_feed_source(self, guild_id: int, profile_key: str,
                                source: str, entry_ids: Iterable[str]) -> bool:
         """Baseline a new source once, atomically; later polls deliver new IDs."""
         profile_key = profile_key.strip().lower()
-        async with self._operation_lock:
-            query = "SELECT 1 FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ? AND source = ?"
-            params = (guild_id, profile_key, source)
-            if self.is_turso:
-                result = await self._client.execute(query, list(params))
-                exists = bool(result.rows)
-            else:
-                async with self._conn.execute(query, params) as cursor:
-                    exists = await cursor.fetchone() is not None
-            if exists:
+        params = (guild_id, profile_key, source)
+        async with self._transaction() as tx:
+            existing = await tx.fetchone(
+                "SELECT 1 FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ? AND source = ?",
+                params,
+            )
+            if existing is not None:
                 return False
-            statements = [(
-                "INSERT OR IGNORE INTO profile_seen_journal_deliveries (guild_id, profile_key, entry_id) VALUES (?, ?, ?)",
-                (guild_id, profile_key, entry_id),
-            ) for entry_id in set(entry_ids) if entry_id]
-            statements.append(("INSERT OR IGNORE INTO profile_feed_sources VALUES (?, ?, ?)", params))
-            if self.is_turso:
-                await self._client.batch(statements)
-            else:
-                await self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for sql, args in statements:
-                        await self._conn.execute(sql, args)
-                    await self._conn.commit()
-                except BaseException:
-                    await self._conn.rollback()
-                    raise
+            for entry_id in set(entry_ids):
+                if entry_id:
+                    await tx.execute(
+                        "INSERT OR IGNORE INTO profile_seen_journal_deliveries (guild_id, profile_key, entry_id) VALUES (?, ?, ?)",
+                        (guild_id, profile_key, entry_id),
+                    )
+            await tx.execute("INSERT OR IGNORE INTO profile_feed_sources VALUES (?, ?, ?)", params)
             return True
-
 
     async def get_feed_messages(self, guild_id: int, profile_key: str):
         """Retain source aliases and Discord message IDs across polls/restarts."""
@@ -2062,18 +2054,7 @@ class Database:
                    (guild_id, profile_key, entry_id) VALUES (?, ?, ?)""",
                 (guild_id, profile_key, event_id),
             ))
-        async with self._operation_lock:
-            if self.is_turso:
-                await self._client.batch(statements)
-            else:
-                await self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for sql, args in statements:
-                        await self._conn.execute(sql, args)
-                    await self._conn.commit()
-                except BaseException:
-                    await self._conn.rollback()
-                    raise
+        await self._execute_batch(statements)
 
     async def store_feed_message(self, guild_id: int, profile_key: str, event_ids,
                                  payload: str, message_id=None, channel_id=None,
@@ -2104,18 +2085,7 @@ class Database:
                     INSERT OR IGNORE INTO profile_seen_journal_deliveries
                         (guild_id, profile_key, entry_id) VALUES (?, ?, ?)
                 """, (guild_id, profile_key, event_id)))
-        async with self._operation_lock:
-            if self.is_turso:
-                await self._client.batch(statements)
-            else:
-                await self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for sql, args in statements:
-                        await self._conn.execute(sql, args)
-                    await self._conn.commit()
-                except BaseException:
-                    await self._conn.rollback()
-                    raise
+        await self._execute_batch(statements)
 
     async def begin_feed_delivery(
         self, guild_id: int, profile_key: str, event_ids: Iterable[str], payload: str, channel_id: int
@@ -2125,75 +2095,55 @@ class Database:
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
         if not aliases:
             return False
-        placeholders = ",".join("?" for _ in aliases)
-        async with self._operation_lock:
-            query = f"""SELECT delivery_state FROM profile_feed_messages
-                WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})"""
-            params = [guild_id, profile_key, *aliases]
-            if self.is_turso:
-                transaction = self._client.transaction()
-                try:
-                    result = await transaction.execute(query, params)
-                    if result.rows:
-                        await transaction.commit()
-                        return False
-                    for event_id in aliases:
-                        await transaction.execute(
-                            """INSERT OR IGNORE INTO profile_feed_messages
-                               (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
-                               VALUES (?, ?, ?, ?, NULL, ?, 'pending')""",
-                            [guild_id, profile_key, event_id, payload, channel_id],
-                        )
-                    await transaction.commit()
-                    return True
-                except BaseException:
-                    await transaction.rollback()
-                    raise
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                async with self._conn.execute(query, params) as cursor:
-                    existing = await cursor.fetchone()
-                if existing:
-                    await self._conn.commit()
+        async with self._transaction() as tx:
+            for chunk in _iter_sql_chunks(aliases, fixed_params=2):
+                placeholders = ",".join("?" for _ in chunk)
+                query = f"""SELECT delivery_state FROM profile_feed_messages
+                    WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})"""
+                existing = await tx.fetchone(query, [guild_id, profile_key, *chunk])
+                if existing is not None:
                     return False
-                for event_id in aliases:
-                    await self._conn.execute(
-                        """INSERT OR IGNORE INTO profile_feed_messages
-                           (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
-                           VALUES (?, ?, ?, ?, NULL, ?, 'pending')""",
-                        (guild_id, profile_key, event_id, payload, channel_id),
-                    )
-                await self._conn.commit()
-                return True
-            except BaseException:
-                await self._conn.rollback()
-                raise
+            for event_id in aliases:
+                await tx.execute(
+                    """INSERT OR IGNORE INTO profile_feed_messages
+                       (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                       VALUES (?, ?, ?, ?, NULL, ?, 'pending')""",
+                    (guild_id, profile_key, event_id, payload, channel_id),
+                )
+            return True
 
     async def release_feed_delivery(self, guild_id: int, profile_key: str, event_ids: Iterable[str]) -> None:
         """Remove a pending intent after Discord definitively rejected a send."""
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
         if not aliases:
             return
-        placeholders = ",".join("?" for _ in aliases)
-        await self._rowcount_execute(
-            f"""DELETE FROM profile_feed_messages
-                WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
-                  AND event_id IN ({placeholders})""",
-            [guild_id, profile_key.strip().lower(), *aliases],
-        )
+        normalized_key = profile_key.strip().lower()
+        statements = []
+        for chunk in _iter_sql_chunks(aliases, fixed_params=2):
+            placeholders = ",".join("?" for _ in chunk)
+            statements.append((
+                f"""DELETE FROM profile_feed_messages
+                    WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
+                      AND event_id IN ({placeholders})""",
+                [guild_id, normalized_key, *chunk],
+            ))
+        await self._execute_batch(statements)
 
     async def mark_feed_delivery_unknown(self, guild_id: int, profile_key: str, event_ids: Iterable[str]) -> None:
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
         if not aliases:
             return
-        placeholders = ",".join("?" for _ in aliases)
-        await self._execute(
-            f"""UPDATE profile_feed_messages SET delivery_state = 'unknown'
-                WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
-                  AND event_id IN ({placeholders})""",
-            [guild_id, profile_key.strip().lower(), *aliases],
-        )
+        normalized_key = profile_key.strip().lower()
+        statements = []
+        for chunk in _iter_sql_chunks(aliases, fixed_params=2):
+            placeholders = ",".join("?" for _ in chunk)
+            statements.append((
+                f"""UPDATE profile_feed_messages SET delivery_state = 'unknown'
+                    WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
+                      AND event_id IN ({placeholders})""",
+                [guild_id, normalized_key, *chunk],
+            ))
+        await self._execute_batch(statements)
 
     async def mark_feed_message_deleted(
         self, guild_id: int, profile_key: str, event_ids: Iterable[str], payload: str
@@ -2201,12 +2151,16 @@ class Database:
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
         if not aliases:
             return
-        placeholders = ",".join("?" for _ in aliases)
-        await self._execute(
-            f"""UPDATE profile_feed_messages SET delivery_state = 'deleted', payload = ?
-                WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
-            [payload, guild_id, profile_key.strip().lower(), *aliases],
-        )
+        normalized_key = profile_key.strip().lower()
+        statements = []
+        for chunk in _iter_sql_chunks(aliases, fixed_params=3):
+            placeholders = ",".join("?" for _ in chunk)
+            statements.append((
+                f"""UPDATE profile_feed_messages SET delivery_state = 'deleted', payload = ?
+                    WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
+                [payload, guild_id, normalized_key, *chunk],
+            ))
+        await self._execute_batch(statements)
 
     async def record_profile_activity_observations(
         self,
@@ -2222,123 +2176,58 @@ class Database:
                 deduped[key] = fingerprint
         items = list(deduped.items())
 
-        async with self._operation_lock:
-            if self.is_turso:
-                transaction = self._client.transaction()
-                try:
-                    src_rs = await transaction.execute(
-                        "SELECT 1 FROM profile_activity_observation_sources WHERE profile_key = ? AND source = ?",
-                        [normalized_key, source],
-                    )
-                    initialized = not bool(src_rs.rows)
-                    if initialized:
-                        await transaction.execute(
-                            """INSERT OR IGNORE INTO profile_activity_observation_sources
-                               (profile_key, source) VALUES (?, ?)""",
-                            [normalized_key, source],
-                        )
-                    existing_map: dict[str, str] = {}
-                    for start in range(0, len(items), 800):
-                        chunk_keys = [key for key, _ in items[start:start + 800]]
-                        if not chunk_keys:
-                            continue
-                        placeholders = ",".join("?" for _ in chunk_keys)
-                        rows_rs = await transaction.execute(
-                            f"""SELECT observation_key, fingerprint
-                                FROM profile_activity_observations
-                                WHERE profile_key = ? AND source = ? AND observation_key IN ({placeholders})""",
-                            [normalized_key, source, *chunk_keys],
-                        )
-                        for row in rows_rs.rows:
-                            existing_map[row["observation_key"]] = row["fingerprint"]
-                    new_count = 0
-                    updated_count = 0
-                    for key, fingerprint in items:
-                        prev = existing_map.get(key)
-                        if prev is None:
-                            new_count += 1
-                            await transaction.execute(
-                                """INSERT INTO profile_activity_observations
-                                   (profile_key, source, observation_key, fingerprint, observed_at)
-                                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                                [normalized_key, source, key, fingerprint],
-                            )
-                        elif prev != fingerprint:
-                            updated_count += 1
-                            await transaction.execute(
-                                """UPDATE profile_activity_observations
-                                   SET fingerprint = ?, observed_at = CURRENT_TIMESTAMP
-                                   WHERE profile_key = ? AND source = ? AND observation_key = ?""",
-                                [fingerprint, normalized_key, source, key],
-                            )
-                    await transaction.commit()
-                    return {
-                        "initialized": initialized,
-                        "new": new_count,
-                        "updated": updated_count,
-                        "changed": new_count + updated_count,
-                    }
-                except BaseException:
-                    await transaction.rollback()
-                    raise
-
-            await self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                async with self._conn.execute(
+        async with self._transaction() as tx:
+            initialized = (
+                await tx.fetchone(
                     "SELECT 1 FROM profile_activity_observation_sources WHERE profile_key = ? AND source = ?",
                     (normalized_key, source),
-                ) as cursor:
-                    initialized = await cursor.fetchone() is None
-                if initialized:
-                    await self._conn.execute(
-                        """INSERT OR IGNORE INTO profile_activity_observation_sources
-                           (profile_key, source) VALUES (?, ?)""",
-                        (normalized_key, source),
+                )
+                is None
+            )
+            if initialized:
+                await tx.execute(
+                    """INSERT OR IGNORE INTO profile_activity_observation_sources
+                       (profile_key, source) VALUES (?, ?)""",
+                    (normalized_key, source),
+                )
+            existing_map: dict[str, str] = {}
+            for chunk in _iter_sql_chunks(items, fixed_params=2):
+                chunk_keys = [key for key, _ in chunk]
+                placeholders = ",".join("?" for _ in chunk_keys)
+                rows = await tx.fetchall(
+                    f"""SELECT observation_key, fingerprint
+                        FROM profile_activity_observations
+                        WHERE profile_key = ? AND source = ? AND observation_key IN ({placeholders})""",
+                    [normalized_key, source, *chunk_keys],
+                )
+                for row in rows:
+                    existing_map[row["observation_key"]] = row["fingerprint"]
+            new_count = 0
+            updated_count = 0
+            for key, fingerprint in items:
+                prev = existing_map.get(key)
+                if prev is None:
+                    new_count += 1
+                    await tx.execute(
+                        """INSERT INTO profile_activity_observations
+                           (profile_key, source, observation_key, fingerprint, observed_at)
+                           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                        (normalized_key, source, key, fingerprint),
                     )
-                existing_map = {}
-                for start in range(0, len(items), 800):
-                    chunk_keys = [key for key, _ in items[start:start + 800]]
-                    if not chunk_keys:
-                        continue
-                    placeholders = ",".join("?" for _ in chunk_keys)
-                    async with self._conn.execute(
-                        f"""SELECT observation_key, fingerprint
-                            FROM profile_activity_observations
-                            WHERE profile_key = ? AND source = ? AND observation_key IN ({placeholders})""",
-                        [normalized_key, source, *chunk_keys],
-                    ) as cursor:
-                        for row in await cursor.fetchall():
-                            existing_map[row["observation_key"]] = row["fingerprint"]
-                new_count = 0
-                updated_count = 0
-                for key, fingerprint in items:
-                    prev = existing_map.get(key)
-                    if prev is None:
-                        new_count += 1
-                        await self._conn.execute(
-                            """INSERT INTO profile_activity_observations
-                               (profile_key, source, observation_key, fingerprint, observed_at)
-                               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                            (normalized_key, source, key, fingerprint),
-                        )
-                    elif prev != fingerprint:
-                        updated_count += 1
-                        await self._conn.execute(
-                            """UPDATE profile_activity_observations
-                               SET fingerprint = ?, observed_at = CURRENT_TIMESTAMP
-                               WHERE profile_key = ? AND source = ? AND observation_key = ?""",
-                            (fingerprint, normalized_key, source, key),
-                        )
-                await self._conn.commit()
-                return {
-                    "initialized": initialized,
-                    "new": new_count,
-                    "updated": updated_count,
-                    "changed": new_count + updated_count,
-                }
-            except BaseException:
-                await self._conn.rollback()
-                raise
+                elif prev != fingerprint:
+                    updated_count += 1
+                    await tx.execute(
+                        """UPDATE profile_activity_observations
+                           SET fingerprint = ?, observed_at = CURRENT_TIMESTAMP
+                           WHERE profile_key = ? AND source = ? AND observation_key = ?""",
+                        (fingerprint, normalized_key, source, key),
+                    )
+            return {
+                "initialized": initialized,
+                "new": new_count,
+                "updated": updated_count,
+                "changed": new_count + updated_count,
+            }
 
     async def set_profile_refresh_pending(self, profile_key: str, token: str) -> None:
         """Persist a pending library refresh token that survives cooldown skips and restarts."""

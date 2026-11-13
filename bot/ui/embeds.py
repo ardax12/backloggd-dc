@@ -12,6 +12,7 @@ from bot.config import (
     COLOR_MUTED,
     COLOR_ERROR
 )
+from bot.input_validation import escape_display_text
 from bot.ui.helpers import (
     rating_to_stars,
     format_number,
@@ -86,7 +87,7 @@ def create_game_embed(
         server_lines = []
         display_limit = 12  # Display up to 12 profiles cleanly
         for r in server_ratings[:display_limit]:
-            username = r["backloggd_username"]
+            username = escape_display_text(r["backloggd_username"])
             raw_status = str(r["status"]).lower().strip()
             if r["rating"] is not None:
                 stars = rating_to_stars(r["rating"])
@@ -293,6 +294,8 @@ def create_compare_embed(
         verdict = "⚡ Polar Opposites"
         color = COLOR_ERROR
 
+    safe_u1 = escape_display_text(user1)
+    safe_u2 = escape_display_text(user2)
     embed = discord.Embed(
         title=f"⚔️ Taste Duel: {user1} vs {user2}"[:256],
         description=f"## {score_pct}% Taste Match\n**{verdict}**",
@@ -303,7 +306,7 @@ def create_compare_embed(
     if shared_loves:
         lines = []
         for g in shared_loves[:5]:
-            lines.append(f"• **{g['title']}** ({user1}: `{g['r1']:.1f}` | {user2}: `{g['r2']:.1f}`)")
+            lines.append(f"• **{escape_display_text(g['title'])}** ({safe_u1}: `{g['r1']:.1f}` | {safe_u2}: `{g['r2']:.1f}`)")
         embed.add_field(name="❤️ Shared Loves (Both Rated 4.0+)", value="\n".join(lines)[:1024], inline=False)
     else:
         embed.add_field(name="❤️ Shared Loves", value="*No shared 4.0+ ratings found.*", inline=False)
@@ -312,7 +315,7 @@ def create_compare_embed(
     if disagreements:
         lines = []
         for g in disagreements[:5]:
-            lines.append(f"• **{g['title']}** ({user1}: `{g['r1']:.1f}` vs {user2}: `{g['r2']:.1f}` — `Δ {g['delta']:.1f}`)")
+            lines.append(f"• **{escape_display_text(g['title'])}** ({safe_u1}: `{g['r1']:.1f}` vs {safe_u2}: `{g['r2']:.1f}` — `Δ {g['delta']:.1f}`)")
         embed.add_field(name="⚡ Biggest Disagreements", value="\n".join(lines)[:1024], inline=False)
 
     if freshness_note:
@@ -434,7 +437,11 @@ def create_server_stats_embed(
         color=COLOR_PRIMARY
     )
 
-    avg_str = f"⭐ **{stats['server_avg_rating']:.2f}** / 5.0" if stats.get("server_avg_rating") else "*N/A*"
+    avg_str = (
+        f"⭐ **{stats['server_avg_rating']:.2f}** / 5.0"
+        if stats.get("server_avg_rating") is not None
+        else "*N/A*"
+    )
     top_game = stats.get("top_game") or "*N/A*"
 
     embed.add_field(name="👥 Linked Members", value=f"**{stats['linked_members']}** members", inline=True)
@@ -491,9 +498,11 @@ def create_taste_twins_embed(
         medals = ["🥇", "🥈", "🥉"]
         for i, t in enumerate(twins[:3]):
             medal = medals[i] if i < len(medals) else f"**#{i+1}**"
-            fav_text = f" — *Loved: {t['top_fav']}*" if t.get("top_fav") else ""
+            fav_text = f" — *Loved: {escape_display_text(str(t['top_fav']))}*" if t.get("top_fav") else ""
+            safe_twin = escape_display_text(str(t["username"]))
+            twin_url = build_backloggd_user_url(t["username"])
             twin_lines.append(
-                f"{medal} **[{t['username']}](https://www.backloggd.com/u/{t['username']}/)** "
+                f"{medal} **[{safe_twin}]({twin_url})** "
                 f"(`{t['match_pct']}%` match, {t['shared_count']} shared){fav_text}"
             )
         embed.add_field(name="✨ Top Taste Soulmates", value="\n".join(twin_lines)[:1024], inline=False)
@@ -506,9 +515,15 @@ def create_taste_twins_embed(
 
     # 2. Taste Nemesis
     if nemesis:
-        nem_fav = f" — *Divergence on: {nemesis['top_disagree']}* (`Δ {nemesis['delta']:.1f}`)" if nemesis.get("top_disagree") else ""
+        nem_fav = (
+            f" — *Divergence on: {escape_display_text(str(nemesis['top_disagree']))}* (`Δ {nemesis['delta']:.1f}`)"
+            if nemesis.get("top_disagree")
+            else ""
+        )
+        safe_nem = escape_display_text(str(nemesis["username"]))
+        nem_url = build_backloggd_user_url(nemesis["username"])
         nem_line = (
-            f"⚡ **[{nemesis['username']}](https://www.backloggd.com/u/{nemesis['username']}/)** "
+            f"⚡ **[{safe_nem}]({nem_url})** "
             f"(`{nemesis['match_pct']}%` match, {nemesis['shared_count']} shared){nem_fav}"
         )
         embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=nem_line[:1024], inline=False)
@@ -546,18 +561,20 @@ def create_all_ratings_embed(
 
     lines = []
     for r in slice_ratings:
-        username = r["backloggd_username"]
+        raw_username = r["backloggd_username"]
+        safe_username = escape_display_text(raw_username)
+        user_url = build_backloggd_user_url(raw_username)
         raw_status = str(r["status"]).lower().strip()
         if r["rating"] is not None:
             stars = rating_to_stars(r["rating"])
             if raw_status in ("unknown", "played", "none", ""):
-                lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {stars} (`{r['rating']:.1f}`)")
+                lines.append(f"• **[{safe_username}]({user_url})**: {stars} (`{r['rating']:.1f}`)")
             else:
                 status_str = format_status(r["status"])
-                lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {stars} (`{r['rating']:.1f}`) — {status_str}")
+                lines.append(f"• **[{safe_username}]({user_url})**: {stars} (`{r['rating']:.1f}`) — {status_str}")
         else:
             status_str = format_status(r["status"])
-            lines.append(f"• **[{username}](https://www.backloggd.com/u/{username}/)**: {status_str}")
+            lines.append(f"• **[{safe_username}]({user_url})**: {status_str}")
 
     # Split at profile boundaries rather than cutting off ratings mid-line.
     chunk = ""

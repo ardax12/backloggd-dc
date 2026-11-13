@@ -1,11 +1,15 @@
 """Custom Discord Bot Client with lifecycle hooks and Backloggd integration."""
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import logging
+from pathlib import Path
 from backloggd import BackloggdClient
+from bot.command_errors import handle_app_command_error
 from bot.db import Database
 from bot.config import DATABASE_PATH, DEV_GUILD_ID
+from bot.services.guild_membership import GuildMembershipService
 from bot.services.library_sync import LibrarySyncService
 
 logger = logging.getLogger("backloggd.bot")
@@ -14,7 +18,7 @@ class BackloggdBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True          # Required for server-specific member queries
-        intents.message_content = True  # Required for link unfurling and chat helpers
+        intents.message_content = False  # Slash commands only; message content is unused
 
         super().__init__(
             command_prefix="!",
@@ -23,8 +27,21 @@ class BackloggdBot(commands.Bot):
         )
 
         self.db = Database(DATABASE_PATH)
-        self.backloggd = BackloggdClient(request_delay=1.0, profile_ttl=3600)
+        self.backloggd = BackloggdClient(
+            request_delay=1.0,
+            profile_ttl=3600,
+            cache_path=Path(DATABASE_PATH).parent / 'sdk-cache' / 'backloggd_cache.db',
+        )
         self.library_sync = LibrarySyncService(max_workers=2)
+        self.guild_membership = GuildMembershipService()
+        self.tree.error(self.on_app_command_error)
+
+    async def on_app_command_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        await handle_app_command_error(interaction, error, log=logger)
 
     async def setup_hook(self) -> None:
         """Called automatically before bot logs into Discord."""
@@ -71,6 +88,7 @@ class BackloggdBot(commands.Bot):
         if feed_cog and hasattr(feed_cog, "journal_feed_loop") and feed_cog.journal_feed_loop.is_running():
             feed_cog.journal_feed_loop.cancel()
 
+        await self.guild_membership.close()
         await self.library_sync.close()
         await self.backloggd.close()
         await self.db.close()

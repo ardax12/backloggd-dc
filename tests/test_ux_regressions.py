@@ -243,7 +243,20 @@ class GameSearchUxTests(unittest.IsolatedAsyncioTestCase):
 
         choices = await cog.game_autocomplete(SimpleNamespace(), "one")
 
-        self.assertEqual(cog._autocomplete_slugs[choices[0].value], "one")
+        self.assertEqual(choices[0].value, "slug:one")
+        fresh_cog = GamesCog(SimpleNamespace(
+            backloggd=SimpleNamespace(search_games=AsyncMock(), get_game=AsyncMock(return_value=None)),
+            db=SimpleNamespace(),
+        ))
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            guild=None,
+            user=SimpleNamespace(id=1),
+        )
+        await GamesCog.game.callback(fresh_cog, interaction, choices[0].value)
+        fresh_cog.bot.backloggd.search_games.assert_not_awaited()
+        fresh_cog.bot.backloggd.get_game.assert_awaited_once_with("one")
 
     async def test_ambiguous_free_text_search_asks_user_to_choose(self):
         games = [

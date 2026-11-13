@@ -1,8 +1,11 @@
 """Interactive Discord UI Views and Buttons for Backloggd Bot."""
 
+import logging
 import discord
 from discord.ui import View, Button
 from typing import Optional, Callable, Coroutine, Any
+
+logger = logging.getLogger("backloggd.ui.views")
 
 class LinkButtonView(View):
     """View with URL button(s) linking to Backloggd."""
@@ -27,8 +30,8 @@ class ExpiringView(View):
         if self.message:
             try:
                 await self.message.edit(view=self)
-            except discord.NotFound:
-                pass
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.debug("Ignoring expected Discord error during expired view cleanup", exc_info=True)
 
 
 class RouletteView(ExpiringView):

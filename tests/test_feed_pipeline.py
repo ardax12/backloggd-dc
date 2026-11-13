@@ -827,7 +827,7 @@ class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(results, [True, True])
-        links = await self.db.get_all_linked_users()
+        links = await self.db.get_guild_linked_users([10, 11])
         self.assertEqual(len(links), 2)
         self.assertEqual({row["profile_key"] for row in links}, {"millers"})
 
@@ -841,7 +841,7 @@ class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await self.db.get_linked_user(10))
         self.assertEqual((await self.db.get_linked_user(11))["profile_key"], "millers")
-        self.assertEqual(await self.db.get_user_ratings_dict(11), {"hades": 4.5})
+        self.assertEqual(await self.db.get_profile_ratings_dict("millers"), {"hades": 4.5})
 
     async def test_shared_sync_can_finish_after_its_requesting_member_unlinks(self):
         await self.db.link_user(10, "Millers")
@@ -853,7 +853,7 @@ class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         self.assertTrue(stored)
-        self.assertEqual(await self.db.get_user_ratings_dict(11), {"hades": 4.5})
+        self.assertEqual(await self.db.get_profile_ratings_dict("millers"), {"hades": 4.5})
 
     async def test_stale_sync_cannot_write_into_a_relinked_profile(self):
         await self.db.link_user(10, "OldProfile")
@@ -864,7 +864,7 @@ class LinkedUsernameTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         self.assertFalse(stored)
-        self.assertEqual(await self.db.get_user_ratings_dict(10), {})
+        self.assertEqual(await self.db.get_profile_ratings_dict("NewProfile"), {})
         self.assertEqual(await self.db.get_profile_ratings_dict("OldProfile"), {})
 
     async def test_profile_sync_info_reports_shared_snapshot_freshness_and_size(self):

@@ -8,6 +8,10 @@ from discord.ext import commands
 import logging
 from typing import List, Literal, Optional
 from bot.ui.embeds import create_server_top_embed, create_server_stats_embed
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
+)
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -81,7 +85,10 @@ class StatsCog(commands.Cog, name="Stats"):
             await interaction.followup.send("❌ This command must be run inside a Discord server.", ephemeral=True)
             return
 
-        guild_member_ids = [m.id for m in interaction.guild.members]
+        guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
+        if guild_member_ids is None:
+            await interaction.followup.send(GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, ephemeral=True)
+            return
         guild_name = interaction.guild.name
         freshness_note = await self._server_freshness_note(guild_member_ids)
 
@@ -132,7 +139,10 @@ class StatsCog(commands.Cog, name="Stats"):
             await interaction.followup.send("❌ This command must be run inside a Discord server.", ephemeral=True)
             return
 
-        guild_member_ids = [m.id for m in interaction.guild.members]
+        guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
+        if guild_member_ids is None:
+            await interaction.followup.send(GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, ephemeral=True)
+            return
         freshness_note = await self._server_freshness_note(guild_member_ids)
         stats = await self.bot.db.get_server_stats(guild_member_ids)
         # Cached library rows include wishlist/backlog entries and can have

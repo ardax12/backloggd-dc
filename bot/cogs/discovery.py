@@ -12,10 +12,15 @@ from bot.ui.embeds import create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url, rating_to_stars
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
+from bot.input_validation import escape_display_text
 from bot.recommendation_rules import (
     excluded_recommendation_slugs,
     has_uncertain_library_exclusion,
     numeric_ratings,
+)
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
 )
 from bot.services.freshness import (
     ensure_profiles_fresh,
@@ -56,7 +61,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
     # =========================================================================
 
     @app_commands.command(name="roulette", description="Pick an unrated game from your Backlog or Wishlist")
-    @app_commands.describe(user="Optional: Backloggd user or mention (defaults to you)")
+    @app_commands.describe(user="Optional: Server member to spin the roulette for (defaults to you)")
     async def roulette(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
         await interaction.response.defer()
 
@@ -64,10 +69,15 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         linked = await self.bot.db.get_linked_user(target_discord_id)
 
         if not linked:
-            who = user.display_name if user else "You"
+            if user:
+                safe_name = escape_display_text(user.display_name)
+                msg = f"❌ **{safe_name}** does not have a linked Backloggd account yet."
+            else:
+                msg = "❌ You do not have a linked Backloggd account! Use `/link <username>` first."
             await interaction.followup.send(
-                f"❌ {who} do not have a linked Backloggd account! Use `/link <username>` first.",
-                ephemeral=True
+                msg,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
@@ -321,7 +331,15 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
             return
 
-        guild_member_ids = [m.id for m in interaction.guild.members if m.id != caller_discord_id]
+        guild_member_ids = await resolve_guild_member_ids(
+            self.bot, interaction.guild, exclude_member_id=caller_discord_id
+        )
+        if guild_member_ids is None:
+            await interaction.followup.send(
+                GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+                ephemeral=True,
+            )
+            return
         other_linked = await self.bot.db.get_guild_linked_profiles(
             guild_member_ids, exclude_profile_key=caller_key
         )

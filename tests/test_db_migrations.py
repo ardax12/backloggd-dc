@@ -154,7 +154,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT discord_id, game_slug FROM user_ratings WHERE game_slug = 'shared-game' ORDER BY discord_id"
             )
             self.assertEqual([row["discord_id"] for row in compatibility_rows], [10, 20])
-            self.assertEqual(await db.get_user_stats(10), {
+            self.assertEqual(await db.get_profile_stats("millers"), {
                 "total_games": 2, "rated_count": 2, "average_rating": 4.25
             })
 
@@ -217,7 +217,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
         retry = Database(str(self.path), turso_url="")
         await retry.connect()
         try:
-            self.assertEqual(await retry.get_user_ratings_dict(10), {
+            self.assertEqual(await retry.get_profile_ratings_dict("millers"), {
                 "new-game": 4.0, "shared-game": 4.5
             })
             version = await retry._fetchone("SELECT MAX(version) AS version FROM schema_migrations")

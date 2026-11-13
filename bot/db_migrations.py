@@ -359,82 +359,27 @@ async def run_migrations(database) -> None:
         )
     """)
 
-    async with database._operation_lock:
-        if database.is_turso:
-            transaction = database._client.transaction()
-
-            async def execute(query: str, params: tuple | list = ()):
-                return await transaction.execute(query, list(params))
-
-            async def fetchone(query: str, params: tuple | list = ()):
-                result = await transaction.execute(query, list(params))
-                return result.rows[0] if result.rows else None
-
-            try:
-                row = await fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-                version = row["version"] if row and row["version"] is not None else 0
-                if version < 1:
-                    await _migrate_profile_schema(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (1)")
-                if version < 2:
-                    await _migrate_profile_feed_schema(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (2)")
-                if version < 3:
-                    await _migrate_guild_feed_preferences(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (3)")
-                if version < 4:
-                    await _migrate_guild_admin_follows(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (4)")
-                if version < 5:
-                    await _migrate_feed_event_decisions(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (5)")
-                if version < 6:
-                    await _migrate_profile_feed_source_health(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (6)")
-                if version < 7:
-                    await _migrate_profile_sync_and_observations(execute, fetchone)
-                    await execute("INSERT INTO schema_migrations (version) VALUES (7)")
-                await transaction.commit()
-            except BaseException:
-                await transaction.rollback()
-                raise
-            return
-
-        connection = database._conn
-        await connection.execute("BEGIN IMMEDIATE")
-
-        async def execute(query: str, params: tuple | list = ()):
-            return await connection.execute(query, params)
-
-        async def fetchone(query: str, params: tuple | list = ()):
-            async with connection.execute(query, params) as cursor:
-                return await cursor.fetchone()
-
-        try:
-            row = await fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-            version = row["version"] if row and row["version"] is not None else 0
-            if version < 1:
-                await _migrate_profile_schema(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (1)")
-            if version < 2:
-                await _migrate_profile_feed_schema(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (2)")
-            if version < 3:
-                await _migrate_guild_feed_preferences(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (3)")
-            if version < 4:
-                await _migrate_guild_admin_follows(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (4)")
-            if version < 5:
-                await _migrate_feed_event_decisions(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (5)")
-            if version < 6:
-                await _migrate_profile_feed_source_health(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (6)")
-            if version < 7:
-                await _migrate_profile_sync_and_observations(execute, fetchone)
-                await execute("INSERT INTO schema_migrations (version) VALUES (7)")
-            await connection.commit()
-        except BaseException:
-            await connection.rollback()
-            raise
+    async with database._transaction() as tx:
+        row = await tx.fetchone("SELECT MAX(version) AS version FROM schema_migrations")
+        version = row["version"] if row and row["version"] is not None else 0
+        if version < 1:
+            await _migrate_profile_schema(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (1)")
+        if version < 2:
+            await _migrate_profile_feed_schema(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (2)")
+        if version < 3:
+            await _migrate_guild_feed_preferences(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (3)")
+        if version < 4:
+            await _migrate_guild_admin_follows(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (4)")
+        if version < 5:
+            await _migrate_feed_event_decisions(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (5)")
+        if version < 6:
+            await _migrate_profile_feed_source_health(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (6)")
+        if version < 7:
+            await _migrate_profile_sync_and_observations(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (7)")

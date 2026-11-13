@@ -1,5 +1,6 @@
 """SocialCog: Handles /compare taste duel and similarity between users."""
 
+import asyncio
 from datetime import datetime, timezone
 import discord
 from discord import app_commands
@@ -7,10 +8,21 @@ from discord.ext import commands
 import logging
 from typing import Optional, Dict
 from backloggd.analytics import calculate_similarity_raw
+from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
+from bot.input_validation import (
+    InvalidUsernameError,
+    escape_display_text,
+    normalize_backloggd_username,
+    parse_discord_member_id,
+)
 from bot.ui.embeds import create_compare_embed, create_taste_twins_embed
 from bot.ui.views import LinkButtonView, TasteTwinsView
 from bot.ui.helpers import build_backloggd_user_url
 from bot.recommendation_rules import numeric_ratings
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
+)
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -20,10 +32,29 @@ from bot.services.freshness import (
 
 logger = logging.getLogger("backloggd.cogs.social")
 
+
+class _ProfileNotFoundSignal(Exception):
+    def __init__(self, username: str):
+        super().__init__(username)
+        self.username = username
+
+
 class SocialCog(commands.Cog, name="Social"):
-    def __init__(self, bot, *, clock=None):
+    def __init__(
+        self,
+        bot,
+        *,
+        clock=None,
+        live_fetch_concurrency: int = 2,
+        live_fetch_timeout: float = 25.0,
+    ):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.live_fetch_concurrency = max(1, int(live_fetch_concurrency))
+        self.live_fetch_timeout = float(live_fetch_timeout)
+        self._live_library_semaphore = asyncio.Semaphore(self.live_fetch_concurrency)
+        self._live_library_tasks: Dict[str, asyncio.Task] = {}
+        self._live_library_waiters: Dict[str, int] = {}
 
     async def _resolve_username(self, interaction: discord.Interaction, target: Optional[str]) -> Optional[str]:
         """Resolve a parameter into a Backloggd username (supports Discord mention or username)."""
@@ -31,12 +62,12 @@ class SocialCog(commands.Cog, name="Social"):
             linked = await self.bot.db.get_linked_user(interaction.user.id)
             return linked["backloggd_username"] if linked else None
 
-        clean = target.strip().lstrip("<@!").rstrip(">")
-        if clean.isdigit():
-            linked = await self.bot.db.get_linked_user(int(clean))
+        member_id = parse_discord_member_id(target)
+        if member_id is not None:
+            linked = await self.bot.db.get_linked_user(member_id)
             return linked["backloggd_username"] if linked else None
 
-        return clean.lstrip("@")
+        return normalize_backloggd_username(target)
 
     async def _is_subscribed(self, username: str) -> bool:
         checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
@@ -50,25 +81,58 @@ class SocialCog(commands.Cog, name="Social"):
 
     @staticmethod
     def _fetching_message(username: str, status) -> str:
+        safe_name = escape_display_text(username)
         if status is not None and status.failed_last and not status.refreshing:
             return (
-                f"⏳ **{username}**'s cached library data is not available yet because the last background refresh failed. "
+                f"⏳ **{safe_name}**'s cached library data is not available yet because the last background refresh failed. "
                 "The bot will retry automatically, or you can run `/refresh`."
             )
         return (
-            f"⏳ **{username}**'s cached library data is currently being fetched in the background. "
+            f"⏳ **{safe_name}**'s cached library data is currently being fetched in the background. "
             "Try again shortly or use `/refresh`."
         )
 
+    async def _fetch_live_library_ratings(self, username: str) -> Dict[str, Optional[float]]:
+        async with self._live_library_semaphore:
+            lib = await self.bot.backloggd.get_user_library(username)
+        return lib.to_ratings_dict()
+
     async def _get_or_fetch_ratings(self, username: str) -> Dict[str, Optional[float]]:
-        """Fetch user's library ratings mapping (slug -> score)."""
+        """Fetch user's library ratings mapping (slug -> score), coalescing live fetches."""
         profile = await self.bot.db.get_profile_sync_info(username)
         if profile and profile["last_synced_at"] is not None:
             return await self.bot.db.get_profile_ratings_dict(username)
 
-        # Otherwise fetch library via backloggd-py
-        lib = await self.bot.backloggd.get_user_library(username)
-        return lib.to_ratings_dict()
+        profile_key = username.strip().lower()
+        task = self._live_library_tasks.get(profile_key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._fetch_live_library_ratings(username))
+            self._live_library_tasks[profile_key] = task
+
+            def _cleanup_live_task(completed: asyncio.Task, key: str = profile_key) -> None:
+                if self._live_library_tasks.get(key) is completed:
+                    self._live_library_tasks.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(_cleanup_live_task)
+
+        self._live_library_waiters[profile_key] = self._live_library_waiters.get(profile_key, 0) + 1
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self.live_fetch_timeout,
+            )
+        finally:
+            remaining = self._live_library_waiters.get(profile_key, 1) - 1
+            if remaining <= 0:
+                self._live_library_waiters.pop(profile_key, None)
+                if self._live_library_tasks.get(profile_key) is task:
+                    self._live_library_tasks.pop(profile_key, None)
+                if not task.done():
+                    task.cancel()
+            else:
+                self._live_library_waiters[profile_key] = remaining
 
     @app_commands.command(name="compare", description="Compare video game tastes and ratings between two Backloggd users")
     @app_commands.describe(
@@ -84,36 +148,48 @@ class SocialCog(commands.Cog, name="Social"):
         await interaction.response.defer()
 
         # Target resolution
-        if user2 is None:
-            # user1 is target, user2 is caller
-            u1_name = await self._resolve_username(interaction, user1)
-            u2_name = await self._resolve_username(interaction, None)
-            if not u2_name:
-                await interaction.followup.send(
-                    "❌ You haven't linked your Backloggd account yet! Use `/link <username>` or specify two users: `/compare <user1> <user2>`.",
-                    ephemeral=True
-                )
-                return
-        else:
-            u1_name = await self._resolve_username(interaction, user1)
-            u2_name = await self._resolve_username(interaction, user2)
+        try:
+            if user2 is None:
+                # user1 is target, user2 is caller
+                u1_name = await self._resolve_username(interaction, user1)
+                u2_name = await self._resolve_username(interaction, None)
+                if not u2_name:
+                    await interaction.followup.send(
+                        "❌ You haven't linked your Backloggd account yet! Use `/link <username>` or specify two users: `/compare <user1> <user2>`.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+            else:
+                u1_name = await self._resolve_username(interaction, user1)
+                u2_name = await self._resolve_username(interaction, user2)
+        except InvalidUsernameError as err:
+            await interaction.followup.send(
+                f"❌ {err}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
 
         if not u1_name or not u2_name:
             await interaction.followup.send(
                 "❌ Could not resolve one or both users. Please check usernames or mentions.",
-                ephemeral=True
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
         if u1_name.lower() == u2_name.lower():
             await interaction.followup.send(
                 "ℹ️ Both inputs resolve to the same Backloggd profile, so there is no separate profile to compare.",
-                ephemeral=True
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
+        safe_u1 = escape_display_text(u1_name)
+        safe_u2 = escape_display_text(u2_name)
         try:
-            import asyncio
             now = self.clock()
             statuses = await ensure_profiles_fresh(
                 self.bot,
@@ -129,36 +205,56 @@ class SocialCog(commands.Cog, name="Social"):
             )
 
             async def _load_ratings(name: str, subscribed: bool, status):
-                if subscribed and status is not None and status.missing and getattr(self.bot, "library_sync", None) is not None:
-                    return await self.bot.db.get_profile_ratings_dict(name)
-                return await self._get_or_fetch_ratings(name)
+                try:
+                    if subscribed and status is not None and status.missing and getattr(self.bot, "library_sync", None) is not None:
+                        return await self.bot.db.get_profile_ratings_dict(name)
+                    return await self._get_or_fetch_ratings(name)
+                except (UserNotFoundError, ResourceNotFoundError) as exc:
+                    raise _ProfileNotFoundSignal(name) from exc
 
-            ratings1, ratings2 = await asyncio.gather(
+            loaded = await asyncio.gather(
                 _load_ratings(u1_name, sub1, s1),
                 _load_ratings(u2_name, sub2, s2),
+                return_exceptions=True,
             )
+            for item in loaded:
+                if isinstance(item, BaseException):
+                    if isinstance(item, asyncio.CancelledError):
+                        raise item
+                    raise item
+            ratings1, ratings2 = loaded
 
             if not ratings1 or not ratings2:
                 if not ratings1 and sub1 and s1 is not None and s1.missing:
-                    await interaction.followup.send(self._fetching_message(u1_name, s1), ephemeral=True)
+                    await interaction.followup.send(
+                        self._fetching_message(u1_name, s1),
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                     return
                 if not ratings2 and sub2 and s2 is not None and s2.missing:
-                    await interaction.followup.send(self._fetching_message(u2_name, s2), ephemeral=True)
+                    await interaction.followup.send(
+                        self._fetching_message(u2_name, s2),
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                     return
-                empty_user = u1_name if not ratings1 else u2_name
+                empty_user = safe_u1 if not ratings1 else safe_u2
                 await interaction.followup.send(
                     f"❌ **{empty_user}** does not have any logged games in their library to compare.",
-                    ephemeral=True
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
             rated1 = numeric_ratings(ratings1)
             rated2 = numeric_ratings(ratings2)
             if not rated1 or not rated2:
-                unrated_user = u1_name if not rated1 else u2_name
+                unrated_user = safe_u1 if not rated1 else safe_u2
                 await interaction.followup.send(
                     f"ℹ️ **{unrated_user}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
                     ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
@@ -167,6 +263,7 @@ class SocialCog(commands.Cog, name="Social"):
                 await interaction.followup.send(
                     "ℹ️ These profiles have no shared numeric ratings to compare yet.",
                     ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
@@ -194,8 +291,8 @@ class SocialCog(commands.Cog, name="Social"):
             shared_loves.sort(key=lambda x: x["avg"], reverse=True)
             disagreements.sort(key=lambda x: x["delta"], reverse=True)
 
-            line1 = format_profile_freshness_line(s1, label=f"**{u1_name}**", unlinked_live=not sub1)
-            line2 = format_profile_freshness_line(s2, label=f"**{u2_name}**", unlinked_live=not sub2)
+            line1 = format_profile_freshness_line(s1, label=f"**{safe_u1}**", unlinked_live=not sub1)
+            line2 = format_profile_freshness_line(s2, label=f"**{safe_u2}**", unlinked_live=not sub2)
             freshness_note = "\n".join(line for line in (line1, line2) if line) or None
 
             embed = create_compare_embed(
@@ -210,11 +307,26 @@ class SocialCog(commands.Cog, name="Social"):
 
             await interaction.followup.send(embed=embed, view=view)
 
+        except _ProfileNotFoundSignal as missing:
+            await interaction.followup.send(
+                f"❌ Backloggd user **{escape_display_text(missing.username)}** could not be found.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "⏳ Fetching Backloggd library data timed out. Please try again shortly.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error("Error comparing %s and %s: %s", u1_name, u2_name, e, exc_info=True)
             await interaction.followup.send(
-                f"❌ An error occurred while comparing **{u1_name}** and **{u2_name}**.",
-                ephemeral=True
+                f"❌ An error occurred while comparing **{safe_u1}** and **{safe_u2}**.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
 
 
@@ -246,20 +358,29 @@ class SocialCog(commands.Cog, name="Social"):
         target_avatar = None
 
         if user:
-            clean_arg = user.strip().lstrip("<@!").rstrip(">")
-            if clean_arg.isdigit():
-                target_discord_id = int(clean_arg)
+            member_id = parse_discord_member_id(user)
+            if member_id is not None:
+                target_discord_id = member_id
                 linked = await self.bot.db.get_linked_user(target_discord_id)
                 if not linked:
                     await interaction.followup.send(
                         "❌ That user has not linked their Backloggd account yet.",
-                        ephemeral=True
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                     return
                 target_username = linked["backloggd_username"]
                 target_avatar = linked["avatar_url"]
             else:
-                clean_name = user.strip().lstrip("@")
+                try:
+                    clean_name = normalize_backloggd_username(user)
+                except InvalidUsernameError as err:
+                    await interaction.followup.send(
+                        f"❌ {err}",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
                 profile = await self.bot.db.get_profile(clean_name)
                 if profile:
                     target_username = profile["display_username"]
@@ -273,12 +394,14 @@ class SocialCog(commands.Cog, name="Social"):
             if not linked:
                 await interaction.followup.send(
                     "❌ You haven't linked your Backloggd account yet! Use `/link <username>` first.",
-                    ephemeral=True
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
             target_username = linked["backloggd_username"]
             target_avatar = linked["avatar_url"]
 
+        safe_target = escape_display_text(target_username)
         try:
             now = self.clock()
             target_key = target_username.lower()
@@ -302,24 +425,35 @@ class SocialCog(commands.Cog, name="Social"):
                     await interaction.followup.send(
                         self._fetching_message(target_username, target_status),
                         ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                 else:
                     await interaction.followup.send(
-                        f"❌ **{target_username}** does not have any cached ratings yet. Use `/refresh` to sync your library.",
-                        ephemeral=True
+                        f"❌ **{safe_target}** does not have any cached ratings yet. Use `/refresh` to sync your library.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
                     )
                 return
 
             my_numeric_ratings = numeric_ratings(my_ratings)
             if not my_numeric_ratings:
                 await interaction.followup.send(
-                    f"ℹ️ **{target_username}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
+                    f"ℹ️ **{safe_target}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
                     ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
             # 3. Fetch distinct candidate profiles in this guild, excluding every link to the target.
-            guild_member_ids = [m.id for m in interaction.guild.members if m.id != target_discord_id]
+            guild_member_ids = await resolve_guild_member_ids(
+                self.bot, interaction.guild, exclude_member_id=target_discord_id
+            )
+            if guild_member_ids is None:
+                await interaction.followup.send(
+                    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+                    ephemeral=True,
+                )
+                return
             other_linked = await self.bot.db.get_guild_linked_profiles(
                 guild_member_ids, exclude_profile_key=target_key
             )
@@ -462,8 +596,8 @@ class SocialCog(commands.Cog, name="Social"):
 
                 c_loves.sort(key=lambda x: x["avg"], reverse=True)
                 c_dis.sort(key=lambda x: x["delta"], reverse=True)
-                l1 = format_profile_freshness_line(target_status, label=f"**{target_username}**", unlinked_live=not target_subscribed)
-                l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{top_twin_name}**")
+                l1 = format_profile_freshness_line(target_status, label=f"**{safe_target}**", unlinked_live=not target_subscribed)
+                l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{escape_display_text(top_twin_name)}**")
                 duel_freshness = "\n".join(line for line in (l1, l2) if line) or None
                 comp_embed = create_compare_embed(
                     user1=target_username,
@@ -479,7 +613,7 @@ class SocialCog(commands.Cog, name="Social"):
             contributing = ([target_status] if (target_subscribed and target_status is not None) else []) + list(other_statuses.values())
             freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
             if not target_subscribed and freshness_note:
-                freshness_note = f"{target_username}: Fetched live · {freshness_note}"
+                freshness_note = f"{safe_target}: Fetched live · {freshness_note}"
 
             embed = create_taste_twins_embed(
                 username=target_username,
@@ -498,11 +632,26 @@ class SocialCog(commands.Cog, name="Social"):
 
             view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
 
+        except (UserNotFoundError, ResourceNotFoundError):
+            await interaction.followup.send(
+                f"❌ Backloggd user **{safe_target}** could not be found.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "⏳ Fetching Backloggd library data timed out. Please try again shortly.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error("Error running taste-twins for %s: %s", target_username, e, exc_info=True)
             await interaction.followup.send(
-                f"❌ An error occurred while computing taste twins for **{target_username}**.",
-                ephemeral=True
+                f"❌ An error occurred while computing taste twins for **{safe_target}**.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
 
 async def setup(bot):

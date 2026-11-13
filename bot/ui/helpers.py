@@ -1,6 +1,7 @@
 """Formatting helpers for stars, status badges, numbers, and Backloggd URLs."""
 
 from typing import Any, Optional
+import urllib.parse
 
 def rating_to_stars(rating: Optional[float], max_stars: int = 5) -> str:
     """
@@ -69,11 +70,19 @@ def format_status(status: str) -> str:
 
 def build_backloggd_game_url(slug: str) -> str:
     """Return full URL to game page on Backloggd."""
-    return f"https://www.backloggd.com/games/{slug}/"
+    encoded = urllib.parse.quote(str(slug).strip(), safe="")
+    return f"https://www.backloggd.com/games/{encoded}/"
 
 def build_backloggd_user_url(username: str) -> str:
     """Return full URL to user profile on Backloggd."""
-    return f"https://www.backloggd.com/u/{username}/"
+    encoded = urllib.parse.quote(str(username).strip().lstrip("@"), safe="")
+    return f"https://www.backloggd.com/u/{encoded}/"
+
+def build_backloggd_review_url(username: str, review_id: Any) -> str:
+    """Return full URL to a user's review on Backloggd."""
+    encoded_user = urllib.parse.quote(str(username).strip().lstrip("@"), safe="")
+    encoded_id = urllib.parse.quote(str(review_id).strip(), safe="")
+    return f"https://backloggd.com/u/{encoded_user}/review/{encoded_id}/"
 
 DEFAULT_BACKLOGGD_AVATAR = "https://backloggd.b-cdn.net/no_avatar.jpg"
 

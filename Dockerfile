@@ -7,20 +7,21 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install system dependencies if needed
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install locked Python dependencies using prebuilt wheels (no compiler required)
+COPY requirements.lock .
+RUN pip install --no-cache-dir --no-deps --only-binary=:all: -r requirements.lock \
+    && groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
 # Copy project files
 COPY . .
 
-# Ensure data directory exists for SQLite
-RUN mkdir -p data
+# Ensure default SQLite storage directory is writable by non-root runtime user
+RUN mkdir -p /app/data \
+    && chown 10001:10001 /app/data
+
+# Drop root privileges
+USER app
 
 # Run bot
 CMD ["python", "main.py"]

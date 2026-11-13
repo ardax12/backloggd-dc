@@ -6,7 +6,8 @@ import sys
 import unittest
 from pathlib import Path
 import tempfile
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Verification must never connect to the configured production database.
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
@@ -171,16 +172,16 @@ class VerificationSuite:
         assert stats["total_logged"] == 7
         assert stats["total_played"] == 6
 
-        # Test journal feed deduplication
-        assert not await self.db.is_journal_entry_seen("log_abc_123")
-        await self.db.mark_journal_entry_seen("log_abc_123", 1001)
-        assert await self.db.is_journal_entry_seen("log_abc_123")
+        # Test journal feed deduplication via profile-keyed feed sources
+        assert not await self.db.is_journal_entry_delivered(1, "nox", "log_abc_123")
+        assert await self.db.seed_feed_source(1, "nox", "journal", ["log_abc_123"])
+        assert await self.db.is_journal_entry_delivered(1, "nox", "log_abc_123")
 
-        # Test batch ratings lookup (N+1 optimization)
-        batch_ratings = await self.db.get_multi_user_ratings_dict([1001, 1002, 1003])
-        assert 1001 in batch_ratings and "elden-ring" in batch_ratings[1001]
-        assert batch_ratings[1001]["elden-ring"] == 5.0
-        assert batch_ratings[1002]["hollow-knight"] == 2.0
+        # Test batch profile ratings lookup (N+1 optimization)
+        batch_ratings = await self.db.get_multi_profile_ratings_dict(["nox", "kaelen", "vesper"])
+        assert "nox" in batch_ratings and "elden-ring" in batch_ratings["nox"]
+        assert batch_ratings["nox"]["elden-ring"] == 5.0
+        assert batch_ratings["kaelen"]["hollow-knight"] == 2.0
 
         # Test batch game metadata lookup
         games_batch = await self.db.get_games_by_slugs(["elden-ring", "chrono-trigger"])
@@ -296,19 +297,30 @@ class VerificationSuite:
         cogs = list(bot.cogs.keys())
         expected_cogs = ['Account', 'Games', 'Users', 'Social', 'Discovery', 'Stats', 'Feed']
         assert all(c in cogs for c in expected_cogs), f"Missing cogs! Got: {cogs}"
-        # Verify GamesCog autocomplete pruning
+        # Verify GamesCog autocomplete bounded eviction & choice survival
         games_cog = bot.get_cog("Games")
         assert games_cog is not None
+        with patch.object(
+            bot.backloggd,
+            "search_games",
+            new=AsyncMock(return_value=[
+                SimpleNamespace(title="Zelda", release_year=1998, slug="zelda-oot"),
+                SimpleNamespace(title="Long", release_year=2024, slug="long-" + ("x" * 100)),
+            ]),
+        ):
+            zelda_choices = await games_cog.game_autocomplete(MagicMock(), "zelda")
+        assert zelda_choices[0].value == "slug:zelda-oot"
+        fallback_token = zelda_choices[1].value
+        assert fallback_token.startswith("slugref:")
         for i in range(505):
             games_cog._autocomplete_cache[f"query_{i}"] = []
-        assert len(games_cog._autocomplete_cache) == 505
-        # Simulate interaction
-        from unittest.mock import MagicMock
+        assert len(games_cog._autocomplete_cache) == 506
         mock_interaction = MagicMock()
         with patch.object(bot.backloggd, "search_games", new=AsyncMock(return_value=[])):
-            await games_cog.game_autocomplete(mock_interaction, "zelda")
-        assert len(games_cog._autocomplete_cache) <= 2, f"Cache not pruned: {len(games_cog._autocomplete_cache)}"
-        print("✅ Games autocomplete cache pruning verified successfully!")
+            await games_cog.game_autocomplete(mock_interaction, "metroid")
+        assert len(games_cog._autocomplete_cache) <= 500, f"Cache not pruned: {len(games_cog._autocomplete_cache)}"
+        assert fallback_token in games_cog._autocomplete_slugs, "Query eviction must not clear fallback tokens"
+        print("✅ Games autocomplete bounded cache and choice survival verified successfully!")
 
         # Verify SocialCog commands
         social_cog = bot.get_cog("Social")
