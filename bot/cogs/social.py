@@ -23,6 +23,12 @@ from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
+from bot.command_errors import (
+    defer_interaction,
+    handle_component_error,
+    send_private_followup,
+    send_public_followup,
+)
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -172,7 +178,7 @@ class SocialCog(commands.Cog, name="Social"):
         user1: str,
         user2: Optional[str] = None
     ):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         # Target resolution
         try:
@@ -181,36 +187,32 @@ class SocialCog(commands.Cog, name="Social"):
                 u1_name = await self._resolve_username(interaction, user1)
                 u2_name = await self._resolve_username(interaction, None)
                 if not u2_name:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         "❌ You haven't linked your Backloggd account yet! Use `/link <username>` or specify two users: `/compare <user1> <user2>`.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
             else:
                 u1_name = await self._resolve_username(interaction, user1)
                 u2_name = await self._resolve_username(interaction, user2)
         except InvalidUsernameError as err:
-            await interaction.followup.send(
-                f"❌ {err}",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await send_private_followup(interaction, f"❌ {err}", log=logger)
             return
 
         if not u1_name or not u2_name:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "❌ Could not resolve one or both users. Please check usernames or mentions.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
 
         if u1_name.lower() == u2_name.lower():
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "ℹ️ Both inputs resolve to the same Backloggd profile, so there is no separate profile to compare.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
 
@@ -253,24 +255,24 @@ class SocialCog(commands.Cog, name="Social"):
 
             if not ratings1 or not ratings2:
                 if not ratings1 and sub1 and s1 is not None and s1.missing:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         format_fetching_library_message(u1_name, s1),
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
                 if not ratings2 and sub2 and s2 is not None and s2.missing:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         format_fetching_library_message(u2_name, s2),
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
                 empty_user = safe_u1 if not ratings1 else safe_u2
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"❌ **{empty_user}** does not have any logged games in their library to compare.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
@@ -278,19 +280,19 @@ class SocialCog(commands.Cog, name="Social"):
             rated2 = numeric_ratings(ratings2)
             if not rated1 or not rated2:
                 unrated_user = safe_u1 if not rated1 else safe_u2
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"ℹ️ **{unrated_user}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
             shared_rated_slugs = set(rated1) & set(rated2)
             if not shared_rated_slugs:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "ℹ️ These profiles have no shared numeric ratings to compare yet.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
@@ -332,28 +334,28 @@ class SocialCog(commands.Cog, name="Social"):
             )
             view = LinkButtonView(label=f"View {u1_name}'s Profile", url=build_backloggd_user_url(u1_name))
 
-            await interaction.followup.send(embed=embed, view=view)
+            await send_public_followup(interaction, embed=embed, view=view)
 
         except _ProfileNotFoundSignal as missing:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ Backloggd user **{escape_display_text(missing.username)}** could not be found.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
         except asyncio.TimeoutError:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "⏳ Fetching Backloggd library data timed out. Please try again shortly.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error("Error comparing %s and %s: %s", u1_name, u2_name, e, exc_info=True)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ An error occurred while comparing **{safe_u1}** and **{safe_u2}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
 
 
@@ -373,10 +375,14 @@ class SocialCog(commands.Cog, name="Social"):
         interaction: discord.Interaction,
         user: Optional[str] = None
     ):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         if not interaction.guild:
-            await interaction.followup.send("❌ This command must be run inside a Discord server.", ephemeral=True)
+            await send_private_followup(
+                interaction,
+                "❌ This command must be run inside a Discord server.",
+                log=logger,
+            )
             return
 
         # 1. Target resolution
@@ -390,10 +396,10 @@ class SocialCog(commands.Cog, name="Social"):
                 target_discord_id = member_id
                 linked = await self.bot.db.get_linked_user(target_discord_id)
                 if not linked:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         "❌ That user has not linked their Backloggd account yet.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
                 target_username = linked["backloggd_username"]
@@ -402,11 +408,7 @@ class SocialCog(commands.Cog, name="Social"):
                 try:
                     clean_name = normalize_backloggd_username(user)
                 except InvalidUsernameError as err:
-                    await interaction.followup.send(
-                        f"❌ {err}",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                    await send_private_followup(interaction, f"❌ {err}", log=logger)
                     return
                 profile = await self.bot.db.get_profile(clean_name)
                 if profile:
@@ -419,10 +421,10 @@ class SocialCog(commands.Cog, name="Social"):
             target_discord_id = interaction.user.id
             linked = await self.bot.db.get_linked_user(target_discord_id)
             if not linked:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "❌ You haven't linked your Backloggd account yet! Use `/link <username>` first.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
             target_username = linked["backloggd_username"]
@@ -449,25 +451,25 @@ class SocialCog(commands.Cog, name="Social"):
 
             if not my_ratings:
                 if target_subscribed and target_status is not None and target_status.missing:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         format_fetching_library_message(target_username, target_status),
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                 else:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         f"❌ **{safe_target}** does not have any cached ratings yet. Use `/refresh` to sync your library.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                 return
 
             my_numeric_ratings = numeric_ratings(my_ratings)
             if not my_numeric_ratings:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"ℹ️ **{safe_target}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
@@ -476,9 +478,10 @@ class SocialCog(commands.Cog, name="Social"):
                 self.bot, interaction.guild, exclude_member_id=target_discord_id
             )
             if guild_member_ids is None:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-                    ephemeral=True,
+                    log=logger,
                 )
                 return
             other_linked = await self.bot.db.get_guild_linked_profiles(
@@ -486,9 +489,10 @@ class SocialCog(commands.Cog, name="Social"):
             )
 
             if not other_linked:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "ℹ️ No other distinct Backloggd profiles are linked in this server yet. Invite members to use `/link`.",
-                    ephemeral=True
+                    log=logger,
                 )
                 return
 
@@ -561,9 +565,10 @@ class SocialCog(commands.Cog, name="Social"):
                     reason = "No other profile shares at least two numeric ratings with this profile."
                 else:
                     reason = "Other profiles need at least five numeric ratings before we can compare taste."
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"ℹ️ {reason} Unrated backlog and wishlist entries do not count toward similarity.",
-                    ephemeral=True
+                    log=logger,
                 )
                 return
 
@@ -595,47 +600,62 @@ class SocialCog(commands.Cog, name="Social"):
             # Interactive duel callback
             async def on_compare(btn_interaction: discord.Interaction):
                 if btn_interaction.user.id != interaction.user.id:
-                    await btn_interaction.response.send_message(
+                    await send_private_followup(
+                        btn_interaction,
                         "❌ Only the member who initiated `/taste-twins` can duel with their twin!",
-                        ephemeral=True
+                        log=logger,
                     )
                     return
-                await btn_interaction.response.defer()
-                t1_ratings = my_numeric_ratings
-                t2_key = twins[0]["profile_key"]
-                t2_ratings = numeric_ratings(all_other_ratings.get(t2_key, {}))
-                final_s, _, _ = calculate_similarity_raw(my_numeric_ratings, t2_ratings)
-                c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
-                c_loves = []
-                c_dis = []
-                for s in c_slugs:
-                    r1 = my_numeric_ratings.get(s)
-                    r2 = t2_ratings.get(s)
-                    if r1 is None or r2 is None:
-                        continue
-                    d = abs(r1 - r2)
-                    meta_lookup = cached_meta.get(s)
-                    t_title = meta_lookup["title"] if meta_lookup and meta_lookup["title"] else s.replace("-", " ").title()
-                    if r1 >= 4.0 and r2 >= 4.0:
-                        c_loves.append({"title": t_title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
-                    if d >= 1.0:
-                        c_dis.append({"title": t_title, "r1": r1, "r2": r2, "delta": d})
+                try:
+                    await defer_interaction(btn_interaction)
+                    t1_ratings = my_numeric_ratings
+                    t2_key = twins[0]["profile_key"]
+                    t2_ratings = numeric_ratings(all_other_ratings.get(t2_key, {}))
+                    final_s, _, _ = calculate_similarity_raw(my_numeric_ratings, t2_ratings)
+                    c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
+                    c_loves = []
+                    c_dis = []
+                    for s in c_slugs:
+                        r1 = my_numeric_ratings.get(s)
+                        r2 = t2_ratings.get(s)
+                        if r1 is None or r2 is None:
+                            continue
+                        d = abs(r1 - r2)
+                        meta_lookup = cached_meta.get(s)
+                        t_title = meta_lookup["title"] if meta_lookup and meta_lookup["title"] else s.replace("-", " ").title()
+                        if r1 >= 4.0 and r2 >= 4.0:
+                            c_loves.append({"title": t_title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
+                        if d >= 1.0:
+                            c_dis.append({"title": t_title, "r1": r1, "r2": r2, "delta": d})
 
-                c_loves.sort(key=lambda x: x["avg"], reverse=True)
-                c_dis.sort(key=lambda x: x["delta"], reverse=True)
-                l1 = format_profile_freshness_line(target_status, label=f"**{safe_target}**", unlinked_live=not target_subscribed)
-                l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{escape_display_text(top_twin_name)}**")
-                duel_freshness = "\n".join(line for line in (l1, l2) if line) or None
-                comp_embed = create_compare_embed(
-                    user1=target_username,
-                    user2=top_twin_name,
-                    match_score=final_s / 100.0,
-                    shared_loves=c_loves,
-                    disagreements=c_dis,
-                    freshness_note=duel_freshness,
-                )
-                comp_view = LinkButtonView(label=f"View {top_twin_name}'s Profile", url=build_backloggd_user_url(top_twin_name))
-                await btn_interaction.followup.send(embed=comp_embed, view=comp_view)
+                    c_loves.sort(key=lambda x: x["avg"], reverse=True)
+                    c_dis.sort(key=lambda x: x["delta"], reverse=True)
+                    l1 = format_profile_freshness_line(target_status, label=f"**{safe_target}**", unlinked_live=not target_subscribed)
+                    l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{escape_display_text(top_twin_name)}**")
+                    duel_freshness = "\n".join(line for line in (l1, l2) if line) or None
+                    comp_embed = create_compare_embed(
+                        user1=target_username,
+                        user2=top_twin_name,
+                        match_score=final_s / 100.0,
+                        shared_loves=c_loves,
+                        disagreements=c_dis,
+                        freshness_note=duel_freshness,
+                    )
+                    comp_view = LinkButtonView(label=f"View {top_twin_name}'s Profile", url=build_backloggd_user_url(top_twin_name))
+                    await send_public_followup(btn_interaction, embed=comp_embed, view=comp_view)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    await handle_component_error(
+                        btn_interaction,
+                        error,
+                        component_name="taste-twins duel",
+                        user_message=(
+                            f"❌ Could not complete the duel between **{safe_target}** and "
+                            f"**{escape_display_text(top_twin_name)}**. Please try again later."
+                        ),
+                        log=logger,
+                    )
 
             contributing = ([target_status] if (target_subscribed and target_status is not None) else []) + list(other_statuses.values())
             freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
@@ -657,28 +677,28 @@ class SocialCog(commands.Cog, name="Social"):
                 on_compare=on_compare if top_twin_name else None
             )
 
-            view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
+            view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
         except (UserNotFoundError, ResourceNotFoundError):
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ Backloggd user **{safe_target}** could not be found.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
         except asyncio.TimeoutError:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "⏳ Fetching Backloggd library data timed out. Please try again shortly.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error("Error running taste-twins for %s: %s", target_username, e, exc_info=True)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ An error occurred while computing taste twins for **{safe_target}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
 
 async def setup(bot):

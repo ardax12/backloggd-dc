@@ -4,6 +4,7 @@ import logging
 import discord
 from discord.ui import View, Button
 from typing import Optional, Callable, Coroutine, Any
+from bot.ui.helpers import truncate_button_label
 
 logger = logging.getLogger("backloggd.ui.views")
 
@@ -11,10 +12,12 @@ class LinkButtonView(View):
     """View with URL button(s) linking to Backloggd."""
     def __init__(self, label: str, url: str, extra_buttons: Optional[list[tuple[str, str]]] = None):
         super().__init__(timeout=None)
-        self.add_item(Button(label=label, url=url, style=discord.ButtonStyle.link))
+        self.add_item(Button(label=truncate_button_label(label), url=url, style=discord.ButtonStyle.link))
         if extra_buttons:
             for extra_label, extra_url in extra_buttons:
-                self.add_item(Button(label=extra_label, url=extra_url, style=discord.ButtonStyle.link))
+                self.add_item(
+                    Button(label=truncate_button_label(extra_label), url=extra_url, style=discord.ButtonStyle.link)
+                )
 
 class ExpiringView(View):
     """Disable expired controls on the message that owns this view."""
@@ -74,7 +77,7 @@ class TasteTwinsView(ExpiringView):
         self.add_item(Button(label="View Profile on Backloggd", url=user_url, style=discord.ButtonStyle.link))
         if top_twin_name and on_compare:
             compare_btn = Button(
-                label=f"Duel with {top_twin_name}",
+                label=truncate_button_label(f"Duel with {top_twin_name}"),
                 emoji="⚔️",
                 style=discord.ButtonStyle.primary
             )
@@ -94,7 +97,7 @@ class GameCardView(ExpiringView):
         self.add_item(Button(label="View on Backloggd", url=game_url, style=discord.ButtonStyle.link))
         if total_ratings > 12 and on_view_all:
             view_all_btn = Button(
-                label=f"View All Ratings ({total_ratings})",
+                label=truncate_button_label(f"View All Ratings ({total_ratings})"),
                 emoji="👥",
                 style=discord.ButtonStyle.secondary
             )

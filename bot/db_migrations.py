@@ -350,6 +350,20 @@ async def _migrate_profile_sync_and_observations(execute: Execute, fetchone: Fet
     """, ())
 
 
+async def _migrate_feed_source_reconciliation(execute: Execute, fetchone: FetchOne) -> None:
+    """Persist uncertain source-removal reconciliation state across restarts."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_profile_feed_reconciliation (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            had_admin_source BOOLEAN NOT NULL DEFAULT 0,
+            candidate_member_ids TEXT NOT NULL DEFAULT '[]',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, profile_key)
+        )
+    """, ())
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -383,3 +397,6 @@ async def run_migrations(database) -> None:
         if version < 7:
             await _migrate_profile_sync_and_observations(tx.execute, tx.fetchone)
             await tx.execute("INSERT INTO schema_migrations (version) VALUES (7)")
+        if version < 8:
+            await _migrate_feed_source_reconciliation(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (8)")

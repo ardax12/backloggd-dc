@@ -12,6 +12,7 @@ from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.services.freshness import resolve_guild_aggregate_freshness
 
 logger = logging.getLogger("backloggd.cogs.stats")
@@ -131,15 +132,15 @@ class StatsCog(commands.Cog, name="Stats"):
         interaction: discord.Interaction,
         mode: LeaderboardMode = "Highest Rated"
     ):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         if not interaction.guild:
-            await interaction.followup.send("❌ This command must be run inside a Discord server.", ephemeral=True)
+            await send_private_followup(interaction, "❌ This command must be run inside a Discord server.", log=logger)
             return
 
         guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
         if guild_member_ids is None:
-            await interaction.followup.send(GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, ephemeral=True)
+            await send_private_followup(interaction, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, log=logger)
             return
         guild_name = interaction.guild.name
         context = await self._resolve_stats_context(guild_member_ids)
@@ -209,19 +210,19 @@ class StatsCog(commands.Cog, name="Stats"):
             freshness_note=freshness_note,
         )
 
-        await interaction.followup.send(embed=embed)
+        await send_public_followup(interaction, embed=embed)
 
     @app_commands.command(name="server-stats", description="View gaming community statistics for this Discord server")
     async def server_stats(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         if not interaction.guild:
-            await interaction.followup.send("❌ This command must be run inside a Discord server.", ephemeral=True)
+            await send_private_followup(interaction, "❌ This command must be run inside a Discord server.", log=logger)
             return
 
         guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
         if guild_member_ids is None:
-            await interaction.followup.send(GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, ephemeral=True)
+            await send_private_followup(interaction, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, log=logger)
             return
         context = await self._resolve_stats_context(guild_member_ids)
         freshness_note = await resolve_guild_aggregate_freshness(
@@ -253,7 +254,7 @@ class StatsCog(commands.Cog, name="Stats"):
             guild_name=interaction.guild.name,
             freshness_note=freshness_note,
         )
-        await interaction.followup.send(embed=embed)
+        await send_public_followup(interaction, embed=embed)
 
 async def setup(bot):
     await bot.add_cog(StatsCog(bot))

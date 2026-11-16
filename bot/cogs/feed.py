@@ -21,7 +21,12 @@ from bot.feed_rules import (
     merge_ratings_and_reviews,
 )
 from bot.feed_policy import classify_feed_event, parse_utc_datetime
-from bot.command_errors import mark_interaction_error_handled, send_ephemeral_error
+from bot.command_errors import (
+    defer_interaction,
+    mark_interaction_error_handled,
+    send_ephemeral_error,
+    send_private_followup,
+)
 from bot.input_validation import (
     InvalidUsernameError,
     escape_display_text,
@@ -815,9 +820,18 @@ class FeedCog(commands.Cog, name="Feed"):
             await interaction.response.send_message("❌ Choose a text channel in a server to set up the activity feed.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
 
-        permissions = channel.permissions_for(interaction.guild.me)
+        me = getattr(interaction.guild, "me", None)
+        if me is None:
+            await send_private_followup(
+                interaction,
+                "❌ I could not verify my permissions in that channel right now because Discord's member cache is unavailable. Please try `/setchannel` again shortly.",
+                log=logger,
+            )
+            return
+
+        permissions = channel.permissions_for(me)
         missing = [
             name for attribute, name in (
                 ("view_channel", "View Channel"),
@@ -827,9 +841,10 @@ class FeedCog(commands.Cog, name="Feed"):
             if not getattr(permissions, attribute, False)
         ]
         if missing:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "❌ I need **" + "**, **".join(missing) + "** permission in that channel before I can post activity.",
-                ephemeral=True,
+                log=logger,
             )
             return
 
@@ -844,6 +859,7 @@ class FeedCog(commands.Cog, name="Feed"):
                 interaction.guild_id,
                 [row["profile_key"] for row in linked_profiles],
                 now=self.clock(),
+                present_member_ids=member_ids,
             )
             note = (
                 "Each active profile source will initialize on its first successful poll and "
@@ -856,9 +872,10 @@ class FeedCog(commands.Cog, name="Feed"):
                 "so only future activity is announced) once a complete member snapshot is available."
             )
 
-        await interaction.followup.send(
+        await send_private_followup(
+            interaction,
             f"✅ Set {channel.mention} as the Backloggd activity feed channel. {note}",
-            ephemeral=True,
+            log=logger,
         )
 
     @app_commands.command(name="unsetchannel", description="Disable the automatic Backloggd activity feed for this server")
@@ -885,12 +902,13 @@ class FeedCog(commands.Cog, name="Feed"):
         if interaction.guild is None:
             await interaction.response.send_message("Use `/feed on` in each server where you want activity announcements.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
         linked = await self.bot.db.get_linked_user(interaction.user.id)
         if not linked:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "Link your Backloggd profile with `/link` first. This command does not ask for or change your username.",
-                ephemeral=True,
+                log=logger,
             )
             return
         await self.bot.db.set_guild_feed_preference(interaction.guild_id, interaction.user.id, True)
@@ -900,62 +918,58 @@ class FeedCog(commands.Cog, name="Feed"):
             message += " The feed is pending until an admin runs `/setchannel`."
         else:
             message += " Existing history will be skipped when the profile is first checked."
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await send_private_followup(interaction, message, log=logger)
 
     @feed.command(name="off", description="Stop your linked profile from participating in this server's feed")
     async def feed_off(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
         linked = await self.bot.db.get_linked_user(interaction.user.id)
         if not linked:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "You do not have a linked Backloggd profile. Your server preference is unchanged.",
-                ephemeral=True,
+                log=logger,
             )
             return
-        await self.bot.db.set_guild_feed_preference(interaction.guild_id, interaction.user.id, False)
         member_ids = await self._authoritative_member_ids(interaction.guild)
-        remaining = (
-            await self.bot.db.get_guild_profile_member_sources(
-                interaction.guild_id, linked["profile_key"], member_ids
-            ) if member_ids is not None else []
+        result = await self.bot.db.disable_guild_feed_preference_and_reconcile(
+            interaction.guild_id,
+            interaction.user.id,
+            member_ids=member_ids,
         )
-        admin_remaining = await self.bot.db.has_guild_admin_follow(
-            interaction.guild_id, linked["profile_key"]
-        )
-        if member_ids is not None:
-            await self.bot.db.reconcile_guild_feed_activity(
-                interaction.guild_id,
-                [row["profile_key"] for row in await self.bot.db.get_guild_feed_candidates(
-                    interaction.guild_id, member_ids
-                )],
-                now=self.clock(),
+        if result is None:
+            await send_private_followup(
+                interaction,
+                "You do not have a linked Backloggd profile. Your server preference is unchanged.",
+                log=logger,
             )
-        if member_ids is None:
-            message = "Your opt-out is saved. I could not verify whether another current member keeps this profile active."
-        elif remaining or admin_remaining:
-            message = "Your participation is off, but this profile remains in this server's feed through another linked member."
-            if admin_remaining and not remaining:
-                message = "Your participation is off, but this profile remains in this server's feed through an admin follow."
-        else:
+            return
+        if result["deactivated"]:
             message = "Your participation is off. Existing announcements stay archived. Use `/feed on` or `/link` in this server to participate again."
-        await interaction.followup.send(message, ephemeral=True)
+        elif result["pending_reconciliation"]:
+            message = "Your opt-out is saved. I could not verify whether another current member keeps this profile active."
+        elif result["has_admin"] and not result["remaining_members"]:
+            message = "Your participation is off, but this profile remains in this server's feed through an admin follow."
+        else:
+            message = "Your participation is off, but this profile remains in this server's feed through another linked member."
+        await send_private_followup(interaction, message, log=logger)
 
     @feed.command(name="status", description="Show your profile's feed participation in this server")
     async def feed_status(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
         linked = await self.bot.db.get_linked_user(interaction.user.id)
         if not linked:
-            await interaction.followup.send("No Backloggd profile is linked to your Discord account. Use `/link` first.", ephemeral=True)
+            await send_private_followup(
+                interaction,
+                "No Backloggd profile is linked to your Discord account. Use `/link` first.",
+                log=logger,
+            )
             return
         profile_key = linked["profile_key"]
         username = linked["backloggd_username"]
@@ -1071,11 +1085,7 @@ class FeedCog(commands.Cog, name="Feed"):
             inline=False,
         )
         embed.set_footer(text="Feed source health is separate from library cache freshness (/profile, /refresh).")
-        await interaction.followup.send(
-            embed=embed,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await send_private_followup(interaction, embed=embed, log=logger)
 
     def _feed_list_pages(self, candidates, channel_id):
         pages = []
@@ -1104,39 +1114,35 @@ class FeedCog(commands.Cog, name="Feed"):
         if interaction.guild is None:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
         try:
             requested = normalize_backloggd_username(username)
         except InvalidUsernameError as error:
-            await interaction.followup.send(
-                f"❌ {error}",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await send_private_followup(interaction, f"❌ {error}", log=logger)
             return
         safe_requested = escape_display_text(requested)
         try:
             profile = await self.bot.backloggd.get_user_profile(requested)
         except (UserNotFoundError, ResourceNotFoundError):
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"No public Backloggd profile was found for **{safe_requested}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
         except Exception as error:
             logger.warning("Could not validate feed profile %s: %s", requested, error)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "Backloggd is temporarily unavailable. No feed subscription was added; try again shortly.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
         if not profile or not profile.username:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"No public Backloggd profile was found for **{safe_requested}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
         created = await self.bot.db.add_guild_admin_follow(
@@ -1147,7 +1153,10 @@ class FeedCog(commands.Cog, name="Feed"):
         if member_ids is not None and channel_id is not None:
             candidates = await self.bot.db.get_guild_feed_candidates(interaction.guild_id, member_ids)
             await self.bot.db.reconcile_guild_feed_activity(
-                interaction.guild_id, [row["profile_key"] for row in candidates], now=self.clock()
+                interaction.guild_id,
+                [row["profile_key"] for row in candidates],
+                now=self.clock(),
+                present_member_ids=member_ids,
             )
         safe_profile = escape_display_text(profile.username)
         if not created:
@@ -1160,11 +1169,7 @@ class FeedCog(commands.Cog, name="Feed"):
             message += " The feed will pick it up after Discord provides a complete member snapshot."
         else:
             message += " Existing history will be skipped on its first check."
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await send_private_followup(interaction, message, log=logger)
 
     @feed.command(name="remove", description="Remove a public profile follow from this server's feed")
     @app_commands.describe(username="The Backloggd username to stop following")
@@ -1174,48 +1179,39 @@ class FeedCog(commands.Cog, name="Feed"):
         if interaction.guild is None:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
         try:
             requested = normalize_backloggd_username(username)
         except InvalidUsernameError as error:
-            await interaction.followup.send(
-                f"❌ {error}",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await send_private_followup(interaction, f"❌ {error}", log=logger)
             return
         safe_requested = escape_display_text(requested)
-        removed = await self.bot.db.remove_guild_admin_follow(interaction.guild_id, requested)
-        if not removed:
-            await interaction.followup.send(
+        if not await self.bot.db.has_guild_admin_follow(interaction.guild_id, requested):
+            await send_private_followup(
+                interaction,
                 f"**{safe_requested}** does not have an admin follow in this server.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
         member_ids = await self._authoritative_member_ids(interaction.guild)
-        enabled_members = []
-        if member_ids is not None:
-            linked = await self.bot.db.get_profile_connections(requested, member_ids)
-            for row in linked:
-                if await self.bot.db.get_guild_feed_preference(interaction.guild_id, row["discord_id"]):
-                    enabled_members.append(row["discord_id"])
-            candidates = await self.bot.db.get_guild_feed_candidates(interaction.guild_id, member_ids)
-            await self.bot.db.reconcile_guild_feed_activity(
-                interaction.guild_id, [row["profile_key"] for row in candidates], now=self.clock()
+        result = await self.bot.db.remove_guild_admin_follow_and_reconcile(
+            interaction.guild_id, requested, member_ids=member_ids
+        )
+        if not result["removed"]:
+            await send_private_followup(
+                interaction,
+                f"**{safe_requested}** does not have an admin follow in this server.",
+                log=logger,
             )
+            return
         message = f"Removed the admin follow for **{safe_requested}**."
-        if member_ids is None:
+        if result["pending_reconciliation"]:
             message += " Current member participation could not be verified."
-        elif enabled_members:
+        elif not result["deactivated"] and result["remaining_members"]:
             message += " The profile remains active through member participation."
         else:
             message += " Existing announcements remain archived; a later re-add will skip inactive history."
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await send_private_followup(interaction, message, log=logger)
 
     @feed.command(name="list", description="List profiles included in this server's activity feed")
     @app_commands.guild_only()
@@ -1224,14 +1220,22 @@ class FeedCog(commands.Cog, name="Feed"):
         if interaction.guild is None:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        await defer_interaction(interaction, ephemeral=True)
         member_ids = await self._authoritative_member_ids(interaction.guild)
         if member_ids is None:
-            await interaction.followup.send("Discord has not provided a complete member snapshot yet. Try again shortly.", ephemeral=True)
+            await send_private_followup(
+                interaction,
+                "Discord has not provided a complete member snapshot yet. Try again shortly.",
+                log=logger,
+            )
             return
         candidates = await self.bot.db.get_guild_feed_candidates(interaction.guild_id, member_ids)
         if not candidates:
-            await interaction.followup.send("No member profiles are enabled and no admin profiles are followed in this server.", ephemeral=True)
+            await send_private_followup(
+                interaction,
+                "No member profiles are enabled and no admin profiles are followed in this server.",
+                log=logger,
+            )
             return
         channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
         _, _, target_issue = self._inspect_target_channel(
@@ -1339,6 +1343,7 @@ class FeedCog(commands.Cog, name="Feed"):
                     guild_id,
                     [row["profile_key"] for row in linked_profiles],
                     now=self.clock(),
+                    present_member_ids=member_ids,
                 )
 
                 for profile_row in linked_profiles:
@@ -1352,16 +1357,18 @@ class FeedCog(commands.Cog, name="Feed"):
                         (guild_id, profile_row["display_username"], profile_row["avatar_url"], channel)
                     )
 
-            for profile_key, entry in profile_entries.items():
-                username = entry["username"]
+            for profile_key in sorted(set(profile_entries) | set(skipped_targets)):
+                entry = profile_entries.get(profile_key)
+                active_targets = entry["targets"] if entry else []
+                skipped = skipped_targets.get(profile_key, [])
+                username = entry["username"] if entry else skipped[0][1]
                 try:
                     sources = await self._fetch_feed_sources(username, defer_boundary_commit=True)
                     await self._observe_profile_activity(profile_key, username, sources)
-                    skipped = skipped_targets.get(profile_key, [])
-                    all_guilds_ok = not skipped
+                    all_guilds_ok = bool(active_targets) and not skipped
                     if skipped:
                         await self.bot.db.record_feed_target_gap(profile_key)
-                    for guild_id, target_username, target_avatar, channel in [*entry["targets"], *skipped]:
+                    for guild_id, target_username, target_avatar, channel in [*active_targets, *skipped]:
                         try:
                             delivery_options = {'deliver': False} if channel is None else {}
                             published_ok = await self._publish_sources(

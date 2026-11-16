@@ -165,7 +165,7 @@ class AccountUxTests(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_profile_notice_names_only_other_members_in_current_guild(self):
         db = SimpleNamespace(
             get_linked_user=AsyncMock(return_value=None),
-            link_user=AsyncMock(return_value=True),
+            link_user_if_unlinked=AsyncMock(return_value=True),
             get_profile_connections=AsyncMock(return_value=[{"discord_id": 2}]),
             get_profile_sync_info=AsyncMock(return_value=None),
         )
@@ -201,7 +201,7 @@ class AccountUxTests(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_profile_notice_does_not_query_connections_in_dm(self):
         db = SimpleNamespace(
             get_linked_user=AsyncMock(return_value=None),
-            link_user=AsyncMock(return_value=True),
+            link_user_if_unlinked=AsyncMock(return_value=True),
             get_profile_connections=AsyncMock(return_value=[{"discord_id": 2}]),
             get_profile_sync_info=AsyncMock(return_value=None),
         )

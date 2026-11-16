@@ -9,7 +9,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["TURSO_DATABASE_URL"] = ""
@@ -128,25 +128,32 @@ class FeedUnavailableTargetTests(unittest.IsolatedAsyncioTestCase):
         )
         cog = FeedCog(bot, clock=lambda: self.now)
 
-        # Poll 1 & 2: Guild missing from Discord cache -> no fetches, state preserved, warning logged once.
-        with self.assertLogs("backloggd.cogs.feed", level=logging.WARNING) as logs:
+        # Poll 1 & 2: Guild missing from Discord cache -> active recovery profile (Millers) is
+        # observed once per poll (never unactivated PublicWatch), state preserved, warning logged once.
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()), self.assertLogs("backloggd.cogs.feed", level=logging.WARNING) as logs:
             await cog.journal_feed_loop.coro(cog)
             await cog.journal_feed_loop.coro(cog)
 
-        api.get_user_activity_snapshot.assert_not_awaited()
-        api.get_user_journal.assert_not_awaited()
+        self.assertEqual(api.get_user_activity_snapshot.await_count, 2)
+        self.assertEqual(api.get_user_journal.await_count, 2)
+        self.assertTrue(all(call.args[0] == "Millers" for call in api.get_user_activity_snapshot.await_args_list))
         self.assertEqual(len([r for r in logs.records if "unavailable" in r.getMessage().lower()]), 1)
         self.assertEqual(await self.db.get_feed_channel(1), 100)
         self.assertTrue(await self.db.get_guild_feed_preference(1, 10))
         self.assertTrue(await self.db.has_guild_admin_follow(1, "publicwatch"))
         self.assertTrue(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+        self.assertEqual(
+            [row["event_id"] for row in await self.db.get_pending_feed_observations(1, "millers")],
+            ["act-1"],
+        )
 
-        # Poll 3 & 4: Guild returns but channel is missing from cache -> state preserved, warning once.
+        # Poll 3 & 4: Guild returns but channel is missing from cache -> observed without sending, warning once.
         current_guild = _make_guild(1, [10], channel=None)
-        with self.assertLogs("backloggd.cogs.feed", level=logging.WARNING) as logs2:
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()), self.assertLogs("backloggd.cogs.feed", level=logging.WARNING) as logs2:
             await cog.journal_feed_loop.coro(cog)
             await cog.journal_feed_loop.coro(cog)
-        api.get_user_activity_snapshot.assert_not_awaited()
+        self.assertEqual(api.get_user_activity_snapshot.await_count, 4)
+        self.assertEqual(api.get_user_journal.await_count, 4)
         self.assertEqual(len([r for r in logs2.records if "unavailable" in r.getMessage().lower()]), 1)
 
         # /feed status discloses unavailable channel while keeping preference/admin state intact
@@ -164,11 +171,12 @@ class FeedUnavailableTargetTests(unittest.IsolatedAsyncioTestCase):
         # Poll 5: Channel returns with full permissions -> recovers and delivers automatically!
         channel = _make_channel(100)
         current_guild = _make_guild(1, [10], channel=channel)
-        await cog.journal_feed_loop.coro(cog)
-        self.assertGreaterEqual(api.get_user_activity_snapshot.await_count, 1)
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await cog.journal_feed_loop.coro(cog)
+        self.assertGreaterEqual(api.get_user_activity_snapshot.await_count, 5)
         channel.send.assert_awaited()
 
-    async def test_missing_view_permission_skips_fetch_discloses_status_and_recovers(self):
+    async def test_missing_view_permission_observes_without_sending_discloses_status_and_recovers(self):
         event = _activity(slug="celeste", title="Celeste", rating=5.0, occurred_at="2026-11-13T11:30:00Z")
         api = SimpleNamespace(
             get_user_activity_snapshot=AsyncMock(
@@ -181,12 +189,13 @@ class FeedUnavailableTargetTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(db=self.db, backloggd=api, get_guild=lambda gid: guild if gid == 1 else None)
         cog = FeedCog(bot, clock=lambda: self.now)
 
-        # Polls 1 & 2 with missing View Channel -> skipped, 0 SDK fetches, 1 warning logged
-        with self.assertLogs("backloggd.cogs.feed", level=logging.WARNING) as logs:
+        # Polls 1 & 2 with missing View Channel -> observed without sends, 1 warning logged
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()), self.assertLogs("backloggd.cogs.feed", level=logging.WARNING) as logs:
             await cog.journal_feed_loop.coro(cog)
             await cog.journal_feed_loop.coro(cog)
 
-        api.get_user_activity_snapshot.assert_not_awaited()
+        self.assertEqual(api.get_user_activity_snapshot.await_count, 2)
+        channel.send.assert_not_awaited()
         self.assertEqual(len([r for r in logs.records if "unavailable" in r.getMessage().lower() or "view channel" in r.getMessage().lower()]), 1)
 
         # /feed status discloses missing View Channel access
@@ -206,8 +215,272 @@ class FeedUnavailableTargetTests(unittest.IsolatedAsyncioTestCase):
         channel.permissions_for.return_value = SimpleNamespace(
             view_channel=True, send_messages=True, embed_links=True
         )
-        await cog.journal_feed_loop.coro(cog)
-        channel.send.assert_awaited()
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await cog.journal_feed_loop.coro(cog)
+        channel.send.assert_awaited_once()
+
+    async def test_only_unavailable_guild_observes_pins_boundary_and_recovers_after_restart(self):
+        # Seed continuous boundary at old-1 before outage
+        early_activation = datetime(2026, 11, 1, 8, 0, tzinfo=timezone.utc)
+        pre_activation_event = _activity(
+            activity_id="pre-act", slug="pre-act-game", title="Pre Act", occurred_at="2026-10-31T10:00:00Z"
+        )
+        new_event = _activity(
+            activity_id="new-2", slug="hades", title="Hades", rating=4.5, occurred_at="2026-11-13T11:30:00Z"
+        )
+        old_event = _activity(
+            activity_id="old-1", slug="old-game", title="Old Game", occurred_at="2026-11-13T07:00:00Z"
+        )
+        too_old_event = _activity(
+            activity_id="very-old", slug="ancient", title="Ancient", occurred_at="2026-11-02T10:00:00Z"
+        )
+        deleted_event = _activity(
+            activity_id="del-1", slug="deleted-game", title="Deleted Game", occurred_at="2026-11-13T11:00:00Z"
+        )
+        del_payload = json.dumps(asdict(FeedEvent.from_activity(deleted_event)), sort_keys=True)
+
+        for reason in ("missing_channel", "incomplete_chunk", "missing_bot_member", "missing_send_perms", "missing_guild"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as folder:
+                db = Database(str(Path(folder) / f"{reason}.db"), turso_url="")
+                await db.connect()
+                try:
+                    await db.link_user(10, "Millers")
+                    await db.set_feed_channel(1, 100)
+                    await db.set_guild_feed_preference(1, 10, True)
+                    await db.reconcile_guild_feed_activity(1, ["millers"], now=early_activation)
+                    await db.seed_feed_source(1, "millers", "activity-display-v1", ["old-1"])
+                    await db.seed_feed_source(1, "millers", "journal-display-v1", [])
+                    old_payload = json.dumps(asdict(FeedEvent.from_activity(old_event)), sort_keys=True)
+                    await db.seed_feed_message(1, "millers", ("old-1",), old_payload)
+                    await db.store_feed_message(1, "millers", ("del-1",), del_payload, 777, 100, delivery_state="deleted")
+                    await db.record_feed_source_attempt("millers", "activity")
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="exhausted", pages_read=1, boundary_event_id="old-1"
+                    )
+
+                    ch = _make_channel(100)
+                    if reason == "missing_channel":
+                        guild = _make_guild(1, [10], channel=None)
+                    elif reason == "incomplete_chunk":
+                        guild = SimpleNamespace(
+                            id=1, name="Guild 1", me=object(), chunked=False, member_count=2,
+                            members=[SimpleNamespace(id=10)], chunk=AsyncMock(),
+                            get_channel=lambda cid, c=ch: c if cid == 100 else None,
+                        )
+                    elif reason == "missing_bot_member":
+                        guild = SimpleNamespace(
+                            id=1, name="Guild 1", me=None, chunked=True, member_count=1,
+                            members=[SimpleNamespace(id=10)],
+                            get_channel=lambda cid, c=ch: c if cid == 100 else None,
+                        )
+                    elif reason == "missing_send_perms":
+                        ch.permissions_for.return_value = SimpleNamespace(
+                            view_channel=True, send_messages=False, embed_links=False
+                        )
+                        guild = _make_guild(1, [10], channel=ch)
+                    else:
+                        guild = None
+
+                    api = SimpleNamespace(
+                        get_user_activity_snapshot=AsyncMock(
+                            return_value=SimpleNamespace(
+                                entries=[new_event, deleted_event, too_old_event, pre_activation_event, old_event],
+                                coverage="boundary_reached",
+                                pages_read=1,
+                            )
+                        ),
+                        get_user_journal=AsyncMock(return_value=[]),
+                    )
+                    bot = SimpleNamespace(db=db, backloggd=api, get_guild=lambda gid, g=guild: g if gid == 1 else None)
+                    cog = FeedCog(bot, clock=lambda: self.now)
+
+                    with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                        await cog.journal_feed_loop.coro(cog)
+
+                    api.get_user_activity_snapshot.assert_awaited_once_with("Millers", stop_at_ids=("old-1",), max_pages=5)
+                    api.get_user_journal.assert_awaited_once()
+                    ch.send.assert_not_awaited()
+
+                    health = await db.get_profile_feed_source("millers", "activity")
+                    self.assertEqual(health["last_continuous_boundary_event_id"], "old-1")
+                    self.assertIsNotNone(health["unresolved_gap_since"])
+                    self.assertEqual(health["gap_reason"], "unavailable_feed_target")
+
+                    pending = [r["event_id"] for r in await db.get_pending_feed_observations(1, "millers")]
+                    self.assertEqual(pending, ["new-2"])
+                    very_old_dec = await db.get_feed_event_decision(1, "millers", "very-old")
+                    self.assertEqual(very_old_dec["decision"], "suppressed_old")
+                    pre_act_dec = await db.get_feed_event_decision(1, "millers", "pre-act")
+                    self.assertEqual(pre_act_dec["decision"], "suppressed_pre_activation")
+
+                    # Restart (new FeedCog) and recover while new-2 dropped off latest SDK page
+                    recovered_ch = _make_channel(100)
+                    recovered_guild = _make_guild(1, [10], channel=recovered_ch)
+                    api.get_user_activity_snapshot.return_value = SimpleNamespace(
+                        entries=[old_event], coverage="boundary_reached", pages_read=1
+                    )
+                    recovered_bot = SimpleNamespace(
+                        db=db, backloggd=api, get_guild=lambda gid, g=recovered_guild: g if gid == 1 else None
+                    )
+                    recovered_cog = FeedCog(recovered_bot, clock=lambda: self.now)
+                    with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                        await recovered_cog.journal_feed_loop.coro(recovered_cog)
+
+                    recovered_ch.send.assert_awaited_once()
+                    self.assertIn("Hades", recovered_ch.send.call_args.kwargs["embed"].title)
+                    del_rows = [r for r in await db.get_feed_messages(1, "millers") if r["event_id"] == "del-1"]
+                    self.assertEqual(del_rows[0]["delivery_state"], "deleted")
+                    health_after = await db.get_profile_feed_source("millers", "activity")
+                    self.assertIsNone(health_after["unresolved_gap_since"])
+                finally:
+                    await db.close()
+
+    async def test_multiple_unavailable_guilds_and_mixed_available_deduplicate_fetches(self):
+        await self.db.remove_guild_admin_follow(1, "PublicWatch")
+        # Set up guild 1 & guild 2, both unavailable -> one fetch, one policy pass per guild
+        ch1 = _make_channel(100, view_channel=False)
+        ch2 = _make_channel(200)
+        g1 = _make_guild(1, [10], channel=ch1)
+        g2 = _make_guild(2, [10], channel=None)
+        await self.db.set_feed_channel(2, 200)
+        await self.db.set_guild_feed_preference(2, 10, True)
+        await self.db.reconcile_guild_feed_activity(2, ["millers"], now=self.activation_time)
+        await self.db.seed_feed_source(2, "millers", "activity-display-v1", [])
+        await self.db.seed_feed_source(2, "millers", "journal-display-v1", [])
+
+        ev = _activity(activity_id="act-multi", slug="balatro", title="Balatro", occurred_at="2026-11-13T11:30:00Z")
+        api = SimpleNamespace(
+            get_user_activity_snapshot=AsyncMock(
+                return_value=SimpleNamespace(entries=[ev], coverage="exhausted", pages_read=1)
+            ),
+            get_user_journal=AsyncMock(return_value=[]),
+        )
+        guilds = {1: g1, 2: g2}
+        bot = SimpleNamespace(db=self.db, backloggd=api, get_guild=lambda gid: guilds.get(gid))
+        cog = FeedCog(bot, clock=lambda: self.now)
+
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await cog.journal_feed_loop.coro(cog)
+
+        api.get_user_activity_snapshot.assert_awaited_once()
+        api.get_user_journal.assert_awaited_once()
+        ch1.send.assert_not_awaited()
+        ch2.send.assert_not_awaited()
+        self.assertEqual([r["event_id"] for r in await self.db.get_pending_feed_observations(1, "millers")], ["act-multi"])
+        self.assertEqual([r["event_id"] for r in await self.db.get_pending_feed_observations(2, "millers")], ["act-multi"])
+
+        # Now make guild 1 available while guild 2 stays unavailable -> still 1 fetch for this poll, guild 1 sends, guild 2 queues
+        ch1.permissions_for.return_value = SimpleNamespace(view_channel=True, send_messages=True, embed_links=True)
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await cog.journal_feed_loop.coro(cog)
+        self.assertEqual(api.get_user_activity_snapshot.await_count, 2)
+        ch1.send.assert_awaited_once()
+        ch2.send.assert_not_awaited()
+        health = await self.db.get_profile_feed_source("millers", "activity")
+        self.assertIsNotNone(health["unresolved_gap_since"])
+
+    async def test_unbaselined_active_profile_in_unavailable_guild_stays_baseline_on_observation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(str(Path(folder) / "unbaselined.db"), turso_url="")
+            await db.connect()
+            try:
+                await db.link_user(10, "Millers")
+                await db.set_feed_channel(1, 100)
+                await db.set_guild_feed_preference(1, 10, True)
+                # Activated (e.g. during /setchannel), but NO source baselined yet
+                await db.reconcile_guild_feed_activity(1, ["millers"], now=self.activation_time)
+                existing_ev = _activity(
+                    activity_id="preexisting-1", slug="celeste", title="Celeste", occurred_at="2026-11-13T11:30:00Z"
+                )
+                api = SimpleNamespace(
+                    get_user_activity_snapshot=AsyncMock(
+                        return_value=SimpleNamespace(entries=[existing_ev], coverage="exhausted", pages_read=1)
+                    ),
+                    get_user_journal=AsyncMock(return_value=[]),
+                )
+                ch = _make_channel(100)
+                guild = _make_guild(1, [10], channel=None)
+                bot = SimpleNamespace(db=db, backloggd=api, get_guild=lambda gid: guild if gid == 1 else None)
+                cog = FeedCog(bot, clock=lambda: self.now)
+
+                with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                    await cog.journal_feed_loop.coro(cog)
+
+                self.assertTrue(await db.has_feed_source(1, "millers", "activity-display-v1"))
+                self.assertEqual(await db.get_pending_feed_observations(1, "millers"), [])
+                dec = await db.get_feed_event_decision(1, "millers", "preexisting-1")
+                self.assertEqual(dec["decision"], "baseline")
+
+                # Recover channel: preexisting-1 is NEVER announced
+                guild_ok = _make_guild(1, [10], channel=ch)
+                bot.get_guild = lambda gid: guild_ok if gid == 1 else None
+                with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                    await cog.journal_feed_loop.coro(cog)
+                ch.send.assert_not_awaited()
+            finally:
+                await db.close()
+
+    async def test_no_fetches_when_no_enrolled_recovery_profile_exists(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(str(Path(folder) / "no-recovery.db"), turso_url="")
+            await db.connect()
+            try:
+                await db.link_user(10, "OptedOut")
+                await db.link_user(20, "NeverActivated")
+                await db.set_feed_channel(1, 100)
+                await db.set_guild_feed_preference(1, 10, True)
+                await db.reconcile_guild_feed_activity(1, ["optedout"], now=self.activation_time)
+                await db.set_guild_feed_preference(1, 10, False)  # disabled preference
+                await db.set_guild_feed_preference(1, 20, True)   # enabled pref, but never activated
+
+                api = SimpleNamespace(
+                    get_user_activity_snapshot=AsyncMock(),
+                    get_user_journal=AsyncMock(),
+                )
+                bot = SimpleNamespace(db=db, backloggd=api, get_guild=lambda gid: None)
+                cog = FeedCog(bot, clock=lambda: self.now)
+
+                with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                    await cog.journal_feed_loop.coro(cog)
+
+                api.get_user_activity_snapshot.assert_not_awaited()
+                api.get_user_journal.assert_not_awaited()
+            finally:
+                await db.close()
+
+    async def test_unavailable_recipient_source_failure_isolation(self):
+        await self.db.link_user(20, "SecondUser")
+        await self.db.set_guild_feed_preference(1, 20, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers", "seconduser"], now=self.activation_time)
+        await self.db.seed_feed_source(1, "seconduser", "activity-display-v1", [])
+        await self.db.seed_feed_source(1, "seconduser", "journal-display-v1", [])
+
+        ev = _activity(activity_id="sec-1", slug="portal", title="Portal", occurred_at="2026-11-13T11:30:00Z")
+
+        async def activity_side_effect(username, **_kw):
+            if username == "Millers":
+                raise RuntimeError("transient upstream 503")
+            return SimpleNamespace(entries=[ev], coverage="exhausted", pages_read=1)
+
+        api = SimpleNamespace(
+            get_user_activity_snapshot=AsyncMock(side_effect=activity_side_effect),
+            get_user_journal=AsyncMock(return_value=[]),
+        )
+        bot = SimpleNamespace(db=self.db, backloggd=api, get_guild=lambda gid: None)
+        cog = FeedCog(bot, clock=lambda: self.now)
+
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await cog.journal_feed_loop.coro(cog)
+
+        self.assertEqual(api.get_user_activity_snapshot.await_count, 2)
+        self.assertEqual([r["event_id"] for r in await self.db.get_pending_feed_observations(1, "seconduser")], ["sec-1"])
+        millers_act = await self.db.get_profile_feed_source("millers", "activity")
+        self.assertIn("transient upstream 503", millers_act["last_error"])
+        self.assertEqual(millers_act["gap_reason"], "unavailable_feed_target")
+        # Journal still succeeded independently for Millers
+        millers_journal = await self.db.get_profile_feed_source("millers", "journal")
+        self.assertEqual(millers_journal["successes"], 1)
+
 
 
 class FeedIndependentEditRetryTests(unittest.IsolatedAsyncioTestCase):

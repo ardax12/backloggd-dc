@@ -64,7 +64,8 @@ class BackloggdBot(commands.Bot):
                 await self.load_extension(ext)
                 logger.info("Loaded extension: %s", ext)
             except Exception as e:
-                logger.error("Failed to load extension %s: %s", ext, e, exc_info=True)
+                logger.error("Failed to load required extension %s: %s", ext, e, exc_info=True)
+                raise RuntimeError(f"Required extension {ext} failed to load") from e
 
         # 3. Slash Command Sync
         try:
@@ -88,6 +89,10 @@ class BackloggdBot(commands.Bot):
         feed_cog = self.get_cog("Feed")
         if feed_cog and hasattr(feed_cog, "journal_feed_loop") and feed_cog.journal_feed_loop.is_running():
             feed_cog.journal_feed_loop.cancel()
+
+        account_cog = self.get_cog("Account")
+        if account_cog and hasattr(account_cog, "close"):
+            await account_cog.close()
 
         social_cog = self.get_cog("Social")
         if social_cog and hasattr(social_cog, "close"):

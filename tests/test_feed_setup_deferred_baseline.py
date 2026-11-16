@@ -31,7 +31,14 @@ def _make_interaction(guild, *, user_id=10):
     )
 
 
-def _make_channel(channel_id=100, mention="#feed"):
+def _make_channel(
+    channel_id=100,
+    mention="#feed",
+    *,
+    view_channel=True,
+    send_messages=True,
+    embed_links=True,
+):
     sent = []
 
     async def send(*, embed=None, view=None):
@@ -39,14 +46,21 @@ def _make_channel(channel_id=100, mention="#feed"):
         sent.append((msg_id, embed, view))
         return SimpleNamespace(id=msg_id)
 
+    def permissions_for(me):
+        if me is None:
+            raise AssertionError("permissions_for must not be invoked with None")
+        return SimpleNamespace(
+            view_channel=view_channel,
+            send_messages=send_messages,
+            embed_links=embed_links,
+        )
+
     partial = MagicMock()
     partial.edit = AsyncMock()
     return SimpleNamespace(
         id=channel_id,
         mention=mention,
-        permissions_for=lambda _me: SimpleNamespace(
-            view_channel=True, send_messages=True, embed_links=True
-        ),
+        permissions_for=MagicMock(side_effect=permissions_for),
         send=AsyncMock(side_effect=send),
         get_partial_message=MagicMock(return_value=partial),
         _sent=sent,
@@ -248,6 +262,54 @@ class PromptSetChannelAndDeferredBaselineTests(unittest.IsolatedAsyncioTestCase)
         self.assertIn("first successful poll", reply.lower())
         # Active enrollments & archives remain intact despite unavailable membership snapshot.
         self.assertTrue(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+
+    async def test_setchannel_guards_unavailable_bot_member_and_retains_existing_channel(self):
+        await self.db.set_feed_channel(1, 100)
+        guild_without_me = SimpleNamespace(
+            id=1,
+            name="Guild",
+            chunked=True,
+            member_count=1,
+            members=[SimpleNamespace(id=10)],
+            me=None,
+        )
+        candidate = _make_channel(200, "#new-feed")
+        interaction = _make_interaction(guild_without_me)
+
+        await FeedCog.setchannel.callback(self.cog, interaction, candidate)
+
+        candidate.permissions_for.assert_not_called()
+        self.assertEqual(await self.db.get_feed_channel(1), 100)
+        self.bot.backloggd.get_user_activity_snapshot.assert_not_awaited()
+        self.bot.backloggd.get_user_journal.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        self.assertTrue(interaction.followup.send.call_args.kwargs.get("ephemeral"))
+        reply = interaction.followup.send.call_args.args[0]
+        self.assertIn("try", reply.lower())
+
+    async def test_setchannel_missing_each_required_permission_retains_existing_channel(self):
+        await self.db.set_feed_channel(1, 100)
+        cases = [
+            ("view_channel", "View Channel"),
+            ("send_messages", "Send Messages"),
+            ("embed_links", "Embed Links"),
+        ]
+        for attr, label in cases:
+            with self.subTest(missing_perm=attr):
+                flags = {"view_channel": True, "send_messages": True, "embed_links": True}
+                flags[attr] = False
+                candidate = _make_channel(200, "#restricted", **flags)
+                interaction = _make_interaction(self.guild)
+
+                await FeedCog.setchannel.callback(self.cog, interaction, candidate)
+
+                candidate.permissions_for.assert_called_once_with(self.guild.me)
+                self.assertEqual(await self.db.get_feed_channel(1), 100)
+                self.bot.backloggd.get_user_activity_snapshot.assert_not_awaited()
+                self.bot.backloggd.get_user_journal.assert_not_awaited()
+                interaction.followup.send.assert_awaited_once()
+                self.assertTrue(interaction.followup.send.call_args.kwargs.get("ephemeral"))
+                self.assertIn(label, interaction.followup.send.call_args.args[0])
 
 
 if __name__ == "__main__":

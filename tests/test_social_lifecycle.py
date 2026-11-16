@@ -98,14 +98,26 @@ class SocialLifecycleTests(unittest.IsolatedAsyncioTestCase):
         api = SimpleNamespace(get_user_library=AsyncMock(side_effect=slow_fetch))
         cog = SocialCog(
             SimpleNamespace(db=self.db, backloggd=api),
-            live_fetch_timeout=5.0,
+            live_fetch_timeout=30.0,
         )
+
+        both_joined = asyncio.Event()
+
+        class ObservedWaiters(dict):
+            def __setitem__(self, key, count):
+                super().__setitem__(key, count)
+                if count == 2:
+                    both_joined.set()
+
+        # Observe actual registration, which happens after the async DB lookup.
+        cog._live_library_waiters = ObservedWaiters()
+        self.addAsyncCleanup(cog.close)
 
         # Part A: cancelling one waiter keeps shared fetch alive for the second waiter.
         w1 = asyncio.create_task(cog._get_or_fetch_ratings("SharedUser"))
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         w2 = asyncio.create_task(cog._get_or_fetch_ratings("shareduser"))
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(both_joined.wait(), timeout=5.0)
         w1.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await w1
@@ -118,10 +130,11 @@ class SocialLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # Part B: cog close cancels the shared fetch for both waiters.
         entered.clear()
         release.clear()
+        both_joined.clear()
         w3 = asyncio.create_task(cog._get_or_fetch_ratings("SharedUser2"))
         await asyncio.wait_for(entered.wait(), timeout=1.0)
         w4 = asyncio.create_task(cog._get_or_fetch_ratings("shareduser2"))
-        await asyncio.sleep(0.02)
+        await asyncio.wait_for(both_joined.wait(), timeout=5.0)
 
         await cog.close()
         self.assertEqual(cancelled, 1)

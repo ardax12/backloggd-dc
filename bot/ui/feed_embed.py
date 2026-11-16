@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from bot.feed_rules import calendar_date
 from typing import Any
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED, COLOR_WISHLIST
+from bot.input_validation import escape_display_text
 from bot.ui.helpers import (
     rating_to_stars,
     build_backloggd_game_url,
     build_backloggd_user_url,
     clean_image_url,
+    clamp_escaped_text,
     DEFAULT_BACKLOGGD_AVATAR
 )
 
@@ -74,7 +76,7 @@ def create_journal_feed_embed(
     )
 
     clean_avatar = clean_image_url(avatar_url) or DEFAULT_BACKLOGGD_AVATAR
-    embed.set_author(name=username, icon_url=clean_avatar, url=user_url)
+    embed.set_author(name=username[:256], icon_url=clean_avatar, url=user_url)
 
     cover = clean_image_url(getattr(entry, "cover_url", None))
     if cover:
@@ -89,29 +91,38 @@ def create_journal_feed_embed(
             details.append(f"**Rating:** {stars} (`{entry.rating:.1f}` / 5.0)")
 
     if getattr(entry, "platform", None):
-        details.append(f"**Platform:** {entry.platform}")
+        details.append(f"**Platform:** {clamp_escaped_text(escape_display_text(entry.platform), 200)}")
 
     if getattr(entry, "is_replay", False):
         details.append("**Replay:** 🔁 Yes")
 
-    if getattr(entry, "session_labels", ()):
-        details.append("**Session:** " + " / ".join(entry.session_labels))
+    session_labels = getattr(entry, "session_labels", ())
+    if session_labels:
+        safe_labels = [escape_display_text(label) for label in session_labels]
+        details.append("**Session:** " + clamp_escaped_text(" / ".join(safe_labels), 300))
     if played_date:
-        details.append(f"**Played date:** {played_date}")
+        details.append(f"**Played date:** {clamp_escaped_text(escape_display_text(played_date), 120)}")
     activity_time = getattr(entry, "occurred_at", None) or getattr(entry, "date_str", None)
     if activity_time:
-        details.append(f"**Activity time:** {activity_time}")
+        details.append(f"**Activity time:** {clamp_escaped_text(escape_display_text(activity_time), 120)}")
 
     if details:
-        embed.description = "\n".join(details)
+        embed.description = clamp_escaped_text("\n".join(details), 4096)
 
     # Review notes or written thoughts if present
     notes = getattr(entry, "review_notes", None)
     if notes:
-        if len(notes) > 400:
-            notes = notes[:397] + "..."
-        notes = f"||{notes}||" if getattr(entry, "has_spoilers", False) else notes
-        embed.add_field(name="💬 Review / Notes", value=f"> {notes}", inline=False)
+        has_spoilers = bool(getattr(entry, "has_spoilers", False))
+        normalized = str(notes).replace("\r\n", "\n").replace("\r", "\n")
+        escaped_notes = escape_display_text(normalized)
+        wrapped_notes = f"||{escaped_notes}||" if has_spoilers else escaped_notes
+        quoted_notes = "\n".join(f"> {line}" for line in wrapped_notes.split("\n"))
+        bounded_notes = clamp_escaped_text(
+            quoted_notes,
+            500,
+            suffix="...||" if has_spoilers else "...",
+        )
+        embed.add_field(name="💬 Review / Notes", value=bounded_notes, inline=False)
 
     embed.set_footer(text="Backloggd Activity Stream • Connect yours with /link")
     return embed

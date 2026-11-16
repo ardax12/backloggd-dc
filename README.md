@@ -124,7 +124,7 @@ python main.py
 
 ---
 
-## Database Migrations, Backup & Rollback (Schema v1–v7)
+## Database Migrations, Backup & Rollback (Schema v1–v8)
 
 Schema upgrades in `bot/db_migrations.py` run atomically inside a transaction on startup (supporting both local SQLite and Turso/libSQL via `schema_migrations`):
 
@@ -135,6 +135,7 @@ Schema upgrades in `bot/db_migrations.py` run atomically inside a transaction on
 - **v5**: Adds `profile_feed_decisions` to persist 7-day/future/uncertain/ambiguity decisions.
 - **v6**: Adds `profile_feed_source_health` for separate source attempts, coverage, boundaries, and unresolved gaps.
 - **v7**: Adds `last_sync_attempt_at` / `last_sync_error` on `profiles`, `unresolved_gap_until` on `profile_feed_source_health`, and `profile_activity_observations` / `profile_activity_observation_sources`.
+- **v8**: Adds `guild_profile_feed_reconciliation` to preserve uncertain source-removal state across restarts. Membership recovery resolves whether another member continuously kept the profile active before reenrollment or delivery.
 
 ### Backup & Rollback Procedure
 
@@ -145,7 +146,8 @@ Schema upgrades in `bot/db_migrations.py` run atomically inside a transaction on
      ```
    - **Turso / libSQL**: Export a logical dump or create a database snapshot/branch before starting the upgraded bot binary.
 2. **Rolling back to an earlier release**:
-   - Because v1–v7 rebuild `linked_users` / `user_ratings` and add new normalized tables (`profiles`, `profile_ratings`, `guild_feed_*`, `profile_feed_*`), simply downgrading the application code while leaving a v7 database in place is **not** supported.
+   - The v1–v8 migration history includes rebuilds of `linked_users` / `user_ratings` and additions of normalized tables (`profiles`, `profile_ratings`, `guild_feed_*`, `profile_feed_*`). Simply downgrading the application code while leaving an upgraded v8 database in place is **not** supported.
+   - v8 adds a table without rebuilding existing tables, but older releases do not implement its reconciliation semantics; an in-place downgrade is not a supported rollback. Offline migration tests do not establish compatibility with older binaries.
    - To roll back safely: stop the bot, restore the pre-upgrade SQLite backup file (or restore the Turso snapshot/branch from step 1), verify `SELECT MAX(version) FROM schema_migrations;` matches the target release, and restart the previous bot version.
 
 ---
@@ -205,7 +207,7 @@ backloggd-dc/
 │   ├── config.py          # Bot settings and embed color constants
 │   ├── db.py              # Asynchronous SQLite/libSQL database manager
 │   ├── db_adapter.py      # Shared SQLite/libSQL transaction, batch, and lock adapter
-│   ├── db_migrations.py   # Atomic versioned schema migrations (v1-v7)
+│   ├── db_migrations.py   # Atomic versioned schema migrations (v1-v8)
 │   ├── feed_models.py     # Normalized feed event models and parsing
 │   ├── feed_rules.py      # Action classification, journal normalization, conservative merging
 │   ├── feed_policy.py     # 7-day cutoff, future/uncertain handling, and ambiguity policy

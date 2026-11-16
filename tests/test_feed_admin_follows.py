@@ -2,17 +2,22 @@ import os
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 import inspect
+import json
 import tempfile
 import unittest
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+from backloggd import ActivityEntry
 from discord import app_commands
 
 from bot.cogs.feed import FeedCog
 from bot.db import Database
+from bot.feed_models import FeedEvent
 from bot.ui.views import FeedListView
 
 
@@ -198,6 +203,217 @@ class AdminFeedFollowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Old (>7d): 1", embed.fields[1].value)
         self.assertIn("Unknown send outcomes: 1", embed.fields[1].value)
         self.assertNotIn("secret", embed.fields[1].value)
+
+    @staticmethod
+    def _make_channel(channel_id: int = 100):
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = channel_id
+        channel.mention = f"<#{channel_id}>"
+        channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True, send_messages=True, embed_links=True
+        )
+        counter = {"n": 0}
+
+        async def _send(**kwargs):
+            counter["n"] += 1
+            return SimpleNamespace(id=6000 + counter["n"], kwargs=kwargs)
+
+        channel.send = AsyncMock(side_effect=_send)
+        channel.get_partial_message = lambda mid: SimpleNamespace(id=mid, edit=AsyncMock())
+        return channel
+
+    @staticmethod
+    def _activity(event_id: str, slug: str, title: str, occurred_at: str) -> ActivityEntry:
+        return ActivityEntry(
+            activity_id=event_id,
+            game_title=title,
+            game_slug=slug,
+            cover_url=None,
+            action_type="completed",
+            action_text="completed",
+            rating=4.5,
+            review_notes=None,
+            date_str="11:30",
+            occurred_at=occurred_at,
+        )
+
+    async def test_sole_admin_remove_under_chunk_failure_deactivates_and_readd_baselines_gap(self):
+        ch1 = self._make_channel(100)
+        ch2 = self._make_channel(200)
+        await self.db.set_feed_channel(1, 100)
+        await self.db.set_feed_channel(2, 200)
+        await self.db.add_guild_admin_follow(1, "PublicPlayer", None, 99)
+        await self.db.add_guild_admin_follow(1, "OtherFollow", None, 99)
+        await self.db.add_guild_admin_follow(2, "PublicPlayer", None, 99)
+        t0 = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+        await self.db.reconcile_guild_feed_activity(1, ["publicplayer", "otherfollow"], now=t0)
+        await self.db.reconcile_guild_feed_activity(2, ["publicplayer"], now=t0)
+        await self.db.seed_feed_source(1, "publicplayer", "activity-display-v1", ["old-1"])
+        await self.db.seed_feed_source(1, "otherfollow", "activity-display-v1", [])
+        await self.db.seed_feed_source(2, "publicplayer", "activity-display-v1", [])
+
+        old_ev = self._activity("old-1", "old-game", "Old Game", "2026-11-13T07:00:00Z")
+        old_payload = json.dumps(asdict(FeedEvent.from_activity(old_ev)), sort_keys=True)
+        await self.db.store_feed_message(1, "publicplayer", ("old-1",), old_payload, 500, 100, delivery_state="sent")
+        await self.db.store_feed_message(1, "publicplayer", ("del-1",), old_payload, 501, 100, delivery_state="deleted")
+        await self.db.record_feed_event_decision(
+            1, "publicplayer", "unsent-1", source="activity", event_date="2026-11-13",
+            decision="eligible", reason="recent", payload=old_payload, observed_at=t0,
+        )
+
+        broken_guild1 = SimpleNamespace(
+            id=1, name="G1", me=object(), chunked=False, members=[], chunk=AsyncMock(return_value=[]),
+            get_channel=lambda cid: ch1 if cid == 100 else None,
+        )
+        remove_inter = SimpleNamespace(
+            guild=broken_guild1, guild_id=1, user=SimpleNamespace(id=99),
+            permissions=SimpleNamespace(manage_channels=True),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        cog = FeedCog(self.bot, clock=lambda: datetime(2026, 11, 13, 9, 0, tzinfo=timezone.utc))
+        await FeedCog.feed_remove.callback(cog, remove_inter, "PublicPlayer")
+
+        status = await self.db.get_guild_profile_feed_status(1, "publicplayer")
+        self.assertFalse(status["active"])
+        self.assertEqual(status["initialized_sources"], [])
+        self.assertIsNone(await self.db.get_feed_event_decision(1, "publicplayer", "unsent-1"))
+        msgs = {r["event_id"]: r for r in await self.db.get_feed_messages(1, "publicplayer")}
+        self.assertEqual(msgs["old-1"]["delivery_state"], "sent")
+        self.assertEqual(msgs["del-1"]["delivery_state"], "deleted")
+        self.assertTrue(await self.db.has_feed_source(1, "otherfollow", "activity-display-v1"))
+        self.assertTrue(await self.db.has_feed_source(2, "publicplayer", "activity-display-v1"))
+
+        # Restart then re-add while chunk still fails, then recover!
+        await self.db.close()
+        self.db = Database(str(Path(self.directory.name) / "admin-feed.db"), turso_url="")
+        await self.db.connect()
+        self.bot.db = self.db
+
+        add_inter = SimpleNamespace(
+            guild=broken_guild1, guild_id=1, user=SimpleNamespace(id=99),
+            permissions=SimpleNamespace(manage_channels=True),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        cog2 = FeedCog(self.bot, clock=lambda: datetime(2026, 11, 13, 11, 0, tzinfo=timezone.utc))
+        await FeedCog.feed_add.callback(cog2, add_inter, "PublicPlayer")
+
+        gap_ev = self._activity("gap-1", "hades", "Hades", "2026-11-13T10:00:00Z")
+        ok_guild1 = SimpleNamespace(
+            id=1, name="G1", me=object(), chunked=True, members=[],
+            get_channel=lambda cid: ch1 if cid == 100 else None,
+        )
+        ok_guild2 = SimpleNamespace(
+            id=2, name="G2", me=object(), chunked=True, members=[],
+            get_channel=lambda cid: ch2 if cid == 200 else None,
+        )
+        async def snapshot_for_user(username, **_kwargs):
+            if username.lower() == "publicplayer":
+                return SimpleNamespace(entries=[gap_ev, old_ev], coverage="exhausted", pages_read=1)
+            return SimpleNamespace(entries=[], coverage="exhausted", pages_read=1)
+
+        api = SimpleNamespace(
+            get_user_profile=self.profile_api,
+            get_user_activity_snapshot=AsyncMock(side_effect=snapshot_for_user),
+            get_user_journal=AsyncMock(return_value=[]),
+        )
+        loop_cog = FeedCog(
+            SimpleNamespace(db=self.db, backloggd=api, get_guild=lambda gid: ok_guild1 if gid == 1 else ok_guild2),
+            clock=lambda: datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc),
+        )
+        with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+            await loop_cog.journal_feed_loop.coro(loop_cog)
+
+        ch1.send.assert_not_awaited()
+        self.assertEqual((await self.db.get_feed_event_decision(1, "publicplayer", "gap-1"))["decision"], "baseline")
+
+    async def test_admin_remove_under_chunk_failure_with_departed_member_readd_baselines_gap(self):
+        for member_present in (True, False):
+            with self.subTest(member_present=member_present), tempfile.TemporaryDirectory() as folder:
+                db = Database(str(Path(folder) / "admin-reconcile.db"), turso_url="")
+                await db.connect()
+                try:
+                    await db.link_user(10, "PublicPlayer")
+                    ch = self._make_channel(100)
+                    await db.set_feed_channel(1, 100)
+                    await db.set_guild_feed_preference(1, 10, True)
+                    await db.add_guild_admin_follow(1, "PublicPlayer", None, 99)
+                    t0 = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+                    await db.reconcile_guild_feed_activity(1, ["publicplayer"], now=t0)
+                    await db.seed_feed_source(1, "publicplayer", "activity-display-v1", ["old-1"])
+                    await db.seed_feed_source(1, "publicplayer", "journal-display-v1", [])
+                    old_ev = self._activity("old-1", "old-game", "Old Game", "2026-11-13T07:00:00Z")
+                    old_payload = json.dumps(asdict(FeedEvent.from_activity(old_ev)), sort_keys=True)
+                    await db.seed_feed_message(1, "publicplayer", ("old-1",), old_payload)
+
+                    broken_guild = SimpleNamespace(
+                        id=1, name="G1", me=object(), chunked=False, members=[], chunk=AsyncMock(return_value=[]),
+                        get_channel=lambda cid: ch if cid == 100 else None,
+                    )
+                    remove_inter = SimpleNamespace(
+                        guild=broken_guild, guild_id=1, user=SimpleNamespace(id=99),
+                        permissions=SimpleNamespace(manage_channels=True),
+                        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+                        followup=SimpleNamespace(send=AsyncMock()),
+                    )
+                    bot = SimpleNamespace(db=db, backloggd=SimpleNamespace(get_user_profile=self.profile_api))
+                    cog = FeedCog(bot, clock=lambda: datetime(2026, 11, 13, 9, 0, tzinfo=timezone.utc))
+                    await FeedCog.feed_remove.callback(cog, remove_inter, "PublicPlayer")
+
+                    # Member 10 stored in DB -> uncertainty retained
+                    self.assertTrue((await db.get_guild_profile_feed_status(1, "publicplayer"))["active"])
+
+                    gap_ev = self._activity("gap-admin", "hades", "Hades", "2026-11-13T10:00:00Z")
+                    api = SimpleNamespace(
+                        get_user_profile=self.profile_api,
+                        get_user_activity_snapshot=AsyncMock(
+                            return_value=SimpleNamespace(entries=[gap_ev, old_ev], coverage="exhausted", pages_read=1)
+                        ),
+                        get_user_journal=AsyncMock(return_value=[]),
+                    )
+                    loop_cog = FeedCog(
+                        SimpleNamespace(db=db, backloggd=api, get_guild=lambda gid: broken_guild if gid == 1 else None),
+                        clock=lambda: datetime(2026, 11, 13, 10, 30, tzinfo=timezone.utc),
+                    )
+                    with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                        await loop_cog.journal_feed_loop.coro(loop_cog)
+                    ch.send.assert_not_awaited()
+
+                    # Admin re-adds while chunk still broken
+                    add_inter = SimpleNamespace(
+                        guild=broken_guild, guild_id=1, user=SimpleNamespace(id=99),
+                        permissions=SimpleNamespace(manage_channels=True),
+                        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+                        followup=SimpleNamespace(send=AsyncMock()),
+                    )
+                    await FeedCog.feed_add.callback(cog, add_inter, "PublicPlayer")
+
+                    # Restart & recover
+                    await db.close()
+                    db = Database(str(Path(folder) / "admin-reconcile.db"), turso_url="")
+                    await db.connect()
+
+                    present = [10] if member_present else [99]
+                    ok_guild = SimpleNamespace(
+                        id=1, name="G1", me=object(), chunked=True,
+                        members=[SimpleNamespace(id=m) for m in present],
+                        get_channel=lambda cid: ch if cid == 100 else None,
+                    )
+                    recovered_cog = FeedCog(
+                        SimpleNamespace(db=db, backloggd=api, get_guild=lambda gid: ok_guild if gid == 1 else None),
+                        clock=lambda: datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc),
+                    )
+                    with patch("bot.cogs.feed.asyncio.sleep", new=AsyncMock()):
+                        await recovered_cog.journal_feed_loop.coro(recovered_cog)
+
+                    if member_present:
+                        ch.send.assert_awaited_once()
+                    else:
+                        ch.send.assert_not_awaited()
+                        self.assertEqual((await db.get_feed_event_decision(1, "publicplayer", "gap-admin"))["decision"], "baseline")
+                finally:
+                    await db.close()
 
 
 if __name__ == "__main__":

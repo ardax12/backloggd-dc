@@ -18,6 +18,7 @@ from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.services.freshness import resolve_guild_aggregate_freshness
 
 logger = logging.getLogger("backloggd.cogs.games")
@@ -130,7 +131,7 @@ class GamesCog(commands.Cog, name="Games"):
     @app_commands.describe(title="Type game title to search with live autocomplete")
     @app_commands.autocomplete(title=game_autocomplete)
     async def game(self, interaction: discord.Interaction, title: str):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         query = title.strip()
         try:
@@ -138,10 +139,10 @@ class GamesCog(commands.Cog, name="Games"):
             if query.startswith(_SLUG_TAG_PREFIX):
                 slug = query[len(_SLUG_TAG_PREFIX):].strip()
                 if not slug:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         "❌ Please select a game from the autocomplete list or enter a game title.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
             elif query.startswith(_FALLBACK_TAG_PREFIX):
@@ -153,23 +154,23 @@ class GamesCog(commands.Cog, name="Games"):
                         self._fallback_entries.move_to_end(query)
                 if not slug:
                     hint = f' for "{_format_display_excerpt(expired[query])}"' if query in expired else ""
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         (
                             f"⏳ That autocomplete selection{hint} has expired. "
                             "Please type the game title again and re-select it from the autocomplete list."
                         )[:2000],
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
             else:
                 search_results = await self.bot.backloggd.search_games(query)
                 if not search_results:
                     safe_query = _format_display_excerpt(query)
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         f"❌ No games found matching **{safe_query}** on Backloggd."[:2000],
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
                 if len(search_results) > 1:
@@ -188,10 +189,10 @@ class GamesCog(commands.Cog, name="Games"):
                     max_opts_len = 2000 - len(prefix) - len(suffix)
                     if len(options) > max_opts_len:
                         options = options[: max(0, max_opts_len - 3)].rstrip("; \\") + "..."
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         f"{prefix}{options}{suffix}",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
                 slug = search_results[0].slug
@@ -199,10 +200,10 @@ class GamesCog(commands.Cog, name="Games"):
             game_data = await self.bot.backloggd.get_game(slug)
             if not game_data:
                 safe_slug = _format_display_excerpt(slug)
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"❌ Could not retrieve details for game: **{safe_slug}**."[:2000],
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
@@ -219,9 +220,10 @@ class GamesCog(commands.Cog, name="Games"):
             if interaction.guild:
                 guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
                 if guild_member_ids is None:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-                        ephemeral=True,
+                        log=logger,
                     )
                     return
             else:
@@ -256,15 +258,15 @@ class GamesCog(commands.Cog, name="Games"):
                 on_view_all=on_view_all if len(server_ratings) > 12 else None
             )
 
-            view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
+            view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
         except Exception as e:
             logger.error("Error looking up game '%s': %s", title, e, exc_info=True)
             safe_title = _format_display_excerpt(query or title)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ An error occurred while fetching information for **{safe_title}**."[:2000],
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
 
 async def setup(bot):

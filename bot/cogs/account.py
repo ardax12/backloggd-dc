@@ -20,14 +20,92 @@ from bot.services.library_sync import (
     seed_profile_sync_state,
     sync_profile_library,
 )
-from bot.ui.helpers import build_backloggd_user_url
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.ui.helpers import build_backloggd_user_url, clean_image_url
 
 logger = logging.getLogger("backloggd.cogs.account")
 
 class AccountCog(commands.Cog, name="Account"):
     def __init__(self, bot):
         self.bot = bot
-        self.library_sync = getattr(bot, "library_sync", None) or LibrarySyncService()
+        shared_sync = getattr(bot, "library_sync", None)
+        if shared_sync is not None:
+            self.library_sync = shared_sync
+            self._owns_library_sync = False
+        else:
+            self.library_sync = LibrarySyncService()
+            self._owns_library_sync = True
+        self._status_tasks: set[asyncio.Task] = set()
+        self._closing: bool = False
+        self._draining_task: Optional[asyncio.Task] = None
+
+    async def close(self) -> None:
+        """Idempotently stop account background work and drain owned resources."""
+        self._closing = True
+        if self._draining_task is not None and not self._draining_task.done():
+            if asyncio.current_task() is not self._draining_task:
+                await asyncio.shield(self._draining_task)
+            return
+
+        caller_task = asyncio.current_task()
+
+        async def _drain() -> None:
+            current = asyncio.current_task()
+            if self._owns_library_sync and hasattr(self.library_sync, "close"):
+                await self.library_sync.close()
+            while True:
+                pending = [
+                    task
+                    for task in list(self._status_tasks)
+                    if not task.done() and task is not current and task is not caller_task
+                ]
+                if not pending:
+                    break
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._status_tasks.clear()
+
+        self._draining_task = asyncio.create_task(_drain())
+        try:
+            await self._draining_task
+        finally:
+            if self._draining_task is not None and self._draining_task.done():
+                self._draining_task = None
+
+    async def cog_unload(self) -> None:
+        """Drain status-edit tasks and owned fallback coordinator when unloaded."""
+        await self.close()
+
+    def _on_status_task_done(self, task: asyncio.Task, username: str) -> None:
+        self._status_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "Unexpected error updating library sync status for %s",
+                username,
+                exc_info=exc,
+            )
+
+    def _schedule_status_edit(
+        self,
+        completed: asyncio.Task,
+        username: str,
+        status_message,
+    ) -> None:
+        if self._closing:
+            if not completed.cancelled():
+                completed.exception()
+            return
+        edit_task = asyncio.create_task(
+            self._update_link_status(completed, username, status_message)
+        )
+        self._status_tasks.add(edit_task)
+        edit_task.add_done_callback(
+            lambda finished, name=username: self._on_status_task_done(finished, name)
+        )
 
     def _start_sync_task(
         self,
@@ -40,6 +118,11 @@ class AccountCog(commands.Cog, name="Account"):
         freshness_window_seconds: Optional[float] = None,
     ) -> asyncio.Task:
         """Request one shared refresh for the normalized Backloggd profile."""
+        if self._closing:
+            async def _cancelled():
+                raise asyncio.CancelledError("Account cog is shutting down")
+            return asyncio.create_task(_cancelled())
+
         profile_key = username.strip().lower()
         task = self.library_sync.request(
             profile_key,
@@ -50,8 +133,8 @@ class AccountCog(commands.Cog, name="Account"):
         )
         if status_message:
             task.add_done_callback(
-                lambda completed: asyncio.create_task(
-                    self._update_link_status(completed, username, status_message)
+                lambda completed, name=username, msg=status_message: self._schedule_status_edit(
+                    completed, name, msg
                 )
             )
         return task
@@ -61,6 +144,10 @@ class AccountCog(commands.Cog, name="Account"):
         await seed_profile_sync_state(self.bot, username, service=self.library_sync)
 
     async def _update_link_status(self, task: asyncio.Task, username: str, status_message) -> None:
+        if self._closing:
+            if not task.cancelled():
+                task.exception()
+            return
         safe_username = escape_display_text(username)
         try:
             result = task.result()
@@ -93,6 +180,8 @@ class AccountCog(commands.Cog, name="Account"):
                 title = "Library sync complete"
                 description = f"Synced **{result.game_count or 0}** games for **{safe_username}**. Your ratings are ready to use with `/game`."
                 color = COLOR_PLAYED
+        if self._closing:
+            return
         embed = discord.Embed(title=title, description=description, color=color)
         try:
             await status_message.edit(embed=embed)
@@ -103,50 +192,53 @@ class AccountCog(commands.Cog, name="Account"):
         """Fetch and atomically replace the linked profile's cached library."""
         return await sync_profile_library(self.bot, username, discord_id=discord_id)
 
+    async def _build_same_profile_link_notice(
+        self, interaction: discord.Interaction, linked_name: str
+    ) -> str:
+        safe_linked = escape_display_text(linked_name)
+        linked_url = build_backloggd_user_url(linked_name)
+        if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
+            await self.bot.db.set_guild_feed_preference(
+                interaction.guild_id, interaction.user.id, True
+            )
+            participation = " Your profile is also enabled for this server's activity feed."
+        else:
+            participation = (
+                " Use `/feed on` in each server where you want activity announcements."
+                if interaction.guild is None
+                else ""
+            )
+        return (
+            f"ℹ️ You are already linked to Backloggd user **[{safe_linked}]({linked_url})**.\n"
+            f"If you want to sync your latest games and ratings, use `/refresh`.{participation}"
+        )
+
     @app_commands.command(name="link", description="Link your Discord account to your Backloggd username")
     @app_commands.describe(username="Your Backloggd username (e.g. Gamer123)")
     async def link(self, interaction: discord.Interaction, username: str):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         try:
             clean_user = normalize_backloggd_username(username)
         except InvalidUsernameError as err:
-            await interaction.followup.send(
-                f"❌ {err}",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await send_private_followup(interaction, f"❌ {err}", log=logger)
             return
 
         # 1. Check if the user is already linked to an account
         existing_link = await self.bot.db.get_linked_user(interaction.user.id)
         if existing_link:
             linked_name = existing_link["backloggd_username"]
-            safe_linked = escape_display_text(linked_name)
-            linked_url = build_backloggd_user_url(linked_name)
             if linked_name.lower() == clean_user.lower():
-                if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
-                    await self.bot.db.set_guild_feed_preference(
-                        interaction.guild_id, interaction.user.id, True
-                    )
-                    participation = " Your profile is also enabled for this server's activity feed."
-                else:
-                    participation = (
-                        " Use `/feed on` in each server where you want activity announcements."
-                        if interaction.guild is None else ""
-                    )
-                await interaction.followup.send(
-                    f"ℹ️ You are already linked to Backloggd user **[{safe_linked}]({linked_url})**.\n"
-                    f"If you want to sync your latest games and ratings, use `/refresh`." + participation,
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+                message = await self._build_same_profile_link_notice(interaction, linked_name)
+                await send_private_followup(interaction, message, log=logger)
             else:
-                await interaction.followup.send(
+                safe_linked = escape_display_text(linked_name)
+                linked_url = build_backloggd_user_url(linked_name)
+                await send_private_followup(
+                    interaction,
                     f"⚠️ You are currently linked to Backloggd user **[{safe_linked}]({linked_url})**.\n"
                     f"Please run `/unlink` first before linking a different account.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
             return
 
@@ -154,33 +246,52 @@ class AccountCog(commands.Cog, name="Account"):
         try:
             profile = await self.bot.backloggd.get_user_profile(clean_user)
             if not profile or not profile.username:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"❌ Could not find a Backloggd user with the username **{safe_clean}**.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
         except (UserNotFoundError, ResourceNotFoundError):
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ Could not find a Backloggd user with the username **{safe_clean}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
         except Exception as e:
             logger.error("Failed to verify user %s: %s", clean_user, e)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ Backloggd could not verify **{safe_clean}** right now. Please try again shortly.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
 
-        await self.bot.db.link_user(
+        linked = await self.bot.db.link_user_if_unlinked(
             discord_id=interaction.user.id,
             username=profile.username,
             avatar_url=profile.avatar_url,
         )
+        if not linked:
+            current_link = await self.bot.db.get_linked_user(interaction.user.id)
+            if current_link is None:
+                conflict_message = (
+                    "ℹ️ Your account connection changed while verifying this profile. "
+                    "Please run `/link` again."
+                )
+            elif current_link["backloggd_username"].lower() == profile.username.strip().lower():
+                conflict_message = await self._build_same_profile_link_notice(
+                    interaction, current_link["backloggd_username"]
+                )
+            else:
+                conflict_message = (
+                    "⚠️ Your Discord account was linked while this Backloggd profile was being verified. "
+                    "Run `/unlink` before linking a different account."
+                )
+            await send_private_followup(interaction, conflict_message, log=logger)
+            return
+
         if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
             await self.bot.db.set_guild_feed_preference(
                 interaction.guild_id, interaction.user.id, True
@@ -198,8 +309,9 @@ class AccountCog(commands.Cog, name="Account"):
             ),
             color=COLOR_PLAYED
         )
-        if profile.avatar_url:
-            embed.set_thumbnail(url=profile.avatar_url)
+        clean_avatar = clean_image_url(profile.avatar_url)
+        if clean_avatar:
+            embed.set_thumbnail(url=clean_avatar)
 
         duplicate_names = []
         if interaction.guild:
@@ -231,7 +343,8 @@ class AccountCog(commands.Cog, name="Account"):
                 inline=False,
             )
 
-        status_message = await interaction.followup.send(
+        status_message = await send_public_followup(
+            interaction,
             embed=embed,
             wait=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -247,22 +360,25 @@ class AccountCog(commands.Cog, name="Account"):
 
     @app_commands.command(name="unlink", description="Unlink your Backloggd account from Discord")
     async def unlink(self, interaction: discord.Interaction):
+        await defer_interaction(interaction, ephemeral=True)
         success = await self.bot.db.unlink_user(interaction.user.id)
         if success:
-            await interaction.response.send_message(
+            await send_private_followup(
+                interaction,
                 "Successfully disconnected your Backloggd profile. Shared library data remains available to other linked members, and past feed posts stay in place.",
-                ephemeral=True
+                log=logger,
             )
         else:
-            await interaction.response.send_message(
+            await send_private_followup(
+                interaction,
                 "ℹ️ You do not currently have a Backloggd account linked.",
-                ephemeral=True
+                log=logger,
             )
 
     @app_commands.command(name="refresh", description="Refresh your Backloggd library and ratings")
     @app_commands.describe(user="Optional: Server member whose linked library to refresh (defaults to you)")
     async def refresh(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         target_discord_id = user.id if user else interaction.user.id
         linked = await self.bot.db.get_linked_user(target_discord_id)
@@ -273,11 +389,7 @@ class AccountCog(commands.Cog, name="Account"):
                 msg = f"❌ **{safe_name}** does not have a linked Backloggd account yet. They can link one with `/link <username>`."
             else:
                 msg = "❌ You do not have a linked Backloggd account. Use `/link <username>` first."
-            await interaction.followup.send(
-                msg,
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await send_private_followup(interaction, msg, log=logger)
             return
 
         username = linked["backloggd_username"]
@@ -300,10 +412,12 @@ class AccountCog(commands.Cog, name="Account"):
             )[:4096],
             color=COLOR_PRIMARY,
         )
-        if linked["avatar_url"]:
-            embed.set_thumbnail(url=linked["avatar_url"])
+        clean_avatar = clean_image_url(linked["avatar_url"])
+        if clean_avatar:
+            embed.set_thumbnail(url=clean_avatar)
 
-        status_message = await interaction.followup.send(
+        status_message = await send_public_followup(
+            interaction,
             embed=embed,
             wait=True,
             allowed_mentions=discord.AllowedMentions.none(),

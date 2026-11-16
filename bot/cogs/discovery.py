@@ -22,6 +22,7 @@ from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -52,7 +53,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
     @app_commands.command(name="roulette", description="Pick an unrated game from your Backlog or Wishlist")
     @app_commands.describe(user="Optional: Server member to spin the roulette for (defaults to you)")
     async def roulette(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         target_discord_id = user.id if user else interaction.user.id
         linked = await self.bot.db.get_linked_user(target_discord_id)
@@ -63,11 +64,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 msg = f"❌ **{safe_name}** does not have a linked Backloggd account yet."
             else:
                 msg = "❌ You do not have a linked Backloggd account! Use `/link <username>` first."
-            await interaction.followup.send(
-                msg,
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await send_private_followup(interaction, msg, log=logger)
             return
 
         username = linked["backloggd_username"]
@@ -84,17 +81,17 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         if not backlog_games:
             if status is not None and status.missing:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     format_fetching_library_message(username, status),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
             safe_username = escape_display_text(username)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"ℹ️ **{safe_username}** has no unrated games in `Backlog` or `Wishlist` in the local cache. Try `/refresh` to sync your latest library.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
 
@@ -125,7 +122,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             on_reroll=on_reroll
         )
 
-        view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
+        view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
     # =========================================================================
     # /recommend (Taste-Matched Server Recommendations)
@@ -139,10 +136,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         user="Optional server member to recommend your games to (defaults to recommendations for you)"
     )
     async def recommend(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         if not interaction.guild:
-            await interaction.followup.send("❌ This command must be run inside a Discord server.", ephemeral=True)
+            await send_private_followup(interaction, "❌ This command must be run inside a Discord server.", log=logger)
             return
 
         caller_discord_id = interaction.user.id
@@ -154,9 +151,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         # =====================================================================
         if user and user.id != caller_discord_id:
             if not caller_link:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "❌ You haven't linked your Backloggd account yet! Use `/link <username>` to recommend your games to others.",
-                    ephemeral=True
+                    log=logger,
                 )
                 return
 
@@ -165,9 +163,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             friend_discord_id = user.id
             friend_link = await self.bot.db.get_linked_user(friend_discord_id)
             if friend_link and self._linked_profile_key(friend_link) == caller_key:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "ℹ️ Both Discord members link to the same Backloggd profile, so there is no separate profile to recommend to.",
-                    ephemeral=True,
+                    log=logger,
                 )
                 return
 
@@ -183,16 +182,16 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             safe_caller = escape_display_text(caller_username)
             if not caller_ratings:
                 if caller_status is not None and caller_status.missing:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         format_fetching_library_message(caller_username, caller_status),
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                 else:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library first."[:2000],
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                 return
 
@@ -231,24 +230,25 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             if not eligible_games:
                 if friend_link:
                     if has_uncertain_library_exclusion(caller_ratings, friend_entries):
-                        await interaction.followup.send(
+                        await send_private_followup(
+                            interaction,
                             (
                                 f"ℹ️ No eligible 4.0+ recommendations were found for **{safe_friend}** "
                                 "(matching games with an unknown status in their library were conservatively excluded)."
                             )[:2000],
-                            ephemeral=True,
-                            allowed_mentions=discord.AllowedMentions.none(),
+                            log=logger,
                         )
                     else:
-                        await interaction.followup.send(
+                        await send_private_followup(
+                            interaction,
                             f"🎉 **{safe_friend}** has already played, started, or rated all of your 4.0+ rated games."[:2000],
-                            ephemeral=True,
-                            allowed_mentions=discord.AllowedMentions.none(),
+                            log=logger,
                         )
                 else:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
-                        ephemeral=True,
+                        log=logger,
                     )
                 return
 
@@ -293,16 +293,17 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 embed.add_field(name="⏱ Cache Freshness", value=freshness_text[:1024], inline=False)
 
             embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot"[:2048])
-            await interaction.followup.send(embed=embed)
+            await send_public_followup(interaction, embed=embed)
             return
 
         # =====================================================================
         # MODE 1: Discover recommendations from distinct server profiles with similar taste.
         # =====================================================================
         if not caller_link:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "❌ You do not have a linked Backloggd account. Use `/link <username>` first.",
-                ephemeral=True
+                log=logger,
             )
             return
 
@@ -318,25 +319,25 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         if not my_ratings:
             if caller_status is not None and caller_status.missing:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     format_fetching_library_message(caller_username, caller_status),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
             else:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library."[:2000],
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
             return
 
         my_numeric_ratings = numeric_ratings(my_ratings)
         if not my_numeric_ratings:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"ℹ️ **{safe_caller}** has no numeric game ratings in the cached library yet. Similarity needs rated games; unrated backlog and wishlist entries do not count."[:2000],
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
             return
 
@@ -344,9 +345,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             self.bot, interaction.guild, exclude_member_id=caller_discord_id
         )
         if guild_member_ids is None:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-                ephemeral=True,
+                log=logger,
             )
             return
         other_linked = await self.bot.db.get_guild_linked_profiles(
@@ -354,9 +356,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         )
 
         if not other_linked:
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 "ℹ️ No other distinct Backloggd profiles are linked in this server yet. Invite members to use `/link`.",
-                ephemeral=True
+                log=logger,
             )
             return
 
@@ -392,9 +395,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 reason = "No other profile shares at least two numeric ratings with you yet."
             else:
                 reason = "Other profiles need at least five numeric ratings before we can compare taste."
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"ℹ️ {reason} Unrated backlog and wishlist entries do not count toward similarity.",
-                ephemeral=True
+                log=logger,
             )
             return
 
@@ -454,15 +458,19 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 has_uncertain_library_exclusion(other_ratings, my_entries)
                 for _, _, _, other_ratings in taste_matches
             ):
-                await interaction.followup.send(
-                    "ℹ️ No eligible 4.0+ recommendations were found from similar profiles "
-                    "(matching games with an unknown status in your library were conservatively excluded).",
-                    ephemeral=True,
+                await send_private_followup(
+                    interaction,
+                    (
+                        "ℹ️ No eligible 4.0+ recommendations were found from similar profiles "
+                        "(matching games with an unknown status in your library were conservatively excluded)."
+                    ),
+                    log=logger,
                 )
             else:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "ℹ️ There are no eligible 4.0+ recommendations from similar profiles that you haven't already played, started, or rated.",
-                    ephemeral=True,
+                    log=logger,
                 )
             return
 
@@ -508,7 +516,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
 
         embed.set_footer(text="Diverse recommendations curated across your server taste matches")
-        await interaction.followup.send(embed=embed)
+        await send_public_followup(interaction, embed=embed)
 
 async def setup(bot):
     await bot.add_cog(DiscoveryCog(bot))

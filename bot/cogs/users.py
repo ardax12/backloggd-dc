@@ -17,6 +17,7 @@ from bot.input_validation import (
 from bot.ui.embeds import create_profile_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_review_url, build_backloggd_user_url
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.services.freshness import ensure_profiles_fresh, format_profile_freshness_line
 
 logger = logging.getLogger("backloggd.cogs.users")
@@ -29,7 +30,7 @@ class UsersCog(commands.Cog, name="Users"):
     @app_commands.command(name="profile", description="View a Backloggd user's profile, library stats, and favorite games")
     @app_commands.describe(user="Optional: Mention a server member or provide a Backloggd username (defaults to you)")
     async def profile(self, interaction: discord.Interaction, user: Optional[str] = None):
-        await interaction.response.defer()
+        await defer_interaction(interaction)
 
         target_username = None
         target_discord_id = None
@@ -42,21 +43,17 @@ class UsersCog(commands.Cog, name="Users"):
                 if linked:
                     target_username = linked["backloggd_username"]
                 else:
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         "❌ That user has not linked their Backloggd account yet.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
             else:
                 try:
                     target_username = normalize_backloggd_username(user)
                 except InvalidUsernameError as err:
-                    await interaction.followup.send(
-                        f"❌ {err}",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                    await send_private_followup(interaction, f"❌ {err}", log=logger)
                     return
         else:
             target_discord_id = interaction.user.id
@@ -64,10 +61,10 @@ class UsersCog(commands.Cog, name="Users"):
             if linked:
                 target_username = linked["backloggd_username"]
             else:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     "❌ You haven't linked your Backloggd account yet! Use `/link <username>` first.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
@@ -86,25 +83,25 @@ class UsersCog(commands.Cog, name="Users"):
 
             if profile_error:
                 if isinstance(profile_error, (UserNotFoundError, ResourceNotFoundError)):
-                    await interaction.followup.send(
+                    await send_private_followup(
+                        interaction,
                         f"❌ Backloggd user **{safe_target}** could not be found.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        log=logger,
                     )
                     return
                 logger.warning("Could not load Backloggd profile for %s: %s", target_username, profile_error)
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"❌ Backloggd could not load **{safe_target}**'s profile right now. Please try again shortly.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
             if not profile_data or not profile_data.username:
-                await interaction.followup.send(
+                await send_private_followup(
+                    interaction,
                     f"❌ Backloggd user **{safe_target}** could not be found.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    log=logger,
                 )
                 return
 
@@ -170,14 +167,14 @@ class UsersCog(commands.Cog, name="Users"):
                 extra_buttons=extra_buttons if extra_buttons else None
             )
 
-            await interaction.followup.send(embed=embed, view=view)
+            await send_public_followup(interaction, embed=embed, view=view)
 
         except Exception as e:
             logger.error("Error looking up profile for '%s': %s", target_username, e, exc_info=True)
-            await interaction.followup.send(
+            await send_private_followup(
+                interaction,
                 f"❌ An error occurred while retrieving profile for **{safe_target}**.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+                log=logger,
             )
 
 async def setup(bot):

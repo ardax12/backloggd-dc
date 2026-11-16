@@ -20,6 +20,7 @@ from bot.ui.helpers import (
     build_backloggd_game_url,
     build_backloggd_user_url,
     clean_image_url,
+    clamp_escaped_text,
     DEFAULT_BACKLOGGD_AVATAR
 )
 
@@ -54,11 +55,12 @@ def create_game_embed(
         desc_lines.append("**Community Rating:** ☆☆☆☆☆ *No ratings yet*")
 
     if game.summary:
-        # Truncate summary if too long
-        summary = game.summary if len(game.summary) <= 220 else game.summary[:217] + "..."
-        desc_lines.append(f"\n*{summary}*")
+        clean_summary = re.sub(r"[\r\n]+", " ", str(game.summary)).strip()
+        escaped_summary = escape_display_text(clean_summary)
+        wrapped_summary = f"\n*{escaped_summary}*"
+        desc_lines.append(clamp_escaped_text(wrapped_summary, 280, suffix="...*"))
 
-    embed.description = "\n".join(desc_lines)
+    embed.description = clamp_escaped_text("\n".join(desc_lines), 4096)
 
     # Global Stats Field
     if hasattr(game, "stats") and game.stats:
@@ -106,7 +108,7 @@ def create_game_embed(
             server_lines.append(f"*+ {remaining} more profiles (click 'View All Ratings' below)*")
 
         field_name = f"👥 {guild_name} Profile Ratings ({len(server_ratings)})"[:256]
-        embed.add_field(name=field_name, value="\n".join(server_lines)[:1024], inline=False)
+        embed.add_field(name=field_name, value=clamp_escaped_text("\n".join(server_lines), 1024), inline=False)
     else:
         embed.add_field(
             name=f"👥 {guild_name} Profile Ratings"[:256],
@@ -115,7 +117,7 @@ def create_game_embed(
         )
 
     if freshness_note:
-        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+        embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
 
     embed.set_footer(text="Data from Backloggd • Use /link to connect your profile")
     return embed
@@ -166,17 +168,16 @@ def create_profile_embed(
         clean_bio = re.sub(r"([a-zA-Z0-9]),([a-zA-Z])", r"\1, \2", clean_bio)
         clean_bio = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", clean_bio)
         clean_bio = re.sub(r"\s+", " ", clean_bio).strip()
-        # Enforce character limit for bio
-        if len(clean_bio) > 250:
-            clean_bio = clean_bio[:247].rsplit(" ", 1)[0] + "..."
-        desc_lines.append(f"> {clean_bio}")
+        escaped_bio = escape_display_text(clean_bio)
+        quoted_bio = f"> {escaped_bio}"
+        desc_lines.append(clamp_escaped_text(quoted_bio, 350, preserve_word_boundary=True))
 
     # Show badges count cleanly if any achievements earned
     if profile.badges:
         desc_lines.append(f"🏆 **{len(profile.badges)}** Badges Earned")
 
     if desc_lines:
-        embed.description = "\n\n".join(desc_lines)
+        embed.description = clamp_escaped_text("\n\n".join(desc_lines), 4096)
 
     # Activity Counter Fields
     played = getattr(profile, "played_count", 0) or 0
@@ -215,8 +216,13 @@ def create_profile_embed(
                 title = val() if callable(val) else val
             else:
                 title = str(fav)
-            fav_lines.append(f"**{i}.** {title}")
-        embed.add_field(name="⭐ Favorite Games", value="\n".join(fav_lines)[:1024], inline=False)
+            safe_title = clamp_escaped_text(escape_display_text(title), 180)
+            fav_lines.append(f"**{i}.** {safe_title}")
+        embed.add_field(
+            name="⭐ Favorite Games",
+            value=clamp_escaped_text("\n".join(fav_lines), 1024),
+            inline=False,
+        )
 
     # 2. Recently Played (up to 5)
     if recent_played:
@@ -230,15 +236,21 @@ def create_profile_embed(
             date_str = getattr(entry, "played_date", None)
             replay = " 🔄" if getattr(entry, "is_replay", False) else ""
 
+            safe_title = clamp_escaped_text(escape_display_text(title), 140)
             stars = f" — {rating_to_stars(rating)}" if rating is not None else ""
-            date_suffix = f" *({date_str})*" if date_str else ""
-            recent_lines.append(f"• **{title}**{stars}{replay}{date_suffix}")
+            safe_date = clamp_escaped_text(escape_display_text(date_str), 40) if date_str else None
+            date_suffix = f" *({safe_date})*" if safe_date else ""
+            recent_lines.append(f"• **{safe_title}**{stars}{replay}{date_suffix}")
         if recent_lines:
-            embed.add_field(name="🕹️ Recently Played", value="\n".join(recent_lines)[:1024], inline=False)
+            embed.add_field(
+                name="🕹️ Recently Played",
+                value=clamp_escaped_text("\n".join(recent_lines), 1024),
+                inline=False,
+            )
 
     # 3. Latest Review (if present)
     if latest_review and getattr(latest_review, "game_title", None):
-        r_title = latest_review.game_title
+        r_title = clamp_escaped_text(escape_display_text(latest_review.game_title), 256)
         r_rating = rating_to_stars(latest_review.rating) if latest_review.rating is not None else ""
         likes_count = getattr(latest_review, "like_count", 0)
         likes_text = f" • ❤️ {likes_count}" if likes_count > 0 else ""
@@ -252,21 +264,32 @@ def create_profile_embed(
             clean_text = re.sub(r"([a-zA-Z0-9]),([a-zA-Z])", r"\1, \2", clean_text)
             clean_text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", clean_text)
             clean_text = re.sub(r"\s+", " ", clean_text).strip()
+            escaped_body = escape_display_text(clean_text)
 
-            if len(clean_text) > 200:
-                clean_text = clean_text[:197].rsplit(" ", 1)[0] + "..."
-
-            if getattr(latest_review, "has_spoilers", False):
-                review_content = f"{header}\n|| > \"{clean_text}\" ||"
+            has_spoilers = bool(getattr(latest_review, "has_spoilers", False))
+            body_budget = max(80, min(320, 1024 - len(header) - 1))
+            if has_spoilers:
+                review_line = clamp_escaped_text(
+                    f'|| > "{escaped_body}" ||',
+                    body_budget,
+                    suffix='..." ||',
+                    preserve_word_boundary=True,
+                )
             else:
-                review_content = f"{header}\n> \"{clean_text}\""
+                review_line = clamp_escaped_text(
+                    f'> "{escaped_body}"',
+                    body_budget,
+                    suffix='..."',
+                    preserve_word_boundary=True,
+                )
+            review_content = f"{header}\n{review_line}"
         else:
-            review_content = header
+            review_content = clamp_escaped_text(header, 1024)
 
-        embed.add_field(name="📝 Latest Review", value=review_content[:1024], inline=False)
+        embed.add_field(name="📝 Latest Review", value=review_content, inline=False)
 
     if freshness_note:
-        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+        embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
 
     embed.set_footer(text="Backloggd Profile Overview • Connect yours with /link")
     return embed
@@ -307,7 +330,7 @@ def create_compare_embed(
         lines = []
         for g in shared_loves[:5]:
             lines.append(f"• **{escape_display_text(g['title'])}** ({safe_u1}: `{g['r1']:.1f}` | {safe_u2}: `{g['r2']:.1f}`)")
-        embed.add_field(name="❤️ Shared Loves (Both Rated 4.0+)", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="❤️ Shared Loves (Both Rated 4.0+)", value=clamp_escaped_text("\n".join(lines), 1024), inline=False)
     else:
         embed.add_field(name="❤️ Shared Loves", value="*No shared 4.0+ ratings found.*", inline=False)
 
@@ -316,10 +339,10 @@ def create_compare_embed(
         lines = []
         for g in disagreements[:5]:
             lines.append(f"• **{escape_display_text(g['title'])}** ({safe_u1}: `{g['r1']:.1f}` vs {safe_u2}: `{g['r2']:.1f}` — `Δ {g['delta']:.1f}`)")
-        embed.add_field(name="⚡ Biggest Disagreements", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="⚡ Biggest Disagreements", value=clamp_escaped_text("\n".join(lines), 1024), inline=False)
 
     if freshness_note:
-        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+        embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
 
     embed.set_footer(text="Calculated using Backloggd library similarity metrics")
     return embed
@@ -365,9 +388,9 @@ def create_roulette_embed(
         desc_lines.append(f"{stars} **{community_rating:.1f}** / 5.0")
     
     desc_lines.append(f"\n🎯 **Your Mission:** Pick one of these unrated games to play! ({remaining_backlog} games still waiting)")
-    embed.description = "\n".join(desc_lines)[:4096]
+    embed.description = clamp_escaped_text("\n".join(desc_lines), 4096)
     if freshness_note:
-        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+        embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
     embed.set_footer(text="Click [🔄 Reroll] below to spin again")
     return embed
 
@@ -387,7 +410,7 @@ def create_server_top_embed(
     if not entries:
         embed.description = "*Not enough server data to generate this leaderboard yet.*"
         if freshness_note:
-            embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+            embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
         return embed
 
     lines = []
@@ -419,9 +442,9 @@ def create_server_top_embed(
         else:
             lines.append(f"{prefix} **[{game_title}]({url})**")
 
-    embed.description = "\n".join(lines)[:4096]
+    embed.description = clamp_escaped_text("\n".join(lines), 4096)
     if freshness_note:
-        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+        embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
     embed.set_footer(text=f"Server rankings across distinct Backloggd profiles linked in {guild_name}"[:2048])
     return embed
 
@@ -433,7 +456,7 @@ def create_server_stats_embed(
     """Construct embed for /server-stats overview."""
     embed = discord.Embed(
         title=f"📊 {guild_name} Gaming Stats"[:256],
-        description=f"⏱ {freshness_note}"[:4096] if freshness_note else None,
+        description=clamp_escaped_text(f"⏱ {freshness_note}", 4096) if freshness_note else None,
         color=COLOR_PRIMARY
     )
 
@@ -463,7 +486,7 @@ def create_server_stats_embed(
         logged_value = f"**{stats['total_logged']}** games"
     embed.add_field(name="📚 Games Logged", value=logged_value, inline=True)
     embed.add_field(name="⭐ Server Avg Rating", value=avg_str, inline=True)
-    embed.add_field(name="👑 Most Played Game", value=str(top_game)[:1024], inline=True)
+    embed.add_field(name="👑 Most Played Game", value=clamp_escaped_text(str(top_game), 1024), inline=True)
 
     embed.set_footer(text="Games Logged sums Played tabs per unique linked profile; profile counts cached up to 1 hour.")
     return embed
@@ -491,7 +514,7 @@ def create_taste_twins_embed(
     desc_lines = [f"Comparing gaming taste across **{escape_display_text(guild_name)}**."]
     if server_avg_match is not None:
         desc_lines.append(f"**Community Compatibility:** `{int(round(server_avg_match))}%` average agreement")
-    embed.description = "\n".join(desc_lines)[:4096]
+    embed.description = clamp_escaped_text("\n".join(desc_lines), 4096)
 
     # 1. Top Taste Twins
     if twins:
@@ -506,7 +529,7 @@ def create_taste_twins_embed(
                 f"{medal} **[{safe_twin}]({twin_url})** "
                 f"(`{t['match_pct']}%` match, {t['shared_count']} shared){fav_text}"
             )
-        embed.add_field(name="✨ Top Taste Soulmates", value="\n".join(twin_lines)[:1024], inline=False)
+        embed.add_field(name="✨ Top Taste Soulmates", value=clamp_escaped_text("\n".join(twin_lines), 1024), inline=False)
     else:
         embed.add_field(
             name="✨ Top Taste Soulmates",
@@ -527,10 +550,10 @@ def create_taste_twins_embed(
             f"⚡ **[{safe_nem}]({nem_url})** "
             f"(`{nemesis['match_pct']}%` match, {nemesis['shared_count']} shared){nem_fav}"
         )
-        embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=nem_line[:1024], inline=False)
+        embed.add_field(name="⚡ #1 Taste Nemesis (Polar Opposite)", value=clamp_escaped_text(nem_line, 1024), inline=False)
 
     if freshness_note:
-        embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+        embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
 
     embed.set_footer(text="Based on Backloggd library ratings • Use /compare to duel with any member")
     return embed
@@ -580,7 +603,7 @@ def create_all_ratings_embed(
     # Split at profile boundaries rather than cutting off ratings mid-line.
     chunk = ""
     for line in lines:
-        line = line if len(line) <= 280 else line[:277] + "..."
+        line = clamp_escaped_text(line, 280)
         if chunk and len(chunk) + 1 + len(line) > 1024:
             embed.add_field(name="Profile Ratings & Status", value=chunk, inline=False)
             chunk = ""

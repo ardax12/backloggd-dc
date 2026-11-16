@@ -333,6 +333,54 @@ class DbTransactionAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turso_res[1].rows[0]["display_username"], "TB1")
         self.assertFalse(self.turso_db._operation_lock.locked())
 
+    async def test_source_removal_reconciliation_rollback_and_turso_parity(self):
+        from unittest.mock import patch
+
+        for label, db in (("sqlite", self.db), ("turso", self.turso_db)):
+            with self.subTest(backend=label):
+                await db.link_user(10, "Millers")
+                await db.link_user(11, "Millers")
+                await db.set_feed_channel(1, 500)
+                await db.set_guild_feed_preference(1, 10, True)
+                await db.set_guild_feed_preference(1, 11, True)
+                await db.reconcile_guild_feed_activity(1, ["millers"])
+                await db.seed_feed_source(1, "millers", "activity-display-v1", ["old"])
+                await db.seed_feed_message(1, "millers", ["old"], '{"id":"old"}')
+
+                # 1. Opt-off member 10 with unknown membership -> retains uncertainty because member 11 exists
+                res1 = await db.disable_guild_feed_preference_and_reconcile(1, 10, member_ids=None)
+                self.assertEqual(res1["profile_key"], "millers")
+                self.assertFalse(res1["deactivated"])
+                self.assertTrue(res1["pending_reconciliation"])
+                self.assertTrue(await db.has_feed_source(1, "millers", "activity-display-v1"))
+
+                # 2. Simulate transaction rollback during member 11 opt-off -> member 11 pref stays enabled & pending row stays intact!
+                orig_deactivate = db._deactivate_guild_profile_tx
+                with patch.object(db, "_deactivate_guild_profile_tx", side_effect=RuntimeError("mid-tx boom")):
+                    with self.assertRaisesRegex(RuntimeError, "mid-tx boom"):
+                        await db.disable_guild_feed_preference_and_reconcile(1, 11, member_ids=None)
+                self.assertTrue(await db.get_guild_feed_preference(1, 11))
+                self.assertTrue(await db.has_feed_source(1, "millers", "activity-display-v1"))
+                self.assertFalse(db._operation_lock.locked())
+
+                # 3. Clean opt-off of member 11 -> sole remaining holder gone -> deactivated atomically while archive kept!
+                res2 = await db.disable_guild_feed_preference_and_reconcile(1, 11, member_ids=None)
+                self.assertTrue(res2["deactivated"])
+                self.assertFalse(await db.has_feed_source(1, "millers", "activity-display-v1"))
+                self.assertFalse((await db.get_guild_profile_feed_status(1, "millers"))["active"])
+                self.assertIsNotNone(await db._fetchone(
+                    "SELECT 1 FROM profile_feed_messages WHERE guild_id = 1 AND profile_key = 'millers' AND event_id = 'old'"
+                ))
+
+                # 4. Admin follow removal under unknown membership (no stored members) -> deactivated atomically
+                await db.add_guild_admin_follow(1, "SoloAdmin", None, 99)
+                await db.reconcile_guild_feed_activity(1, ["soloadmin"], present_member_ids=[])
+                await db.seed_feed_source(1, "soloadmin", "activity-display-v1", ["a1"])
+                admin_res = await db.remove_guild_admin_follow_and_reconcile(1, "SoloAdmin", member_ids=None)
+                self.assertTrue(admin_res["removed"])
+                self.assertTrue(admin_res["deactivated"])
+                self.assertFalse(await db.has_feed_source(1, "soloadmin", "activity-display-v1"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -87,16 +87,62 @@ def build_backloggd_review_url(username: str, review_id: Any) -> str:
 DEFAULT_BACKLOGGD_AVATAR = "https://backloggd.b-cdn.net/no_avatar.jpg"
 
 def clean_image_url(url: Optional[str]) -> Optional[str]:
-    """Ensure image URLs are well-formed absolute URLs for Discord embeds."""
+    """Ensure image URLs are well-formed http/https URLs for Discord embeds."""
     if not url:
         return None
     cleaned = str(url).strip()
     if not cleaned:
         return None
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        return None
     if cleaned.startswith("//"):
-        return f"https:{cleaned}"
-    if cleaned.startswith("/"):
-        return f"https://backloggd.com{cleaned}"
-    if not cleaned.startswith("http://") and not cleaned.startswith("https://"):
-        return f"https://{cleaned}"
+        cleaned = f"https:{cleaned}"
+    elif cleaned.startswith("/"):
+        cleaned = f"https://backloggd.com{cleaned}"
+    elif not cleaned.lower().startswith(("http://", "https://")):
+        return None
+
+    parsed = urllib.parse.urlsplit(cleaned)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    if not parsed.netloc or not parsed.hostname:
+        return None
     return cleaned
+
+
+def truncate_button_label(text: Any, max_length: int = 80) -> str:
+    """Bound plain-text Discord button labels to max_length characters including ellipsis."""
+    raw = "" if text is None else str(text)
+    if len(raw) <= max_length:
+        return raw
+    if max_length <= 3:
+        return raw[: max(0, max_length)]
+    return raw[: max_length - 3].rstrip() + "..."
+
+
+def clamp_escaped_text(
+    text: str,
+    max_length: int,
+    *,
+    suffix: str = "...",
+    preserve_word_boundary: bool = False,
+) -> str:
+    """Clamp already-escaped Markdown text without splitting a backslash escape."""
+    if len(text) <= max_length:
+        return text
+    if max_length <= 0:
+        return ""
+    if len(suffix) >= max_length:
+        return suffix[:max_length]
+
+    cutoff = max_length - len(suffix)
+    cut = text[:cutoff]
+    if preserve_word_boundary and " " in cut:
+        candidate = cut.rsplit(" ", 1)[0]
+        if len(candidate) >= cutoff // 2:
+            cut = candidate
+    cut = cut.rstrip()
+    trailing_backslashes = len(cut) - len(cut.rstrip("\\"))
+    if trailing_backslashes % 2 == 1:
+        cut = cut[:-1]
+    return f"{cut}{suffix}"

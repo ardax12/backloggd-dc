@@ -3,8 +3,9 @@
 Supports both local SQLite (aiosqlite) and Turso / libSQL Cloud Database (libsql-client).
 """
 
-import logging
 import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
@@ -356,6 +357,43 @@ class Database:
         ])
         return True
 
+    async def link_user_if_unlinked(
+        self, discord_id: int, username: str, avatar_url: Optional[str] = None
+    ) -> bool:
+        """Create a member link only if no link exists, without replacing a concurrent winner."""
+        from bot.ui.helpers import clean_image_url
+
+        clean_avatar = clean_image_url(avatar_url)
+        display_username = username.strip()
+        profile_key = display_username.lower()
+        async with self._transaction() as tx:
+            existing = await tx.fetchone(
+                "SELECT 1 FROM linked_users WHERE discord_id = ? LIMIT 1;", (discord_id,)
+            )
+            if existing is not None:
+                return False
+
+            await tx.execute(
+                """
+                INSERT INTO profiles (profile_key, display_username, avatar_url)
+                VALUES (?, ?, ?)
+                ON CONFLICT(profile_key) DO UPDATE SET
+                    display_username = excluded.display_username,
+                    avatar_url = COALESCE(excluded.avatar_url, profiles.avatar_url)
+                """,
+                (profile_key, display_username, clean_avatar),
+            )
+            inserted = await tx.execute(
+                """
+                INSERT INTO linked_users
+                    (discord_id, profile_key, backloggd_username, avatar_url, last_synced_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(discord_id) DO NOTHING;
+                """,
+                (discord_id, profile_key, display_username, clean_avatar),
+            )
+            return inserted > 0
+
     async def unlink_user(self, discord_id: int) -> bool:
         """Remove this member's connection and deactivate guild feeds with no remaining source."""
         async with self._transaction() as tx:
@@ -375,38 +413,13 @@ class Database:
                 (profile_key,),
             )
             for active_row in active_guilds:
-                guild_id = active_row["guild_id"]
-                has_member = await tx.fetchone(
-                    """SELECT 1 FROM linked_users AS u
-                       JOIN guild_feed_preferences AS pref ON pref.discord_id = u.discord_id
-                       WHERE u.profile_key = ? AND pref.guild_id = ? AND pref.enabled = 1
-                       LIMIT 1""",
-                    (profile_key, guild_id),
+                await self._reconcile_removed_profile_source_tx(
+                    tx,
+                    active_row["guild_id"],
+                    profile_key,
+                    present_member_ids=None,
+                    removed_discord_id=discord_id,
                 )
-                has_admin = await tx.fetchone(
-                    "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
-                    (guild_id, profile_key),
-                )
-                if has_member is None and has_admin is None:
-                    await tx.execute(
-                        "UPDATE guild_profile_feed_activity SET active = 0 WHERE guild_id = ? AND profile_key = ?",
-                        (guild_id, profile_key),
-                    )
-                    await tx.execute(
-                        "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                        (guild_id, profile_key),
-                    )
-                    await tx.execute(
-                        """DELETE FROM profile_feed_decisions
-                           WHERE guild_id = ? AND profile_key = ?
-                             AND decision IN ('baseline', 'eligible')
-                             AND event_id NOT IN (
-                                 SELECT event_id FROM profile_feed_messages
-                                 WHERE guild_id = ? AND profile_key = ?
-                                   AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
-                             )""",
-                        (guild_id, profile_key, guild_id, profile_key),
-                    )
             return True
 
     async def get_linked_user(self, discord_id: int) -> Optional[Any]:
@@ -698,49 +711,346 @@ class Database:
             )
             return True
 
+    _CLEAR_UNSENT_FEED_DECISIONS_SQL = """
+        DELETE FROM profile_feed_decisions
+        WHERE guild_id = ? AND profile_key = ?
+          AND decision IN ('baseline', 'eligible')
+          AND event_id NOT IN (
+              SELECT event_id FROM profile_feed_messages
+              WHERE guild_id = ? AND profile_key = ?
+                AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
+          )
+    """
+
+    async def _deactivate_guild_profile_tx(self, tx, guild_id: int, profile_key: str) -> None:
+        await tx.execute(
+            """UPDATE guild_profile_feed_activity SET active = 0
+               WHERE guild_id = ? AND profile_key = ?""",
+            (guild_id, profile_key),
+        )
+        await tx.execute(
+            "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
+            (guild_id, profile_key),
+        )
+        await tx.execute(
+            self._CLEAR_UNSENT_FEED_DECISIONS_SQL,
+            (guild_id, profile_key, guild_id, profile_key),
+        )
+
+    async def _resolve_pending_reconciliation_tx(
+        self,
+        tx,
+        guild_id: int,
+        present_member_ids: Iterable[int],
+        *,
+        profile_key: Optional[str] = None,
+    ) -> list[str]:
+        present_set = {int(value) for value in present_member_ids}
+        if profile_key is not None:
+            rows = await tx.fetchall(
+                """SELECT profile_key, had_admin_source, candidate_member_ids
+                   FROM guild_profile_feed_reconciliation
+                   WHERE guild_id = ? AND profile_key = ?""",
+                (guild_id, profile_key),
+            )
+        else:
+            rows = await tx.fetchall(
+                """SELECT profile_key, had_admin_source, candidate_member_ids
+                   FROM guild_profile_feed_reconciliation
+                   WHERE guild_id = ? ORDER BY profile_key""",
+                (guild_id,),
+            )
+        deactivated: list[str] = []
+        for row in rows:
+            pkey = row["profile_key"]
+            had_admin = bool(row["had_admin_source"])
+            candidate_ids = [int(value) for value in json.loads(row["candidate_member_ids"] or "[]")]
+            has_continuous_admin = False
+            if had_admin:
+                has_continuous_admin = (
+                    await tx.fetchone(
+                        "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
+                        (guild_id, pkey),
+                    )
+                ) is not None
+            has_continuous_member = False
+            present_candidates = [cid for cid in candidate_ids if cid in present_set]
+            if present_candidates and not has_continuous_admin:
+                for chunk in _iter_sql_chunks(present_candidates, fixed_params=2):
+                    placeholders = ",".join("?" for _ in chunk)
+                    found = await tx.fetchone(
+                        f"""SELECT 1 FROM linked_users AS u
+                            JOIN guild_feed_preferences AS pref ON pref.discord_id = u.discord_id
+                            WHERE pref.guild_id = ? AND pref.enabled = 1
+                              AND u.profile_key = ?
+                              AND u.discord_id IN ({placeholders})
+                            LIMIT 1""",
+                        [guild_id, pkey, *chunk],
+                    )
+                    if found is not None:
+                        has_continuous_member = True
+                        break
+            if not has_continuous_admin and not has_continuous_member:
+                await self._deactivate_guild_profile_tx(tx, guild_id, pkey)
+                deactivated.append(pkey)
+            await tx.execute(
+                "DELETE FROM guild_profile_feed_reconciliation WHERE guild_id = ? AND profile_key = ?",
+                (guild_id, pkey),
+            )
+        return deactivated
+
+    async def _reconcile_removed_profile_source_tx(
+        self,
+        tx,
+        guild_id: int,
+        profile_key: str,
+        *,
+        present_member_ids: Optional[Iterable[int]] = None,
+        removed_discord_id: Optional[int] = None,
+        removed_admin: bool = False,
+    ) -> dict[str, Any]:
+        act_row = await tx.fetchone(
+            "SELECT active FROM guild_profile_feed_activity WHERE guild_id = ? AND profile_key = ?",
+            (guild_id, profile_key),
+        )
+        was_active = bool(act_row and act_row["active"])
+        has_admin = (
+            await tx.fetchone(
+                "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
+                (guild_id, profile_key),
+            )
+        ) is not None
+        stored_member_rows = await tx.fetchall(
+            """SELECT u.discord_id FROM linked_users AS u
+               JOIN guild_feed_preferences AS pref ON pref.discord_id = u.discord_id
+               WHERE u.profile_key = ? AND pref.guild_id = ? AND pref.enabled = 1
+               ORDER BY u.discord_id""",
+            (profile_key, guild_id),
+        )
+        stored_member_ids = [row["discord_id"] for row in stored_member_rows]
+        stored_member_set = set(stored_member_ids)
+
+        if present_member_ids is not None:
+            present_set = {int(value) for value in present_member_ids}
+            present_members = [mid for mid in stored_member_ids if mid in present_set]
+            if has_admin or present_members:
+                return {
+                    "profile_key": profile_key,
+                    "deactivated": False,
+                    "pending_reconciliation": False,
+                    "has_admin": has_admin,
+                    "remaining_members": present_members,
+                }
+            if was_active:
+                await self._deactivate_guild_profile_tx(tx, guild_id, profile_key)
+            return {
+                "profile_key": profile_key,
+                "deactivated": True,
+                "pending_reconciliation": False,
+                "has_admin": False,
+                "remaining_members": [],
+            }
+
+        pending_row = await tx.fetchone(
+            """SELECT had_admin_source, candidate_member_ids
+               FROM guild_profile_feed_reconciliation
+               WHERE guild_id = ? AND profile_key = ?""",
+            (guild_id, profile_key),
+        )
+        if not was_active:
+            await tx.execute(
+                "DELETE FROM guild_profile_feed_reconciliation WHERE guild_id = ? AND profile_key = ?",
+                (guild_id, profile_key),
+            )
+            if not has_admin and not stored_member_ids:
+                return {
+                    "profile_key": profile_key,
+                    "deactivated": True,
+                    "pending_reconciliation": False,
+                    "has_admin": False,
+                    "remaining_members": [],
+                }
+            return {
+                "profile_key": profile_key,
+                "deactivated": False,
+                "pending_reconciliation": not has_admin and bool(stored_member_ids),
+                "has_admin": has_admin,
+                "remaining_members": stored_member_ids,
+            }
+
+        if pending_row is not None:
+            still_prior_admin = bool(pending_row["had_admin_source"]) and not removed_admin and has_admin
+            narrowed_candidates = [
+                int(cid)
+                for cid in json.loads(pending_row["candidate_member_ids"] or "[]")
+                if int(cid) != removed_discord_id and int(cid) in stored_member_set
+            ]
+            if not still_prior_admin and not narrowed_candidates:
+                await self._deactivate_guild_profile_tx(tx, guild_id, profile_key)
+                await tx.execute(
+                    "DELETE FROM guild_profile_feed_reconciliation WHERE guild_id = ? AND profile_key = ?",
+                    (guild_id, profile_key),
+                )
+                return {
+                    "profile_key": profile_key,
+                    "deactivated": True,
+                    "pending_reconciliation": False,
+                    "has_admin": False,
+                    "remaining_members": [],
+                }
+            await tx.execute(
+                """UPDATE guild_profile_feed_reconciliation
+                   SET had_admin_source = ?, candidate_member_ids = ?
+                   WHERE guild_id = ? AND profile_key = ?""",
+                (still_prior_admin, json.dumps(narrowed_candidates), guild_id, profile_key),
+            )
+            return {
+                "profile_key": profile_key,
+                "deactivated": False,
+                "pending_reconciliation": not still_prior_admin,
+                "has_admin": still_prior_admin,
+                "remaining_members": narrowed_candidates,
+            }
+
+        if not has_admin and not stored_member_ids:
+            await self._deactivate_guild_profile_tx(tx, guild_id, profile_key)
+            return {
+                "profile_key": profile_key,
+                "deactivated": True,
+                "pending_reconciliation": False,
+                "has_admin": False,
+                "remaining_members": [],
+            }
+        if has_admin:
+            return {
+                "profile_key": profile_key,
+                "deactivated": False,
+                "pending_reconciliation": False,
+                "has_admin": True,
+                "remaining_members": stored_member_ids,
+            }
+        await tx.execute(
+            """INSERT INTO guild_profile_feed_reconciliation
+               (guild_id, profile_key, had_admin_source, candidate_member_ids)
+               VALUES (?, ?, 0, ?)
+               ON CONFLICT(guild_id, profile_key) DO UPDATE SET
+                   had_admin_source = excluded.had_admin_source,
+                   candidate_member_ids = excluded.candidate_member_ids""",
+            (guild_id, profile_key, json.dumps(stored_member_ids)),
+        )
+        return {
+            "profile_key": profile_key,
+            "deactivated": False,
+            "pending_reconciliation": True,
+            "has_admin": False,
+            "remaining_members": stored_member_ids,
+        }
+
+    async def disable_guild_feed_preference_and_reconcile(
+        self,
+        guild_id: int,
+        discord_id: int,
+        *,
+        member_ids: Optional[Iterable[int]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically opt a member out and deactivate/record reconciliation for their profile."""
+        async with self._transaction() as tx:
+            linked = await tx.fetchone(
+                "SELECT profile_key FROM linked_users WHERE discord_id = ? LIMIT 1",
+                (discord_id,),
+            )
+            if not linked:
+                return None
+            profile_key = linked["profile_key"]
+            if member_ids is not None:
+                await self._resolve_pending_reconciliation_tx(
+                    tx, guild_id, member_ids, profile_key=profile_key
+                )
+            await tx.execute(
+                """INSERT INTO guild_feed_preferences (guild_id, discord_id, enabled, updated_at)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(guild_id, discord_id) DO UPDATE SET
+                       enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP""",
+                (guild_id, discord_id, False),
+            )
+            return await self._reconcile_removed_profile_source_tx(
+                tx,
+                guild_id,
+                profile_key,
+                present_member_ids=member_ids,
+                removed_discord_id=discord_id,
+            )
+
+    async def remove_guild_admin_follow_and_reconcile(
+        self,
+        guild_id: int,
+        username: str,
+        *,
+        member_ids: Optional[Iterable[int]] = None,
+    ) -> dict[str, Any]:
+        """Atomically remove a guild admin follow and reconcile that profile's feed state."""
+        profile_key = username.strip().lower()
+        async with self._transaction() as tx:
+            exists = await tx.fetchone(
+                "SELECT 1 FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ? LIMIT 1",
+                (guild_id, profile_key),
+            )
+            if exists is None:
+                return {
+                    "removed": False,
+                    "profile_key": profile_key,
+                    "deactivated": False,
+                    "pending_reconciliation": False,
+                    "has_admin": False,
+                    "remaining_members": [],
+                }
+            if member_ids is not None:
+                await self._resolve_pending_reconciliation_tx(
+                    tx, guild_id, member_ids, profile_key=profile_key
+                )
+            deleted = await tx.execute(
+                "DELETE FROM guild_admin_follows WHERE guild_id = ? AND profile_key = ?",
+                (guild_id, profile_key),
+            )
+            reconciled = await self._reconcile_removed_profile_source_tx(
+                tx,
+                guild_id,
+                profile_key,
+                present_member_ids=member_ids,
+                removed_admin=True,
+            )
+            return {"removed": deleted > 0, **reconciled}
+
     async def reconcile_guild_feed_activity(
         self,
         guild_id: int,
         eligible_profile_keys: Iterable[str],
         *,
         now: Optional[Any] = None,
+        present_member_ids: Optional[Iterable[int]] = None,
     ) -> dict[str, list[str]]:
         """Pause departed profiles and fresh-baseline profiles that resume atomically."""
         eligible = {key.strip().lower() for key in eligible_profile_keys if key}
         now_sql = self._format_utc_sql_timestamp(now)
         deactivated, activated = [], []
-        clear_unsent_decisions_sql = """
-            DELETE FROM profile_feed_decisions
-            WHERE guild_id = ? AND profile_key = ?
-              AND decision IN ('baseline', 'eligible')
-              AND event_id NOT IN (
-                  SELECT event_id FROM profile_feed_messages
-                  WHERE guild_id = ? AND profile_key = ?
-                    AND delivery_state IN ('sent', 'deleted', 'pending', 'unknown')
-              )
-        """
         async with self._transaction() as tx:
+            pending_deactivated: set[str] = set()
+            if present_member_ids is not None:
+                pending_deactivated.update(
+                    await self._resolve_pending_reconciliation_tx(tx, guild_id, present_member_ids)
+                )
             existing = await tx.fetchall(
                 "SELECT profile_key, active FROM guild_profile_feed_activity WHERE guild_id = ?",
                 (guild_id,),
             )
             states = {row["profile_key"]: bool(row["active"]) for row in existing}
+            for profile_key in sorted(pending_deactivated - eligible):
+                deactivated.append(profile_key)
             for profile_key, was_active in states.items():
                 if was_active and profile_key not in eligible:
-                    await tx.execute(
-                        """UPDATE guild_profile_feed_activity SET active = 0
-                           WHERE guild_id = ? AND profile_key = ?""",
-                        (guild_id, profile_key),
-                    )
-                    await tx.execute(
-                        "DELETE FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
-                        (guild_id, profile_key),
-                    )
-                    await tx.execute(
-                        clear_unsent_decisions_sql,
-                        (guild_id, profile_key, guild_id, profile_key),
-                    )
-                    deactivated.append(profile_key)
+                    await self._deactivate_guild_profile_tx(tx, guild_id, profile_key)
+                    if profile_key not in pending_deactivated:
+                        deactivated.append(profile_key)
             for profile_key in sorted(eligible):
                 if not states.get(profile_key, False):
                     if now_sql is not None:
@@ -766,7 +1076,7 @@ class Database:
                         (guild_id, profile_key),
                     )
                     await tx.execute(
-                        clear_unsent_decisions_sql,
+                        self._CLEAR_UNSENT_FEED_DECISIONS_SQL,
                         (guild_id, profile_key, guild_id, profile_key),
                     )
                     activated.append(profile_key)
@@ -2042,6 +2352,10 @@ class Database:
             ),
             (
                 "DELETE FROM profile_feed_sources WHERE guild_id = ?",
+                (guild_id,),
+            ),
+            (
+                "DELETE FROM guild_profile_feed_reconciliation WHERE guild_id = ?",
                 (guild_id,),
             ),
             (
