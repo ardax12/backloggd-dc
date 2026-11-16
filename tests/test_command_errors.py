@@ -113,6 +113,32 @@ class CommandErrorBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.tmpdir.cleanup()
 
     async def test_db_failure_before_defer_replies_ephemerally_and_logs_without_leaking(self):
+        @self.bot.tree.command(name="pre_defer_db_cmd", description="test")
+        async def pre_defer_db_cmd(interaction: discord.Interaction):
+            raise sqlite3.OperationalError(
+                "SELECT * FROM guild_settings WHERE token='secret_tok_123' /app/data/prod.db"
+            )
+
+        interaction = make_interaction(name="pre_defer_db_cmd", guild_id=1)
+
+        with self.assertLogs("backloggd.bot", level="ERROR") as logs:
+            await self.bot.tree._call(interaction)
+
+        self.assertTrue(interaction.command_failed)
+        interaction.response.send_message.assert_awaited_once()
+        interaction.followup.send.assert_not_awaited()
+        args = interaction.response.send_message.call_args.args
+        kwargs = interaction.response.send_message.call_args.kwargs
+        self.assertTrue(kwargs.get("ephemeral"))
+        reply = args[0] if args else kwargs.get("content", "")
+        self.assertNotIn("SELECT", reply)
+        self.assertNotIn("secret_tok_123", reply)
+        self.assertNotIn("prod.db", reply)
+        self.assertNotIn("OperationalError", reply)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("pre_defer_db_cmd", logs.output[0])
+
+    async def test_unsetchannel_db_failure_after_defer_uses_followup_and_logs_once(self):
         await self.bot.load_extension("bot.cogs.feed")
         self.bot.db.unset_feed_channel = AsyncMock(
             side_effect=sqlite3.OperationalError(
@@ -125,10 +151,11 @@ class CommandErrorBoundaryTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.tree._call(interaction)
 
         self.assertTrue(interaction.command_failed)
-        interaction.response.send_message.assert_awaited_once()
-        interaction.followup.send.assert_not_awaited()
-        args = interaction.response.send_message.call_args.args
-        kwargs = interaction.response.send_message.call_args.kwargs
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.response.send_message.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        args = interaction.followup.send.call_args.args
+        kwargs = interaction.followup.send.call_args.kwargs
         self.assertTrue(kwargs.get("ephemeral"))
         reply = args[0] if args else kwargs.get("content", "")
         self.assertNotIn("SELECT", reply)

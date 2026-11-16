@@ -301,7 +301,13 @@ class SocialCog(commands.Cog, name="Social"):
             match_pct = final_score / 100.0
 
             # Find common rated games
-            common_slugs = shared_rated_slugs
+            common_slugs = sorted(shared_rated_slugs)
+            slug_lookup = getattr(self.bot.db, "get_games_by_slugs", None)
+            cached_meta = (
+                await slug_lookup(common_slugs)
+                if common_slugs and callable(slug_lookup)
+                else {}
+            )
             shared_loves = []
             disagreements = []
 
@@ -309,7 +315,13 @@ class SocialCog(commands.Cog, name="Social"):
                 r1 = rated1[slug]
                 r2 = rated2[slug]
                 delta = abs(r1 - r2)
-                title = slug.replace("-", " ").title()
+                meta = cached_meta.get(slug)
+                raw_title = meta["title"] if meta else None
+                title = (
+                    raw_title.strip()
+                    if isinstance(raw_title, str) and raw_title.strip()
+                    else slug.replace("-", " ").title()
+                )
                 # Shared loves (both rated 4.0+)
                 if r1 >= 4.0 and r2 >= 4.0:
                     shared_loves.append({"title": title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
@@ -317,8 +329,8 @@ class SocialCog(commands.Cog, name="Social"):
                 if delta >= 1.0:
                     disagreements.append({"title": title, "r1": r1, "r2": r2, "delta": delta})
 
-            shared_loves.sort(key=lambda x: x["avg"], reverse=True)
-            disagreements.sort(key=lambda x: x["delta"], reverse=True)
+            shared_loves.sort(key=lambda x: (-x["avg"], x["title"]))
+            disagreements.sort(key=lambda x: (-x["delta"], x["title"]))
 
             line1 = format_profile_freshness_line(s1, label=f"**{safe_u1}**", unlinked_live=not sub1)
             line2 = format_profile_freshness_line(s2, label=f"**{safe_u2}**", unlinked_live=not sub2)

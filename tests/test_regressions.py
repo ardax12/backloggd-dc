@@ -36,11 +36,11 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
         from bot.ui.views import RatingsView
         rows = [{"backloggd_username": f"User{i}", "rating": 4.5, "status": "played"} for i in range(31)]
         view = RatingsView("Hades", "hades", "Guild", rows)
-        interaction = SimpleNamespace(response=SimpleNamespace(edit_message=AsyncMock()))
+        interaction = SimpleNamespace(response=SimpleNamespace(is_done=lambda: True), edit_original_response=AsyncMock())
         self.assertTrue(view.previous_button.disabled)
         await view.next_button.callback(interaction)
         self.assertEqual(view.page, 2)
-        self.assertIn("User15", interaction.response.edit_message.call_args.kwargs["embed"].fields[0].value)
+        self.assertIn("User15", interaction.edit_original_response.call_args.kwargs["embed"].fields[0].value)
         await view.next_button.callback(interaction)
         self.assertTrue(view.next_button.disabled)
         await view.previous_button.callback(interaction)

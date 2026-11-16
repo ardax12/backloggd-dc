@@ -1,9 +1,11 @@
 """Interactive Discord UI Views and Buttons for Backloggd Bot."""
 
+import asyncio
 import logging
 import discord
 from discord.ui import View, Button
 from typing import Optional, Callable, Coroutine, Any
+from bot.command_errors import GENERIC_COMMAND_ERROR_MESSAGE, defer_interaction, handle_component_error
 from bot.ui.helpers import truncate_button_label
 
 logger = logging.getLogger("backloggd.ui.views")
@@ -35,6 +37,22 @@ class ExpiringView(View):
                 await self.message.edit(view=self)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 logger.debug("Ignoring expected Discord error during expired view cleanup", exc_info=True)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+        /,
+    ) -> None:
+        label = getattr(item, "label", None) or getattr(item, "custom_id", None) or item.__class__.__name__
+        await handle_component_error(
+            interaction,
+            error,
+            component_name=f"{self.__class__.__name__}:{label}",
+            user_message=GENERIC_COMMAND_ERROR_MESSAGE,
+            log=logger,
+        )
 
 
 class RouletteView(ExpiringView):
@@ -116,6 +134,7 @@ class RatingsView(ExpiringView):
         self.ratings = ratings
         self.page = 1
         self.total_pages = max(1, (len(ratings) + 14) // 15)
+        self._nav_lock = asyncio.Lock()
         self._update_buttons()
 
     def embed(self):
@@ -129,9 +148,20 @@ class RatingsView(ExpiringView):
         self.next_button.disabled = self.page >= self.total_pages
 
     async def _move(self, interaction: discord.Interaction, offset: int):
-        self.page = max(1, min(self.total_pages, self.page + offset))
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        if not interaction.response.is_done():
+            await defer_interaction(interaction)
+        async with self._nav_lock:
+            previous_page = self.page
+            target_page = max(1, min(self.total_pages, previous_page + offset))
+            self.page = target_page
+            self._update_buttons()
+            try:
+                embed = self.embed()
+                await interaction.edit_original_response(embed=embed, view=self)
+            except BaseException:
+                self.page = previous_page
+                self._update_buttons()
+                raise
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
     async def previous_button(self, interaction: discord.Interaction, button: Button):
@@ -150,6 +180,7 @@ class FeedListView(ExpiringView):
         self.owner_id = owner_id
         self.pages = pages
         self.page = 0
+        self._nav_lock = asyncio.Lock()
         self._update_buttons()
 
     def _update_buttons(self):
@@ -160,9 +191,19 @@ class FeedListView(ExpiringView):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message("Only the person who opened this feed list can change pages.", ephemeral=True)
             return
-        self.page = max(0, min(len(self.pages) - 1, self.page + offset))
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.page], view=self)
+        if not interaction.response.is_done():
+            await defer_interaction(interaction)
+        async with self._nav_lock:
+            previous_page = self.page
+            target_page = max(0, min(len(self.pages) - 1, previous_page + offset))
+            self.page = target_page
+            self._update_buttons()
+            try:
+                await interaction.edit_original_response(embed=self.pages[target_page], view=self)
+            except BaseException:
+                self.page = previous_page
+                self._update_buttons()
+                raise
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
     async def previous_button(self, interaction: discord.Interaction, button: Button):

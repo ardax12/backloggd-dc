@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -67,6 +68,8 @@ class StatefulDiscordInteraction:
         guild_id=None,
         options=None,
         manage_channels: bool = True,
+        send_message_error=None,
+        edit_message_error=None,
         edit_original_error=None,
         delete_original_error=None,
         followup_send_error=None,
@@ -103,9 +106,16 @@ class StatefulDiscordInteraction:
         self.deferred_ephemeral = None
         self.original_consumed = False
         self.original_message: dict | None = source_message
+        self.message = (
+            _ProtocolMessageHandle(source_message)
+            if isinstance(source_message, dict)
+            else source_message
+        )
         self.delivered_messages: list[dict] = []
         self.public_text_history: list[str] = []
 
+        self.send_message_error = send_message_error
+        self.edit_message_error = edit_message_error
         self.edit_original_error = edit_original_error
         self.delete_original_error = delete_original_error
         self.followup_send_error = followup_send_error
@@ -134,6 +144,11 @@ class StatefulDiscordInteraction:
             m for m in self.delivered_messages
             if m["ephemeral"] and not m.get("deleted", False)
         ]
+
+    async def original_response(self):
+        if not self.responded or self.original_message is None or self.original_message.get("deleted"):
+            raise discord.NotFound(_FakeHTTPResp(404, "Not Found"), "Unknown Message")
+        return _ProtocolMessageHandle(self.original_message)
 
     async def edit_original_response(self, *, content=None, embed=None, view=None, allowed_mentions=None):
         if self.edit_original_error is not None:
@@ -192,6 +207,8 @@ class _StatefulResponse:
         self._parent.delivered_messages.append(record)
 
     async def send_message(self, content=None, *, embed=None, view=None, ephemeral: bool = False, allowed_mentions=None):
+        if self._parent.send_message_error is not None:
+            raise self._parent.send_message_error
         if self._parent.responded:
             raise discord.InteractionResponded(self._parent)
         self._parent.responded = True
@@ -210,6 +227,25 @@ class _StatefulResponse:
         self._parent.delivered_messages.append(record)
         if not ephemeral:
             self._parent._record_public_snapshot(content, embed)
+
+    async def edit_message(self, content=None, *, embed=None, view=None, allowed_mentions=None):
+        if self._parent.edit_message_error is not None:
+            raise self._parent.edit_message_error
+        if self._parent.responded:
+            raise discord.InteractionResponded(self._parent)
+        self._parent.responded = True
+        self._parent.original_consumed = True
+        self.type = discord.InteractionResponseType.message_update
+        msg = self._parent.original_message
+        if msg is not None:
+            if content is not None:
+                msg["content"] = content
+            if embed is not None:
+                msg["embed"] = embed
+            if view is not None:
+                msg["view"] = view
+            if not msg.get("ephemeral", False):
+                self._parent._record_public_snapshot(content, embed)
 
 
 class _StatefulFollowup:
@@ -262,6 +298,15 @@ class _StatefulFollowup:
 
 class InteractionVisibilityProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        saved_cog_modules = {
+            name: mod for name, mod in sys.modules.items() if name.startswith("bot.cogs.")
+        }
+
+        def _restore_cog_modules():
+            for name, mod in saved_cog_modules.items():
+                sys.modules.setdefault(name, mod)
+
+        self.addCleanup(_restore_cog_modules)
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.db = Database(str(Path(self.tmpdir.name) / "vis.db"), turso_url="")
@@ -598,6 +643,188 @@ class InteractionVisibilityProtocolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await bot.tree._call(i_cancel)
         self.assertEqual(i_cancel.visible_ephemeral_messages(), [])
+
+    async def test_unsetchannel_acknowledges_privately_before_database_cleanup(self):
+        import sqlite3
+
+        bot = BackloggdBot()
+        await bot.db.close()
+        bot.db = self.db
+        bot.backloggd = MagicMock()
+        bot.backloggd.close = AsyncMock()
+        self.addAsyncCleanup(bot.close)
+        await bot.load_extension("bot.cogs.feed")
+
+        await self.db.set_feed_channel(1, 50)
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        real_unset = self.db.unset_feed_channel
+
+        async def held_unset(guild_id: int) -> bool:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            return await real_unset(guild_id)
+
+        self.db.unset_feed_channel = held_unset
+        guild = SimpleNamespace(
+            id=1, name="TestGuild", chunked=True, member_count=1,
+            members=[SimpleNamespace(id=10)], me=SimpleNamespace(id=999),
+        )
+        interaction = StatefulDiscordInteraction(
+            name="unsetchannel", guild=guild, guild_id=1, user_id=10, manage_channels=True,
+        )
+
+        task = asyncio.create_task(bot.tree._call(interaction))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2.0)
+
+        self.assertTrue(interaction.deferred)
+        self.assertIs(interaction.deferred_ephemeral, True)
+        self.assertEqual(
+            interaction.response.type,
+            discord.InteractionResponseType.deferred_channel_message,
+        )
+        self.assertEqual(interaction.visible_public_messages(), [])
+
+        release_cleanup.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        self.assertEqual(interaction.visible_public_messages(), [])
+        ephem = interaction.visible_ephemeral_messages()
+        self.assertEqual(len(ephem), 1)
+        self.assertIn("disabled", ephem[0]["content"].lower())
+
+    async def test_unsetchannel_dispatch_outcomes_error_isolation_and_archive_protection(self):
+        import sqlite3
+
+        bot = BackloggdBot()
+        await bot.db.close()
+        bot.db = self.db
+        bot.backloggd = MagicMock()
+        bot.backloggd.close = AsyncMock()
+        self.addAsyncCleanup(bot.close)
+        await bot.load_extension("bot.cogs.feed")
+
+        guild = SimpleNamespace(
+            id=1, name="TestGuild", chunked=True, member_count=1,
+            members=[SimpleNamespace(id=10)], me=SimpleNamespace(id=999),
+        )
+
+        # Seed active channel, sources, pending reconciliation, decisions, and protected deliveries
+        await self.db.set_feed_channel(1, 50)
+        await self.db.link_user(10, "Millers")
+        await self.db.set_guild_feed_preference(1, 10, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers"])
+        await self.db.seed_feed_source(1, "millers", "activity-display-v1", ["base-1"])
+        await self.db._execute(
+            """INSERT INTO guild_profile_feed_reconciliation
+               (guild_id, profile_key, had_admin_source, candidate_member_ids)
+               VALUES (1, 'millers', 0, '[10]')"""
+        )
+        await self.db.begin_feed_delivery(1, "millers", ["ev-sent"], '{"id":"ev-sent"}', 50)
+        await self.db.store_feed_message(1, "millers", ["ev-sent"], '{"id":"ev-sent"}', 701, 50)
+        await self.db.begin_feed_delivery(1, "millers", ["ev-del"], '{"id":"ev-del"}', 50)
+        await self.db.store_feed_message(1, "millers", ["ev-del"], '{"id":"ev-del"}', 702, 50)
+        await self.db.mark_feed_message_deleted(1, "millers", ["ev-del"], '{"id":"ev-del"}')
+        await self.db.begin_feed_delivery(1, "millers", ["ev-pend"], '{"id":"ev-pend"}', 50)
+        await self.db.begin_feed_delivery(1, "millers", ["ev-unk"], '{"id":"ev-unk"}', 50)
+        await self.db.mark_feed_delivery_unknown(1, "millers", ["ev-unk"])
+
+        for eid, dec in (
+            ("ev-sent", "eligible"),
+            ("ev-del", "eligible"),
+            ("ev-pend", "eligible"),
+            ("ev-unk", "eligible"),
+            ("ev-unsent", "eligible"),
+            ("ev-base", "baseline"),
+            ("ev-old", "suppressed_old"),
+        ):
+            await self.db.record_feed_event_decision(
+                1, "millers", eid, source="activity", event_date="2026-11-12",
+                decision=dec, reason="test", payload="{}",
+            )
+
+        # 1. Successful removal cleans channel/sources/reconciliation/unsent decisions, preserves archive
+        i_ok = StatefulDiscordInteraction(name="unsetchannel", guild=guild, guild_id=1, user_id=10)
+        await bot.tree._call(i_ok)
+        self.assertTrue(i_ok.deferred)
+        self.assertIs(i_ok.deferred_ephemeral, True)
+        self.assertEqual(i_ok.visible_public_messages(), [])
+        self.assertEqual(len(i_ok.visible_ephemeral_messages()), 1)
+        self.assertIn("disabled", i_ok.visible_ephemeral_messages()[0]["content"].lower())
+
+        self.assertIsNone(await self.db.get_feed_channel(1))
+        self.assertFalse(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+        self.assertIsNone(
+            await self.db._fetchone("SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1")
+        )
+        act_row = await self.db._fetchone(
+            "SELECT active FROM guild_profile_feed_activity WHERE guild_id = 1 AND profile_key = 'millers'"
+        )
+        self.assertEqual(act_row["active"], 0)
+        msg_rows = await self.db._fetchall(
+            "SELECT event_id, delivery_state FROM profile_feed_messages WHERE guild_id = 1 ORDER BY event_id"
+        )
+        self.assertEqual(
+            {r["event_id"]: r["delivery_state"] for r in msg_rows},
+            {"ev-del": "deleted", "ev-pend": "pending", "ev-sent": "sent", "ev-unk": "unknown"},
+        )
+        dec_rows = await self.db._fetchall(
+            "SELECT event_id FROM profile_feed_decisions WHERE guild_id = 1 ORDER BY event_id"
+        )
+        self.assertEqual(
+            {r["event_id"] for r in dec_rows},
+            {"ev-sent", "ev-del", "ev-pend", "ev-unk", "ev-old"},
+        )
+
+        # 2. Already disabled (no configuration) -> private outcome
+        i_none = StatefulDiscordInteraction(name="unsetchannel", guild=guild, guild_id=1, user_id=10)
+        await bot.tree._call(i_none)
+        self.assertTrue(i_none.deferred)
+        self.assertIs(i_none.deferred_ephemeral, True)
+        self.assertEqual(i_none.visible_public_messages(), [])
+        self.assertEqual(len(i_none.visible_ephemeral_messages()), 1)
+        self.assertIn("no activity feed channel", i_none.visible_ephemeral_messages()[0]["content"].lower())
+
+        # 3. DM rejection -> private reply, no error log
+        i_dm = StatefulDiscordInteraction(name="unsetchannel", guild=None, guild_id=None, user_id=10)
+        with self.assertNoLogs(logging.getLogger("backloggd"), level="ERROR"):
+            await bot.tree._call(i_dm)
+        self.assertEqual(i_dm.visible_public_messages(), [])
+        self.assertEqual(len(i_dm.visible_ephemeral_messages()), 1)
+        self.assertIn("server", i_dm.visible_ephemeral_messages()[0]["content"].lower())
+
+        # 4. Missing Manage Channels permission -> private reply, no error log
+        i_noperms = StatefulDiscordInteraction(
+            name="unsetchannel", guild=guild, guild_id=1, user_id=10, manage_channels=False,
+        )
+        with self.assertNoLogs(logging.getLogger("backloggd"), level="ERROR"):
+            await bot.tree._call(i_noperms)
+        self.assertEqual(i_noperms.visible_public_messages(), [])
+        self.assertEqual(len(i_noperms.visible_ephemeral_messages()), 1)
+        self.assertIn("manage channels", i_noperms.visible_ephemeral_messages()[0]["content"].lower())
+
+        # 5. Database exception after defer -> single safe private reply, no SQL/tokens, no second initial response
+        real_unset = self.db.unset_feed_channel
+        self.db.unset_feed_channel = AsyncMock(
+            side_effect=sqlite3.OperationalError("SELECT * FROM guild_settings WHERE token='secret_tok_999'")
+        )
+        try:
+            i_err = StatefulDiscordInteraction(name="unsetchannel", guild=guild, guild_id=1, user_id=10)
+            with self.assertLogs("backloggd.bot", level="ERROR") as logs:
+                await bot.tree._call(i_err)
+        finally:
+            self.db.unset_feed_channel = real_unset
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertTrue(i_err.deferred)
+        self.assertIs(i_err.deferred_ephemeral, True)
+        self.assertEqual(i_err.response.type, discord.InteractionResponseType.deferred_channel_message)
+        self.assertEqual(i_err.visible_public_messages(), [])
+        ephem = i_err.visible_ephemeral_messages()
+        self.assertEqual(len(ephem), 1)
+        self.assertIn("something went wrong", ephem[0]["content"].lower())
+        self.assertNotIn("SELECT", ephem[0]["content"])
+        self.assertNotIn("secret_tok_999", ephem[0]["content"])
 
 
 if __name__ == "__main__":

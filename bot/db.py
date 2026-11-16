@@ -210,9 +210,19 @@ class Database:
                 await self._conn.commit()
                 return cursor.rowcount
 
+    async def _get_applied_schema_version(self) -> int:
+        """Return highest applied schema migration version, or 0 if unversioned."""
+        table = await self._fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations';"
+        )
+        if not table:
+            return 0
+        row = await self._fetchone("SELECT MAX(version) AS version FROM schema_migrations;")
+        return int(row["version"]) if row and row["version"] is not None else 0
+
     async def _create_tables(self) -> None:
-        """Initialize all required schemas and indexes."""
-        # 1. Linked users
+        """Initialize foundational schemas and pre-migration compatibility state where needed."""
+        # Foundational active tables needed before versioned migrations run.
         await self._execute("""
             CREATE TABLE IF NOT EXISTS linked_users (
                 discord_id INTEGER PRIMARY KEY,
@@ -221,7 +231,6 @@ class Database:
                 last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # 2. Cached games
         await self._execute("""
             CREATE TABLE IF NOT EXISTS cached_games (
                 slug TEXT PRIMARY KEY,
@@ -231,27 +240,6 @@ class Database:
                 community_rating REAL
             );
         """)
-
-        # 3. User ratings and status logs
-        rating_object = await self._fetchone(
-            "SELECT type FROM sqlite_master WHERE name = 'user_ratings';"
-        )
-        if not rating_object or rating_object["type"] == "table":
-            await self._execute("""
-                CREATE TABLE IF NOT EXISTS user_ratings (
-                    discord_id INTEGER NOT NULL,
-                    game_slug TEXT NOT NULL,
-                    rating REAL,
-                    status TEXT NOT NULL,
-                    is_liked BOOLEAN DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (discord_id, game_slug),
-                    FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
-                    FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
-                );
-            """)
-
-        # 4. Guild settings for automatic feed
         await self._execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
@@ -259,54 +247,72 @@ class Database:
             );
         """)
 
-        await self._execute("""
-            CREATE TABLE IF NOT EXISTS feed_sources (
-                guild_id INTEGER NOT NULL,
-                discord_id INTEGER NOT NULL,
-                source TEXT NOT NULL,
-                PRIMARY KEY (guild_id, discord_id, source)
-            );
-        """)
+        schema_version = await self._get_applied_schema_version()
 
-        await self._execute("""
-            CREATE TABLE IF NOT EXISTS feed_messages (
-                guild_id INTEGER NOT NULL,
-                discord_id INTEGER NOT NULL,
-                event_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                message_id INTEGER,
-                channel_id INTEGER,
-                PRIMARY KEY (guild_id, discord_id, event_id)
-            );
-        """)
+        # Pre-v1 user_ratings table (replaced by a compatibility VIEW in migration 1).
+        if schema_version < 1:
+            rating_object = await self._fetchone(
+                "SELECT type FROM sqlite_master WHERE name = 'user_ratings';"
+            )
+            if not rating_object or rating_object["type"] == "table":
+                await self._execute("""
+                    CREATE TABLE IF NOT EXISTS user_ratings (
+                        discord_id INTEGER NOT NULL,
+                        game_slug TEXT NOT NULL,
+                        rating REAL,
+                        status TEXT NOT NULL,
+                        is_liked BOOLEAN DEFAULT 0,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (discord_id, game_slug),
+                        FOREIGN KEY (discord_id) REFERENCES linked_users (discord_id) ON DELETE CASCADE,
+                        FOREIGN KEY (game_slug) REFERENCES cached_games (slug) ON DELETE CASCADE
+                    );
+                """)
 
-        # 5. Seen journal logs deduplication
-        await self._execute("""
-            CREATE TABLE IF NOT EXISTS seen_journal_logs (
-                entry_id TEXT PRIMARY KEY,
-                discord_id INTEGER NOT NULL,
-                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-
-        # Delivery state is per guild. Migrate old global seen markers to all
-        # currently configured feeds so deployment does not replay old entries.
-        await self._execute("""
-            CREATE TABLE IF NOT EXISTS seen_journal_deliveries (
-                guild_id INTEGER NOT NULL,
-                entry_id TEXT NOT NULL,
-                discord_id INTEGER NOT NULL,
-                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, entry_id)
-            );
-        """)
-        await self._execute("""
-            INSERT OR IGNORE INTO seen_journal_deliveries
-                (guild_id, entry_id, discord_id, posted_at)
-            SELECT gs.guild_id, old.entry_id, old.discord_id, old.posted_at
-            FROM seen_journal_logs AS old
-            CROSS JOIN guild_settings AS gs;
-        """)
+        # Pre-v2 legacy feed/journal tables and backfill (migrated into profile_feed_* in migration 2).
+        if schema_version < 2:
+            await self._execute("""
+                CREATE TABLE IF NOT EXISTS feed_sources (
+                    guild_id INTEGER NOT NULL,
+                    discord_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, discord_id, source)
+                );
+            """)
+            await self._execute("""
+                CREATE TABLE IF NOT EXISTS feed_messages (
+                    guild_id INTEGER NOT NULL,
+                    discord_id INTEGER NOT NULL,
+                    event_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    message_id INTEGER,
+                    channel_id INTEGER,
+                    PRIMARY KEY (guild_id, discord_id, event_id)
+                );
+            """)
+            await self._execute("""
+                CREATE TABLE IF NOT EXISTS seen_journal_logs (
+                    entry_id TEXT PRIMARY KEY,
+                    discord_id INTEGER NOT NULL,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            await self._execute("""
+                CREATE TABLE IF NOT EXISTS seen_journal_deliveries (
+                    guild_id INTEGER NOT NULL,
+                    entry_id TEXT NOT NULL,
+                    discord_id INTEGER NOT NULL,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, entry_id)
+                );
+            """)
+            await self._execute("""
+                INSERT OR IGNORE INTO seen_journal_deliveries
+                    (guild_id, entry_id, discord_id, posted_at)
+                SELECT gs.guild_id, old.entry_id, old.discord_id, old.posted_at
+                FROM seen_journal_logs AS old
+                CROSS JOIN guild_settings AS gs;
+            """)
 
     async def _execute_batch_results(
         self, statements: List[tuple[str, tuple | list]]
@@ -686,6 +692,7 @@ class Database:
             )
             if not pending or pending["completed"]:
                 return False
+            eligible_ids: list[int] = []
             for chunk in _iter_sql_chunks(members, fixed_params=1):
                 placeholders = ",".join("?" for _ in chunk)
                 eligible = await tx.fetchall(
@@ -697,12 +704,21 @@ class Database:
                         WHERE scope.guild_id = ? AND scope.discord_id IN ({placeholders})""",
                     [guild_id, *chunk],
                 )
-                for row in eligible:
-                    await tx.execute(
-                        """INSERT OR IGNORE INTO guild_feed_preferences
-                           (guild_id, discord_id, enabled) VALUES (?, ?, 1)""",
-                        (guild_id, row["discord_id"]),
-                    )
+                eligible_ids.extend(int(row["discord_id"]) for row in eligible)
+            pref_rows = [(guild_id, did) for did in dict.fromkeys(eligible_ids)]
+            for batch in _iter_bounded_row_batches(
+                pref_rows,
+                params_per_row=2,
+                fixed_params=0,
+                fixed_sql_bytes=128,
+            ):
+                values_sql = ", ".join(["(?, ?, 1)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                await tx.execute(
+                    f"""INSERT OR IGNORE INTO guild_feed_preferences
+                        (guild_id, discord_id, enabled) VALUES {values_sql}""",
+                    flat_params,
+                )
             await tx.execute(
                 """UPDATE guild_feed_legacy_migrations
                    SET completed = 1, completed_at = CURRENT_TIMESTAMP
@@ -1140,26 +1156,99 @@ class Database:
             (guild_id, profile_key),
         ) is not None
 
-    async def get_guild_profile_feed_status(self, guild_id: int, profile_key: str) -> dict:
-        profile_key = profile_key.strip().lower()
-        activity = await self._fetchone(
-            """SELECT active, last_active_at FROM guild_profile_feed_activity
-               WHERE guild_id = ? AND profile_key = ?""",
-            (guild_id, profile_key),
-        )
-        sources = await self._fetchall(
-            """SELECT source FROM profile_feed_sources
-               WHERE guild_id = ? AND profile_key = ? ORDER BY source""",
-            (guild_id, profile_key),
-        )
+    @staticmethod
+    def _empty_feed_status() -> dict[str, Any]:
         return {
-            "active": bool(activity and activity["active"]),
-            "last_active_at": activity["last_active_at"] if activity else None,
-            "initialized_sources": [row["source"] for row in sources],
-            "suppression_counts": await self.get_feed_decision_counts(guild_id, profile_key),
-            "delivery_counts": await self.get_feed_message_delivery_counts(guild_id, profile_key),
-            "source_health": await self.get_profile_feed_source_health(profile_key),
+            "active": False,
+            "last_active_at": None,
+            "initialized_sources": [],
+            "suppression_counts": {},
+            "delivery_counts": {},
+            "source_health": [],
         }
+
+    async def get_guild_feed_statuses(
+        self, guild_id: int, profile_keys: Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch feed status dicts for many profiles in bounded guild- and profile-scoped chunks."""
+        normalized_keys = list(dict.fromkeys(
+            str(key).strip().lower() for key in profile_keys if key and str(key).strip()
+        ))
+        if not normalized_keys:
+            return {}
+
+        results: dict[str, dict[str, Any]] = {
+            key: self._empty_feed_status() for key in normalized_keys
+        }
+
+        for chunk in _iter_sql_chunks(normalized_keys, fixed_params=1):
+            placeholders = ",".join("?" for _ in chunk)
+            params = [guild_id, *chunk]
+
+            activity_rows = await self._fetchall(
+                f"""SELECT profile_key, active, last_active_at
+                    FROM guild_profile_feed_activity
+                    WHERE guild_id = ? AND profile_key IN ({placeholders})""",
+                params,
+            )
+            for row in activity_rows:
+                entry = results[row["profile_key"]]
+                entry["active"] = bool(row["active"])
+                entry["last_active_at"] = row["last_active_at"]
+
+            source_rows = await self._fetchall(
+                f"""SELECT profile_key, source
+                    FROM profile_feed_sources
+                    WHERE guild_id = ? AND profile_key IN ({placeholders})
+                    ORDER BY profile_key, source""",
+                params,
+            )
+            for row in source_rows:
+                results[row["profile_key"]]["initialized_sources"].append(row["source"])
+
+            decision_rows = await self._fetchall(
+                f"""SELECT profile_key, decision, COUNT(*) AS count
+                    FROM profile_feed_decisions
+                    WHERE guild_id = ? AND profile_key IN ({placeholders})
+                    GROUP BY profile_key, decision""",
+                params,
+            )
+            for row in decision_rows:
+                results[row["profile_key"]]["suppression_counts"][row["decision"]] = row["count"]
+
+            delivery_rows = await self._fetchall(
+                f"""SELECT profile_key, delivery_state, COUNT(*) AS count
+                    FROM profile_feed_messages
+                    WHERE guild_id = ? AND profile_key IN ({placeholders})
+                    GROUP BY profile_key, delivery_state""",
+                params,
+            )
+            for row in delivery_rows:
+                results[row["profile_key"]]["delivery_counts"][row["delivery_state"]] = row["count"]
+
+        for chunk in _iter_sql_chunks(normalized_keys, fixed_params=0):
+            placeholders = ",".join("?" for _ in chunk)
+            health_rows = await self._fetchall(
+                f"""SELECT profile_key, source, attempts, successes, last_attempt_at, last_success_at,
+                           coverage, pages_read, last_continuous_boundary_event_id,
+                           last_continuous_boundary_at, unresolved_gap_since,
+                           unresolved_gap_until, gap_reason, last_error
+                    FROM profile_feed_source_health
+                    WHERE profile_key IN ({placeholders})
+                    ORDER BY profile_key, source""",
+                chunk,
+            )
+            for row in health_rows:
+                results[row["profile_key"]]["source_health"].append(row)
+
+        return results
+
+    async def get_guild_profile_feed_status(self, guild_id: int, profile_key: str) -> dict:
+        normalized = str(profile_key).strip().lower()
+        if not normalized:
+            return self._empty_feed_status()
+        statuses = await self.get_guild_feed_statuses(guild_id, [normalized])
+        return statuses[normalized]
 
     async def get_feed_message_delivery_counts(self, guild_id: int, profile_key: str) -> dict[str, int]:
         rows = await self._fetchall(
@@ -1355,6 +1444,27 @@ class Database:
             (guild_id, profile_key.strip().lower(), event_id),
         )
 
+    async def get_feed_event_decisions(
+        self, guild_id: int, profile_key: str, event_ids: Iterable[str]
+    ) -> dict[str, Any]:
+        """Bulk fetch stored feed event decisions for a guild/profile/alias set."""
+        normalized_key = profile_key.strip().lower()
+        unique_ids = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not unique_ids:
+            return {}
+        decisions: dict[str, Any] = {}
+        for chunk in _iter_sql_chunks(unique_ids, fixed_params=2):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT event_id, source, event_date, decision, reason, payload, observed_at
+                    FROM profile_feed_decisions
+                    WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
+                [guild_id, normalized_key, *chunk],
+            )
+            for row in rows:
+                decisions[row["event_id"]] = row
+        return decisions
+
     async def resolve_feed_event_decision(
         self, guild_id: int, profile_key: str, event_id: str, payload: str,
         event_date: Optional[str],
@@ -1410,6 +1520,227 @@ class Database:
                  )""",
             (decision, reason, event_date, payload, guild_id, profile_key.strip().lower(), event_id),
         )
+
+    _FEED_DECISION_PRIORITY = {
+        "suppressed_pre_activation": 0,
+        "suppressed_old": 1,
+        "held_ambiguous": 2,
+        "held_future": 3,
+        "held_uncertain": 4,
+        "baseline": 5,
+        "eligible": 6,
+    }
+
+    async def persist_feed_event_decisions(
+        self,
+        guild_id: int,
+        profile_key: str,
+        *,
+        inserts: Iterable[dict[str, Any]] = (),
+        revisions: Iterable[dict[str, Any]] = (),
+        alias_groups: Iterable[Iterable[str]] = (),
+    ) -> dict[str, Any]:
+        """Atomically persist new alias decisions and conditional revisions with conflict reconciliation."""
+        normalized_key = profile_key.strip().lower()
+        insert_map: dict[str, dict[str, Any]] = {}
+        for item in inserts:
+            eid = item.get("event_id")
+            if not eid:
+                continue
+            insert_map[eid] = {
+                "event_id": eid,
+                "source": item["source"],
+                "event_date": item.get("event_date"),
+                "decision": item["decision"],
+                "reason": item["reason"],
+                "payload": item["payload"],
+                "observed_sql": self._format_utc_sql_timestamp(item.get("observed_at")),
+            }
+
+        revision_map: dict[str, dict[str, Any]] = {}
+        for item in revisions:
+            eid = item.get("event_id")
+            if not eid:
+                continue
+            revision_map[eid] = {
+                "event_id": eid,
+                "event_date": item.get("event_date"),
+                "decision": item["decision"],
+                "reason": item["reason"],
+                "payload": item["payload"],
+            }
+
+        # Merge overlapping identities so a strict concurrent decision applies
+        # to every alias in the connected event group in the same transaction.
+        parents = {}
+        def root(key):
+            parents.setdefault(key, key)
+            while parents[key] != key:
+                parents[key] = parents[parents[key]]
+                key = parents[key]
+            return key
+        for aliases in alias_groups:
+            group = [eid for eid in aliases if eid]
+            for eid in group:
+                parents[root(eid)] = root(group[0])
+        groups = {}
+        for eid in parents:
+            groups.setdefault(root(eid), []).append(eid)
+        all_ids = list(dict.fromkeys([*insert_map, *revision_map, *parents]))
+        if not all_ids:
+            return {}
+
+        priority = self._FEED_DECISION_PRIORITY
+        async with self._transaction() as tx:
+            current_rows: dict[str, Any] = {}
+            for chunk in _iter_sql_chunks(all_ids, fixed_params=2):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = await tx.fetchall(
+                    f"""SELECT event_id, source, event_date, decision, reason, payload, observed_at
+                        FROM profile_feed_decisions
+                        WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
+                    [guild_id, normalized_key, *chunk],
+                )
+                for row in rows:
+                    current_rows[row["event_id"]] = row
+
+            for group in groups.values():
+                candidates = []
+                for eid in group:
+                    if eid in current_rows:
+                        candidates.append(dict(current_rows[eid]))
+                    if eid in insert_map:
+                        candidates.append(insert_map[eid])
+                    if eid in revision_map and eid in current_rows:
+                        candidates.append({**dict(current_rows[eid]), **revision_map[eid]})
+                if not candidates:
+                    continue
+                chosen = min(candidates, key=lambda row: priority.get(row["decision"], 99))
+                for eid in group:
+                    if eid in insert_map:
+                        item = insert_map[eid]
+                        if priority.get(chosen["decision"], 99) < priority.get(item["decision"], 99):
+                            for field in ("decision", "reason", "event_date", "payload"):
+                                item[field] = chosen[field]
+                            item["observed_sql"] = chosen.get("observed_at", chosen.get("observed_sql"))
+                    cur = current_rows.get(eid)
+                    if cur is not None and cur["decision"] == "eligible":
+                        if priority.get(chosen["decision"], 99) < priority["eligible"]:
+                            revision_map[eid] = {
+                                field: chosen[field]
+                                for field in ("decision", "reason", "event_date", "payload")
+                            }
+
+            to_insert_rows: list[tuple[Any, ...]] = []
+            candidate_revisions: dict[str, dict[str, Any]] = {}
+
+            for eid, item in insert_map.items():
+                cur = current_rows.get(eid)
+                if cur is None:
+                    to_insert_rows.append((
+                        guild_id,
+                        normalized_key,
+                        eid,
+                        item["source"],
+                        item["event_date"],
+                        item["decision"],
+                        item["reason"],
+                        item["payload"],
+                        item["observed_sql"],
+                    ))
+                elif cur["decision"] == "eligible":
+                    if priority.get(item["decision"], 99) < priority.get(cur["decision"], 99):
+                        candidate_revisions[eid] = {
+                            "decision": item["decision"],
+                            "reason": item["reason"],
+                            "event_date": item["event_date"],
+                            "payload": item["payload"],
+                        }
+
+            for eid, item in revision_map.items():
+                cur = current_rows.get(eid)
+                if cur is None or cur["decision"] != "eligible":
+                    continue
+                if priority.get(item["decision"], 99) <= priority.get(cur["decision"], 99):
+                    candidate_revisions[eid] = item
+
+            to_update_rows: list[tuple[Any, ...]] = []
+            if candidate_revisions:
+                protected_ids: set[str] = set()
+                for chunk in _iter_sql_chunks(list(candidate_revisions.keys()), fixed_params=2):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = await tx.fetchall(
+                        f"""SELECT event_id FROM profile_feed_messages
+                            WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})
+                              AND (message_id IS NOT NULL
+                                   OR delivery_state IN ('sent', 'deleted', 'pending', 'unknown'))""",
+                        [guild_id, normalized_key, *chunk],
+                    )
+                    protected_ids.update(row["event_id"] for row in rows)
+                for eid, rev in candidate_revisions.items():
+                    if eid in protected_ids:
+                        continue
+                    cur = current_rows[eid]
+                    to_update_rows.append((
+                        guild_id,
+                        normalized_key,
+                        eid,
+                        cur["source"],
+                        rev["event_date"],
+                        rev["decision"],
+                        rev["reason"],
+                        rev["payload"],
+                        cur["observed_at"],
+                    ))
+
+            for batch in _iter_bounded_row_batches(
+                to_insert_rows,
+                params_per_row=9,
+                fixed_params=0,
+                fixed_sql_bytes=256,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                await tx.execute(
+                    f"""INSERT OR IGNORE INTO profile_feed_decisions
+                        (guild_id, profile_key, event_id, source, event_date, decision, reason, payload, observed_at)
+                        VALUES {values_sql}""",
+                    flat_params,
+                )
+
+            for batch in _iter_bounded_row_batches(
+                to_update_rows,
+                params_per_row=9,
+                fixed_params=0,
+                fixed_sql_bytes=384,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                await tx.execute(
+                    f"""INSERT INTO profile_feed_decisions
+                        (guild_id, profile_key, event_id, source, event_date, decision, reason, payload, observed_at)
+                        VALUES {values_sql}
+                        ON CONFLICT(guild_id, profile_key, event_id) DO UPDATE SET
+                            decision = excluded.decision,
+                            reason = excluded.reason,
+                            event_date = excluded.event_date,
+                            payload = excluded.payload
+                        WHERE profile_feed_decisions.decision = 'eligible'""",
+                    flat_params,
+                )
+
+            authoritative: dict[str, Any] = {}
+            for chunk in _iter_sql_chunks(all_ids, fixed_params=2):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = await tx.fetchall(
+                    f"""SELECT event_id, source, event_date, decision, reason, payload, observed_at
+                        FROM profile_feed_decisions
+                        WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
+                    [guild_id, normalized_key, *chunk],
+                )
+                for row in rows:
+                    authoritative[row["event_id"]] = row
+            return authoritative
 
     async def get_feed_decision_counts(self, guild_id: int, profile_key: str) -> dict[str, int]:
         rows = await self._fetchall(
@@ -2401,10 +2732,18 @@ class Database:
         return row is not None
 
     async def seed_feed_source(self, guild_id: int, profile_key: str,
-                               source: str, entry_ids: Iterable[str]) -> bool:
+                               source: str, entry_ids: Iterable[str], *, baseline_messages=()) -> bool:
         """Baseline a new source once, atomically; later polls deliver new IDs."""
         profile_key = profile_key.strip().lower()
         params = (guild_id, profile_key, source)
+        unique_ids = list(
+            dict.fromkeys(
+                entry_id
+                for entry_id in entry_ids
+                if entry_id and (not isinstance(entry_id, str) or entry_id.strip())
+            )
+        )
+        seen_rows = [(guild_id, profile_key, entry_id) for entry_id in unique_ids]
         async with self._transaction() as tx:
             existing = await tx.fetchone(
                 "SELECT 1 FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ? AND source = ?",
@@ -2412,14 +2751,43 @@ class Database:
             )
             if existing is not None:
                 return False
-            for entry_id in set(entry_ids):
-                if entry_id:
-                    await tx.execute(
-                        "INSERT OR IGNORE INTO profile_seen_journal_deliveries (guild_id, profile_key, entry_id) VALUES (?, ?, ?)",
-                        (guild_id, profile_key, entry_id),
-                    )
+            for batch in _iter_bounded_row_batches(
+                seen_rows,
+                params_per_row=3,
+                fixed_params=0,
+                fixed_sql_bytes=128,
+            ):
+                values_sql = ", ".join(["(?, ?, ?)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                await tx.execute(
+                    f"""INSERT OR IGNORE INTO profile_seen_journal_deliveries
+                        (guild_id, profile_key, entry_id) VALUES {values_sql}""",
+                    flat_params,
+                )
+            message_rows = [(guild_id, profile_key, event_id, payload)
+                            for event_id, payload in baseline_messages if event_id]
+            for batch in _iter_bounded_row_batches(
+                message_rows, params_per_row=4, fixed_sql_bytes=256
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, NULL, NULL, 'baseline')"] * len(batch))
+                await tx.execute(
+                    f"""INSERT OR IGNORE INTO profile_feed_messages
+                        (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                        VALUES {values_sql}""",
+                    [value for row in batch for value in row],
+                )
             await tx.execute("INSERT OR IGNORE INTO profile_feed_sources VALUES (?, ?, ?)", params)
             return True
+
+    async def seed_feed_source_with_messages(
+        self, guild_id: int, profile_key: str, source: str, messages
+    ) -> bool:
+        """Initialize distinct baseline payloads, seen IDs and source marker atomically."""
+        unique = dict(messages)
+        return await self.seed_feed_source(
+            guild_id, profile_key, source, unique,
+            baseline_messages=list(unique.items()),
+        )
 
     async def get_feed_messages(self, guild_id: int, profile_key: str):
         """Retain source aliases and Discord message IDs across polls/restarts."""
@@ -2441,18 +2809,38 @@ class Database:
                                 payload: str):
         """Record baseline events only when absent, preserving delivered mappings."""
         profile_key = profile_key.strip().lower()
+        aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not aliases:
+            return
+        msg_rows = [(guild_id, profile_key, event_id, payload) for event_id in aliases]
+        seen_rows = [(guild_id, profile_key, event_id) for event_id in aliases]
         statements = []
-        for event_id in event_ids:
+        for batch in _iter_bounded_row_batches(
+            msg_rows,
+            params_per_row=4,
+            fixed_params=0,
+            fixed_sql_bytes=192,
+        ):
+            values_sql = ", ".join(["(?, ?, ?, ?, NULL, NULL, 'baseline')"] * len(batch))
+            flat_params = [value for row in batch for value in row]
             statements.append((
-                """INSERT OR IGNORE INTO profile_feed_messages
-                   (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
-                   VALUES (?, ?, ?, ?, NULL, NULL, 'baseline')""",
-                (guild_id, profile_key, event_id, payload),
+                f"""INSERT OR IGNORE INTO profile_feed_messages
+                    (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                    VALUES {values_sql}""",
+                flat_params,
             ))
+        for batch in _iter_bounded_row_batches(
+            seen_rows,
+            params_per_row=3,
+            fixed_params=0,
+            fixed_sql_bytes=128,
+        ):
+            values_sql = ", ".join(["(?, ?, ?)"] * len(batch))
+            flat_params = [value for row in batch for value in row]
             statements.append((
-                """INSERT OR IGNORE INTO profile_seen_journal_deliveries
-                   (guild_id, profile_key, entry_id) VALUES (?, ?, ?)""",
-                (guild_id, profile_key, event_id),
+                f"""INSERT OR IGNORE INTO profile_seen_journal_deliveries
+                    (guild_id, profile_key, entry_id) VALUES {values_sql}""",
+                flat_params,
             ))
         await self._execute_batch(statements)
 
@@ -2460,13 +2848,27 @@ class Database:
                                  payload: str, message_id=None, channel_id=None,
                                  delivery_state: Optional[str] = None):
         profile_key = profile_key.strip().lower()
+        aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not aliases:
+            return
         saved_state = delivery_state or ("sent" if message_id is not None else "baseline")
+        msg_rows = [
+            (guild_id, profile_key, event_id, payload, message_id, channel_id, saved_state)
+            for event_id in aliases
+        ]
         statements = []
-        for event_id in event_ids:
-            statements.append(("""
+        for batch in _iter_bounded_row_batches(
+            msg_rows,
+            params_per_row=7,
+            fixed_params=0,
+            fixed_sql_bytes=512,
+        ):
+            values_sql = ", ".join(["(?, ?, ?, ?, ?, ?, ?)"] * len(batch))
+            flat_params = [value for row in batch for value in row]
+            statements.append((f"""
                 INSERT INTO profile_feed_messages
                     (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES {values_sql}
                 ON CONFLICT(guild_id, profile_key, event_id) DO UPDATE SET
                     payload = excluded.payload,
                     message_id = COALESCE(excluded.message_id, profile_feed_messages.message_id),
@@ -2476,15 +2878,22 @@ class Database:
                         WHEN excluded.message_id IS NOT NULL THEN 'sent'
                         ELSE profile_feed_messages.delivery_state
                     END
-            """, (
-                guild_id, profile_key, event_id, payload, message_id, channel_id,
-                saved_state,
-            )))
-            if saved_state != "unknown":
-                statements.append(("""
-                    INSERT OR IGNORE INTO profile_seen_journal_deliveries
-                        (guild_id, profile_key, entry_id) VALUES (?, ?, ?)
-                """, (guild_id, profile_key, event_id)))
+            """, flat_params))
+        if saved_state != "unknown":
+            seen_rows = [(guild_id, profile_key, event_id) for event_id in aliases]
+            for batch in _iter_bounded_row_batches(
+                seen_rows,
+                params_per_row=3,
+                fixed_params=0,
+                fixed_sql_bytes=128,
+            ):
+                values_sql = ", ".join(["(?, ?, ?)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                statements.append((
+                    f"""INSERT OR IGNORE INTO profile_seen_journal_deliveries
+                        (guild_id, profile_key, entry_id) VALUES {values_sql}""",
+                    flat_params,
+                ))
         await self._execute_batch(statements)
 
     async def begin_feed_delivery(
@@ -2495,6 +2904,7 @@ class Database:
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
         if not aliases:
             return False
+        pending_rows = [(guild_id, profile_key, event_id, payload, channel_id) for event_id in aliases]
         async with self._transaction() as tx:
             for chunk in _iter_sql_chunks(aliases, fixed_params=2):
                 placeholders = ",".join("?" for _ in chunk)
@@ -2503,12 +2913,19 @@ class Database:
                 existing = await tx.fetchone(query, [guild_id, profile_key, *chunk])
                 if existing is not None:
                     return False
-            for event_id in aliases:
+            for batch in _iter_bounded_row_batches(
+                pending_rows,
+                params_per_row=5,
+                fixed_params=0,
+                fixed_sql_bytes=192,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, NULL, ?, 'pending')"] * len(batch))
+                flat_params = [value for row in batch for value in row]
                 await tx.execute(
-                    """INSERT OR IGNORE INTO profile_feed_messages
-                       (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
-                       VALUES (?, ?, ?, ?, NULL, ?, 'pending')""",
-                    (guild_id, profile_key, event_id, payload, channel_id),
+                    f"""INSERT OR IGNORE INTO profile_feed_messages
+                        (guild_id, profile_key, event_id, payload, message_id, channel_id, delivery_state)
+                        VALUES {values_sql}""",
+                    flat_params,
                 )
             return True
 
@@ -2602,26 +3019,47 @@ class Database:
                 )
                 for row in rows:
                     existing_map[row["observation_key"]] = row["fingerprint"]
-            new_count = 0
-            updated_count = 0
+            new_rows: list[tuple[str, str, str, str]] = []
+            changed_rows: list[tuple[str, str, str, str]] = []
             for key, fingerprint in items:
                 prev = existing_map.get(key)
                 if prev is None:
-                    new_count += 1
-                    await tx.execute(
-                        """INSERT INTO profile_activity_observations
-                           (profile_key, source, observation_key, fingerprint, observed_at)
-                           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                        (normalized_key, source, key, fingerprint),
-                    )
+                    new_rows.append((normalized_key, source, key, fingerprint))
                 elif prev != fingerprint:
-                    updated_count += 1
-                    await tx.execute(
-                        """UPDATE profile_activity_observations
-                           SET fingerprint = ?, observed_at = CURRENT_TIMESTAMP
-                           WHERE profile_key = ? AND source = ? AND observation_key = ?""",
-                        (fingerprint, normalized_key, source, key),
-                    )
+                    changed_rows.append((normalized_key, source, key, fingerprint))
+            for batch in _iter_bounded_row_batches(
+                new_rows,
+                params_per_row=4,
+                fixed_params=0,
+                fixed_sql_bytes=192,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, CURRENT_TIMESTAMP)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                await tx.execute(
+                    f"""INSERT INTO profile_activity_observations
+                        (profile_key, source, observation_key, fingerprint, observed_at)
+                        VALUES {values_sql}""",
+                    flat_params,
+                )
+            for batch in _iter_bounded_row_batches(
+                changed_rows,
+                params_per_row=4,
+                fixed_params=0,
+                fixed_sql_bytes=256,
+            ):
+                values_sql = ", ".join(["(?, ?, ?, ?, CURRENT_TIMESTAMP)"] * len(batch))
+                flat_params = [value for row in batch for value in row]
+                await tx.execute(
+                    f"""INSERT INTO profile_activity_observations
+                        (profile_key, source, observation_key, fingerprint, observed_at)
+                        VALUES {values_sql}
+                        ON CONFLICT(profile_key, source, observation_key) DO UPDATE SET
+                            fingerprint = excluded.fingerprint,
+                            observed_at = CURRENT_TIMESTAMP""",
+                    flat_params,
+                )
+            new_count = len(new_rows)
+            updated_count = len(changed_rows)
             return {
                 "initialized": initialized,
                 "new": new_count,
