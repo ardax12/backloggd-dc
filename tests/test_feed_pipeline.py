@@ -38,7 +38,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.directory.cleanup()
 
     async def publish(self, sources, guild=1, member=10):
-        await self.cog._publish_sources(guild, "millers", "Millers", None, self.channel, sources)
+        return await self.cog._publish_sources(guild, "millers", "Millers", None, self.channel, sources)
 
     async def baseline(self):
         await self.publish({"activity": [], "journal": []})
@@ -219,11 +219,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.baseline()
         rejected = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), {"message": "rejected"})
         self.channel.send.side_effect = rejected
-        with self.assertRaises(discord.Forbidden):
-            await self.publish({"activity": [self.activity]})
+        self.assertFalse(await self.publish({"activity": [self.activity]}))
         self.assertFalse(await self.db.is_journal_entry_delivered(1, "millers", self.activity.activity_id))
         self.channel.send.side_effect = None
-        await self.publish({"activity": [self.activity]})
+        self.assertTrue(await self.publish({"activity": [self.activity]}))
         self.assertTrue(await self.db.is_journal_entry_delivered(1, "millers", self.activity.activity_id))
 
     async def test_validated_unsent_observation_retries_after_event_leaves_latest_page(self):
@@ -232,11 +231,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.channel.send.side_effect = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden"), {"message": "rejected"}
         )
-        with self.assertRaises(discord.Forbidden):
-            await self.publish({"activity": [self.activity]})
+        self.assertFalse(await self.publish({"activity": [self.activity]}))
         self.channel.send.side_effect = None
 
-        await self.publish({"activity": [], "journal": []})
+        self.assertTrue(await self.publish({"activity": [], "journal": []}))
 
         self.assertEqual(self.channel.send.await_count, 2)
         self.assertTrue(await self.db.is_journal_entry_delivered(1, "millers", self.activity.activity_id))
@@ -619,13 +617,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(status=403, reason="Forbidden"), {"message": "temporary"}
         )
         act = replace(self.activity, activity_id="act-1")
-        with self.assertRaises(discord.Forbidden):
-            await self.publish({"activity": [act], "journal": [self.log]})
+        self.assertFalse(await self.publish({"activity": [act], "journal": [self.log]}))
         self.assertEqual(self.channel.send.await_count, 1)
         await self.db.close()
         await self.db.connect()
         self.channel.send.side_effect = None
-        await self.publish({"activity": [], "journal": []})
+        self.assertTrue(await self.publish({"activity": [], "journal": []}))
         self.assertEqual(self.channel.send.await_count, 2)
         await self.publish({"activity": [act], "journal": [self.log]})
         self.assertEqual(self.channel.send.await_count, 2)
@@ -705,8 +702,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.channel.send.side_effect = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden"), {"message": "rejected"}
         )
-        with self.assertRaises(discord.Forbidden):
-            await self.publish({"activity": [activity], "journal": []})
+        self.assertFalse(await self.publish({"activity": [activity], "journal": []}))
         self.channel.send.side_effect = None
         old_log = replace(self.log, played_date="2026-10-01")
 
@@ -728,16 +724,14 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(status=403, reason="Forbidden"), {"message": "rejected"}
         )
         self.channel.send.side_effect = rejection
-        with self.assertRaises(discord.Forbidden):
-            await self.publish({"activity": [activity], "journal": []})
+        self.assertFalse(await self.publish({"activity": [activity], "journal": []}))
         # The played date was exactly seven days old at initial discovery.
         self.cog.clock = lambda: datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
         recent_log = replace(self.log, played_date="2026-11-05")
-        with self.assertRaises(discord.Forbidden):
-            await self.publish({"activity": [activity], "journal": [recent_log]})
+        self.assertFalse(await self.publish({"activity": [activity], "journal": [recent_log]}))
         self.channel.send.side_effect = None
 
-        await self.publish({"activity": [activity]})
+        self.assertTrue(await self.publish({"activity": [activity]}))
 
         self.assertEqual(self.channel.send.await_count, 3)
         self.assertIn("2026-11-05", self.channel.send.call_args.kwargs["embed"].description)

@@ -290,6 +290,233 @@ class FeedObservationRefreshTests(unittest.IsolatedAsyncioTestCase):
             if service2 is not None:
                 await service2.close()
 
+    async def test_initial_observations_covered_by_completed_sync_skip_redundant_refresh_and_cooldown(self):
+        from datetime import timedelta
+
+        await self.db.link_user(10, "Millers")
+        t0 = datetime(2026, 11, 12, 12, 0, 0, tzinfo=timezone.utc)
+        now = t0
+        service = LibrarySyncService(
+            automatic_debounce_seconds=300,
+            failure_backoff_seconds=300,
+            clock=lambda: (now - t0).total_seconds(),
+        )
+        try:
+            await self.db.replace_profile_library(
+                "Millers",
+                [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)],
+                synced_at=t0,
+            )
+            info = await self.db.get_profile_sync_info("millers")
+            service.seed_from_sync_info(info, now=now, profile_key="millers")
+
+            api = SimpleNamespace(get_user_library=AsyncMock(return_value=[]))
+            cog = FeedCog(SimpleNamespace(db=self.db, backloggd=api, library_sync=service), clock=lambda: now)
+
+            now = t0 + timedelta(seconds=60)
+            events = [
+                self._entry("rate-1", action_type="rated", rating=4.5, occurred_at="2026-11-12T11:55:00Z"),
+                self._entry("comp-1", action_type="completed", rating=None, occurred_at="2026-11-12T11:50:00Z"),
+            ]
+            self.assertFalse(await cog._observe_profile_activity("millers", "Millers", {"activity": events, "journal": []}))
+            self.assertIsNone(await self.db.get_profile_refresh_pending_token("millers"))
+            api.get_user_library.assert_not_awaited()
+
+            # Past cooldown: still no redundant refresh because no pending token was created.
+            now = t0 + timedelta(seconds=400)
+            self.assertFalse(await cog._observe_profile_activity("millers", "Millers", {"activity": events, "journal": []}))
+            self.assertIsNone(await self.db.get_profile_refresh_pending_token("millers"))
+            api.get_user_library.assert_not_awaited()
+        finally:
+            await service.close()
+
+    async def test_initial_observations_after_completed_sync_set_pending_and_trigger_followup(self):
+        from datetime import timedelta
+
+        await self.db.link_user(10, "Millers")
+        t0 = datetime(2026, 11, 12, 12, 0, 0, tzinfo=timezone.utc)
+        now = t0
+        service = LibrarySyncService(
+            automatic_debounce_seconds=300,
+            failure_backoff_seconds=300,
+            clock=lambda: (now - t0).total_seconds(),
+        )
+        try:
+            await self.db.replace_profile_library(
+                "Millers",
+                [GameEntry(slug="hades", title="Hades", rating=4.0, status=GameStatus.PLAYED)],
+                synced_at=t0,
+            )
+            service.seed_from_sync_info(await self.db.get_profile_sync_info("millers"), now=now, profile_key="millers")
+
+            api = SimpleNamespace(get_user_library=AsyncMock(return_value=[
+                GameEntry(slug="hades", title="Hades", rating=5.0, status=GameStatus.PLAYED),
+            ]))
+            cog = FeedCog(SimpleNamespace(db=self.db, backloggd=api, library_sync=service), clock=lambda: now)
+
+            # Activity occurred AFTER t0 -> inside cooldown it sets pending and defers refresh.
+            now = t0 + timedelta(seconds=60)
+            post_sync = self._entry("rate-post", action_type="rated", rating=5.0, occurred_at="2026-11-12T12:00:30Z")
+            self.assertTrue(await cog._observe_profile_activity("millers", "Millers", {"activity": [post_sync], "journal": []}))
+            if service._profiles["millers"].task:
+                await service._profiles["millers"].task
+            await asyncio.sleep(0)
+            api.get_user_library.assert_not_awaited()
+            self.assertIsNotNone(await self.db.get_profile_refresh_pending_token("millers"))
+
+            # Past cooldown -> pending triggers refresh and clears token.
+            now = t0 + timedelta(seconds=400)
+            self.assertTrue(await cog._observe_profile_activity("millers", "Millers", {"activity": [post_sync], "journal": []}))
+            if service._profiles["millers"].task:
+                await service._profiles["millers"].task
+            await asyncio.sleep(0)
+            api.get_user_library.assert_awaited_once_with("Millers", force_refresh=True)
+            self.assertEqual(await self.db.get_profile_ratings_dict("millers"), {"hades": 5.0})
+            self.assertIsNone(await self.db.get_profile_refresh_pending_token("millers"))
+        finally:
+            await service.close()
+
+    async def test_initial_observations_during_inflight_link_sync_keep_newer_token_and_run_dirty_followup(self):
+        from bot.services.library_sync import sync_profile_library
+
+        await self.db.link_user(10, "Millers")
+        t0 = datetime(2026, 11, 12, 12, 0, 0, tzinfo=timezone.utc)
+        # Seed an older completed sync so only the in-flight guard stops false coverage.
+        await self.db.replace_profile_library(
+            "Millers",
+            [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)],
+            synced_at=t0,
+        )
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+
+        async def fetch_library(username, force_refresh=False):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+                return [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)]
+            return [GameEntry(slug="hades", title="Hades", rating=5.0, status=GameStatus.PLAYED)]
+
+        api = SimpleNamespace(get_user_library=AsyncMock(side_effect=fetch_library))
+        bot = SimpleNamespace(db=self.db, backloggd=api, library_sync=self.service)
+        cog = FeedCog(bot, clock=lambda: t0)
+
+        link_task = self.service.request("millers", lambda: sync_profile_library(bot, "Millers", synced_at=t0), manual=True)
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        # Even if initial observation's timestamp <= t0, sync is in flight so pending token must be kept & dirty queued.
+        obs = self._entry("rate-1", action_type="rated", rating=4.5, occurred_at="2026-11-12T11:55:00Z")
+        self.assertTrue(await cog._observe_profile_activity("millers", "Millers", {"activity": [obs], "journal": []}))
+        token_during_sync = await self.db.get_profile_refresh_pending_token("millers")
+        self.assertIsNotNone(token_during_sync)
+        self.assertIsNotNone(self.service._profiles["millers"].dirty_operation)
+
+        # Token compare-and-clear must not erase token_during_sync with an older/None token.
+        self.assertFalse(await self.db.clear_profile_refresh_pending("millers", token="older-token"))
+        self.assertEqual(await self.db.get_profile_refresh_pending_token("millers"), token_during_sync)
+
+        release.set()
+        await link_task
+        self.assertEqual(calls, 2)
+        self.assertEqual(await self.db.get_profile_ratings_dict("millers"), {"hades": 5.0})
+        self.assertIsNone(await self.db.get_profile_refresh_pending_token("millers"))
+
+    async def test_date_only_backdated_and_state_mismatch_initial_observations_stay_conservative(self):
+        t0 = datetime(2026, 11, 12, 12, 0, 0, tzinfo=timezone.utc)
+        journal_event = FeedEvent(
+            "journal_abc", "Hades", "hades", None, "completed", "completed",
+            4.5, None, None, played_date="November, 2026 10", source="journal", event_ids=("journal_abc",),
+        )
+        undated_activity = self._entry("act-undated", action_type="rated", rating=4.5, occurred_at=None)
+        mismatched_rating = self._entry("act-mismatch", action_type="rated", rating=5.0, occurred_at="2026-11-12T11:50:00Z")
+
+        for label, sources in (
+            ("date_only_journal", {"activity": [], "journal": [journal_event]}),
+            ("undated_activity", {"activity": [undated_activity], "journal": []}),
+            ("state_mismatch", {"activity": [mismatched_rating], "journal": []}),
+        ):
+            with self.subTest(case=label):
+                db_dir = tempfile.TemporaryDirectory()
+                db = Database(str(Path(db_dir.name) / f"{label}.db"), turso_url="")
+                await db.connect()
+                svc = LibrarySyncService(automatic_debounce_seconds=0, failure_backoff_seconds=0)
+                try:
+                    await db.link_user(10, "Millers")
+                    await db.replace_profile_library(
+                        "Millers",
+                        [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)],
+                        synced_at=t0,
+                    )
+                    api = SimpleNamespace(get_user_library=AsyncMock(return_value=[
+                        GameEntry(slug="hades", title="Hades", rating=5.0, status=GameStatus.PLAYED),
+                    ]))
+                    cog = FeedCog(SimpleNamespace(db=db, backloggd=api, library_sync=svc), clock=lambda: t0)
+                    self.assertTrue(await cog._observe_profile_activity("millers", "Millers", sources))
+                    if "millers" in svc._profiles and svc._profiles["millers"].task:
+                        await svc._profiles["millers"].task
+                    api.get_user_library.assert_awaited_once_with("Millers", force_refresh=True)
+                finally:
+                    await svc.close()
+                    await db.close()
+                    db_dir.cleanup()
+
+    async def test_failed_sync_after_earlier_snapshot_preserves_required_refresh(self):
+        from datetime import timedelta
+
+        await self.db.link_user(10, "Millers")
+        t0 = datetime(2026, 11, 12, 12, 0, 0, tzinfo=timezone.utc)
+        now = t0
+        service1 = LibrarySyncService(
+            automatic_debounce_seconds=300,
+            failure_backoff_seconds=300,
+            clock=lambda: (now - t0).total_seconds(),
+        )
+        service2 = None
+        try:
+            await self.db.replace_profile_library(
+                "Millers",
+                [GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED)],
+                synced_at=t0 - timedelta(hours=2),
+            )
+            await self.db.record_profile_sync_failure("Millers", "upstream 503", attempted_at=t0 - timedelta(seconds=30))
+            api = SimpleNamespace(get_user_library=AsyncMock(return_value=[
+                GameEntry(slug="hades", title="Hades", rating=5.0, status=GameStatus.PLAYED),
+            ]))
+            cog1 = FeedCog(SimpleNamespace(db=self.db, backloggd=api, library_sync=service1), clock=lambda: now)
+            # Even though observation timestamp precedes earlier synced_at, failed attempt keeps it conservative.
+            obs = self._entry("rate-old", action_type="rated", rating=4.5, occurred_at="2026-11-12T09:30:00Z")
+            self.assertTrue(await cog1._observe_profile_activity("millers", "Millers", {"activity": [obs], "journal": []}))
+            if service1._profiles["millers"].task:
+                await service1._profiles["millers"].task
+            await asyncio.sleep(0)
+            api.get_user_library.assert_not_awaited()
+            self.assertIsNotNone(await self.db.get_profile_refresh_pending_token("millers"))
+
+            # Restart and advance past backoff -> pending triggers refresh.
+            await service1.close()
+            await self.db.close()
+            await self.db.connect()
+            service2 = LibrarySyncService(
+                automatic_debounce_seconds=300,
+                failure_backoff_seconds=300,
+                clock=lambda: (now - t0).total_seconds(),
+            )
+            cog2 = FeedCog(SimpleNamespace(db=self.db, backloggd=api, library_sync=service2), clock=lambda: now)
+            now = t0 + timedelta(seconds=400)
+            self.assertTrue(await cog2._observe_profile_activity("millers", "Millers", {"activity": [obs], "journal": []}))
+            if service2._profiles["millers"].task:
+                await service2._profiles["millers"].task
+            await asyncio.sleep(0)
+            api.get_user_library.assert_awaited_once_with("Millers", force_refresh=True)
+            self.assertEqual(await self.db.get_profile_ratings_dict("millers"), {"hades": 5.0})
+            self.assertIsNone(await self.db.get_profile_refresh_pending_token("millers"))
+        finally:
+            await service1.close()
+            if service2 is not None:
+                await service2.close()
+
 
 if __name__ == "__main__":
     unittest.main()

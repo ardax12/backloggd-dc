@@ -1,7 +1,10 @@
 """Formatting helpers for stars, status badges, numbers, and Backloggd URLs."""
 
+import re
 from typing import Any, Optional
 import urllib.parse
+
+from bot.input_validation import escape_display_text
 
 def rating_to_stars(rating: Optional[float], max_stars: int = 5) -> str:
     """
@@ -146,3 +149,22 @@ def clamp_escaped_text(
     if trailing_backslashes % 2 == 1:
         cut = cut[:-1]
     return f"{cut}{suffix}"
+
+
+_URL_USERINFO_RE = re.compile(r"://[^/\s@]+@")
+_KEY_SECRET_RE = re.compile(
+    r"(?i)\b(auth_?token|access_?token|refresh_?token|token|password|passwd|secret|api_?key|authorization|cookie|set-cookie)\b"
+    r"(\s*[:=]\s*)(['\"]?)(?:bearer\s+)?[^\s,;'\"]+\3"
+)
+_BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"']+")
+_JWT_SECRET_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
+
+
+def format_health_error_excerpt(raw_error: Any, *, max_length: int = 120) -> str:
+    """Normalize multiline errors, redact secret-like tokens, escape once, and clamp as prose."""
+    collapsed = " ".join(str(raw_error).split())
+    sanitized = _URL_USERINFO_RE.sub("://[redacted]@", collapsed)
+    sanitized = _KEY_SECRET_RE.sub(r"\1\2[redacted]", sanitized)
+    sanitized = _BEARER_SECRET_RE.sub("Bearer [redacted]", sanitized)
+    sanitized = _JWT_SECRET_RE.sub("[redacted-token]", sanitized)
+    return clamp_escaped_text(escape_display_text(sanitized), max_length)

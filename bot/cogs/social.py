@@ -625,23 +625,35 @@ class SocialCog(commands.Cog, name="Social"):
                     t2_ratings = numeric_ratings(all_other_ratings.get(t2_key, {}))
                     final_s, _, _ = calculate_similarity_raw(my_numeric_ratings, t2_ratings)
                     c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
+                    duel_meta = dict(cached_meta)
+                    missing_slugs = sorted(s for s in c_slugs if s not in duel_meta)
+                    slug_lookup = getattr(self.bot.db, "get_games_by_slugs", None)
+                    if missing_slugs and callable(slug_lookup):
+                        extra_meta = await slug_lookup(missing_slugs)
+                        if extra_meta:
+                            duel_meta.update(extra_meta)
                     c_loves = []
                     c_dis = []
-                    for s in c_slugs:
+                    for s in sorted(c_slugs):
                         r1 = my_numeric_ratings.get(s)
                         r2 = t2_ratings.get(s)
                         if r1 is None or r2 is None:
                             continue
                         d = abs(r1 - r2)
-                        meta_lookup = cached_meta.get(s)
-                        t_title = meta_lookup["title"] if meta_lookup and meta_lookup["title"] else s.replace("-", " ").title()
+                        meta_lookup = duel_meta.get(s)
+                        raw_title = meta_lookup["title"] if meta_lookup else None
+                        t_title = (
+                            raw_title.strip()
+                            if isinstance(raw_title, str) and raw_title.strip()
+                            else s.replace("-", " ").title()
+                        )
                         if r1 >= 4.0 and r2 >= 4.0:
                             c_loves.append({"title": t_title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
                         if d >= 1.0:
                             c_dis.append({"title": t_title, "r1": r1, "r2": r2, "delta": d})
 
-                    c_loves.sort(key=lambda x: x["avg"], reverse=True)
-                    c_dis.sort(key=lambda x: x["delta"], reverse=True)
+                    c_loves.sort(key=lambda x: (-x["avg"], x["title"]))
+                    c_dis.sort(key=lambda x: (-x["delta"], x["title"]))
                     l1 = format_profile_freshness_line(target_status, label=f"**{safe_target}**", unlinked_live=not target_subscribed)
                     l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{escape_display_text(top_twin_name)}**")
                     duel_freshness = "\n".join(line for line in (l1, l2) if line) or None

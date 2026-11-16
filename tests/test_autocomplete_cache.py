@@ -1,5 +1,6 @@
 """Regression tests for Task 8: resilient autocomplete choices and bounded fallback cache."""
 
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
@@ -241,6 +242,89 @@ class AutocompletePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(renewed_b, token_b)
         await GamesCog.game.callback(cog, _fake_interaction(), renewed_b)
         api.get_game.assert_awaited_once_with(slug_b)
+
+    async def test_autocomplete_times_out_within_budget_without_poisoning_cache_or_closing_sdk(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def search_games(query: str):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                started.set()
+                await release.wait()
+            return [SimpleNamespace(title="Hollow Knight", release_year=2017, slug="hollow-knight")]
+
+        api = SimpleNamespace(search_games=AsyncMock(side_effect=search_games), close=AsyncMock())
+        cog = GamesCog(
+            SimpleNamespace(backloggd=api, db=SimpleNamespace()),
+            autocomplete_timeout_seconds=0.05,
+        )
+        # Seed an existing cached query and fallback token to confirm timeouts preserve both.
+        cog._autocomplete_cache["cached game"] = []
+        existing_token = cog._register_fallback_slug("x" * 110, "seeded")
+
+        default_cog = GamesCog(SimpleNamespace(backloggd=api, db=SimpleNamespace()))
+        self.assertGreater(default_cog._autocomplete_timeout_seconds, 0.0)
+        self.assertLess(default_cog._autocomplete_timeout_seconds, 3.0)
+
+        with self.assertLogs("backloggd.cogs.games", level="WARNING") as logs:
+            choices = await asyncio.wait_for(
+                cog.game_autocomplete(SimpleNamespace(), "Hollow Knight"),
+                timeout=1.0,
+            )
+
+        self.assertTrue(started.is_set())
+        self.assertEqual(choices, [])
+        self.assertTrue(any("timed out" in rec.getMessage().lower() for rec in logs.records))
+        api.close.assert_not_awaited()
+        self.assertNotIn("hollow knight", cog._autocomplete_cache)
+        self.assertIn("cached game", cog._autocomplete_cache)
+        self.assertIn(existing_token, cog._fallback_entries)
+
+        # Unblock and repeat query: since timeout did not poison the cache, it succeeds now.
+        release.set()
+        recovered = await cog.game_autocomplete(SimpleNamespace(), "Hollow Knight")
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0].value, "slug:hollow-knight")
+        self.assertIn("hollow knight", cog._autocomplete_cache)
+
+        # Cached hit skips SDK search completely.
+        api.search_games.reset_mock()
+        cached_hit = await cog.game_autocomplete(SimpleNamespace(), "  HOLLOW KNIGHT ")
+        self.assertEqual(cached_hit, recovered)
+        api.search_games.assert_not_awaited()
+
+    async def test_autocomplete_error_does_not_poison_cache_and_cancellation_propagates(self):
+        api = SimpleNamespace(
+            search_games=AsyncMock(side_effect=RuntimeError("upstream 503")),
+            close=AsyncMock(),
+        )
+        cog = GamesCog(
+            SimpleNamespace(backloggd=api, db=SimpleNamespace()),
+            autocomplete_timeout_seconds=0.05,
+        )
+
+        with self.assertLogs("backloggd.cogs.games", level="WARNING"):
+            choices = await cog.game_autocomplete(SimpleNamespace(), "Elden Ring")
+
+        self.assertEqual(choices, [])
+        self.assertNotIn("elden ring", cog._autocomplete_cache)
+        api.close.assert_not_awaited()
+
+        # Subsequent query recovers once upstream succeeds.
+        api.search_games = AsyncMock(
+            return_value=[SimpleNamespace(title="Elden Ring", release_year=2022, slug="elden-ring")]
+        )
+        recovered = await cog.game_autocomplete(SimpleNamespace(), "Elden Ring")
+        self.assertEqual([c.value for c in recovered], ["slug:elden-ring"])
+
+        # Cancellation must propagate instead of being swallowed into [].
+        api.search_games = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await cog.game_autocomplete(SimpleNamespace(), "Dark Souls")
+        self.assertNotIn("dark souls", cog._autocomplete_cache)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """DiscoveryCog: Handles profile-based recommendations and an unplayed-game roulette."""
 
+import asyncio
 from datetime import datetime, timezone
 import discord
 from discord import app_commands
@@ -10,7 +11,12 @@ from typing import Optional
 from backloggd.analytics import calculate_similarity_raw
 from bot.ui.embeds import create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
-from bot.ui.helpers import build_backloggd_game_url, build_backloggd_user_url, rating_to_stars
+from bot.ui.helpers import (
+    build_backloggd_game_url,
+    build_backloggd_user_url,
+    clamp_escaped_text,
+    rating_to_stars,
+)
 from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
 from bot.input_validation import escape_display_text
 from bot.recommendation_rules import (
@@ -98,30 +104,55 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         chosen_game = random.choice(backlog_games)
         remaining = len(backlog_games)
         freshness_note = format_profile_freshness_line(status)
+        reroll_lock = asyncio.Lock()
+        active_state = {"view": None, "generation": 0}
 
-        # Reroll callback definition for the interactive view
-        async def on_reroll(btn_interaction: discord.Interaction):
-            new_choice = random.choice(backlog_games)
-            new_embed = create_roulette_embed(
-                username, new_choice, remaining, freshness_note=freshness_note
-            )
-            new_view = RouletteView(
+        def _build_roulette_view(choice, *, generation: int) -> RouletteView:
+            built_view = None
+
+            async def on_reroll(btn_interaction: discord.Interaction):
+                if not btn_interaction.response.is_done():
+                    await defer_interaction(btn_interaction)
+                async with reroll_lock:
+                    if built_view is not active_state["view"] or generation != active_state["generation"]:
+                        return
+                    new_choice = random.choice(backlog_games)
+                    next_generation = generation + 1
+                    new_embed = create_roulette_embed(
+                        username, new_choice, remaining, freshness_note=freshness_note
+                    )
+                    new_view = _build_roulette_view(new_choice, generation=next_generation)
+                    previous_view = active_state["view"]
+                    parent_message = (
+                        previous_view.message
+                        if previous_view is not None and previous_view.message is not None
+                        else btn_interaction.message
+                    )
+                    try:
+                        edited_message = await btn_interaction.edit_original_response(
+                            embed=new_embed, view=new_view
+                        )
+                    except BaseException:
+                        new_view.retire()
+                        raise
+                    new_view.message = edited_message or parent_message
+                    active_state["view"] = new_view
+                    active_state["generation"] = next_generation
+                    if previous_view is not None and previous_view is not new_view:
+                        previous_view.retire()
+
+            built_view = RouletteView(
                 author_id=interaction.user.id,
-                game_url=build_backloggd_game_url(new_choice["slug"]),
-                on_reroll=on_reroll
+                game_url=build_backloggd_game_url(choice["slug"]),
+                on_reroll=on_reroll,
             )
-            new_view.message = btn_interaction.message
-            await btn_interaction.response.edit_message(embed=new_embed, view=new_view)
+            return built_view
 
         embed = create_roulette_embed(
             username, chosen_game, remaining, freshness_note=freshness_note
         )
-        view = RouletteView(
-            author_id=interaction.user.id,
-            game_url=build_backloggd_game_url(chosen_game["slug"]),
-            on_reroll=on_reroll
-        )
-
+        view = _build_roulette_view(chosen_game, generation=0)
+        active_state["view"] = view
         view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
     # =========================================================================
@@ -190,7 +221,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 else:
                     await send_private_followup(
                         interaction,
-                        f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library first."[:2000],
+                        clamp_escaped_text(
+                            f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library first.",
+                            2000,
+                        ),
                         log=logger,
                     )
                 return
@@ -220,28 +254,45 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 taste_pct = int(round(sim_score))
 
             # Pick caller's top-rated games (rated >= 4.0) not played, started, unknown, or rated by friend
-            eligible_games = [
+            qualifying_games = [
                 (slug, rating)
                 for slug, rating in caller_ratings.items()
-                if rating is not None and rating >= 4.0 and slug not in friend_excluded_slugs
+                if rating is not None and rating >= 4.0
+            ]
+            eligible_games = [
+                (slug, rating)
+                for slug, rating in qualifying_games
+                if slug not in friend_excluded_slugs
             ]
             eligible_games.sort(key=lambda x: x[1], reverse=True)
 
             if not eligible_games:
-                if friend_link:
+                if not qualifying_games:
+                    await send_private_followup(
+                        interaction,
+                        "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
+                        log=logger,
+                    )
+                elif friend_link:
                     if has_uncertain_library_exclusion(caller_ratings, friend_entries):
                         await send_private_followup(
                             interaction,
-                            (
-                                f"ℹ️ No eligible 4.0+ recommendations were found for **{safe_friend}** "
-                                "(matching games with an unknown status in their library were conservatively excluded)."
-                            )[:2000],
+                            clamp_escaped_text(
+                                (
+                                    f"ℹ️ No eligible 4.0+ recommendations were found for **{safe_friend}** "
+                                    "(matching games with an unknown status in their library were conservatively excluded)."
+                                ),
+                                2000,
+                            ),
                             log=logger,
                         )
                     else:
                         await send_private_followup(
                             interaction,
-                            f"🎉 **{safe_friend}** has already played, started, or rated all of your 4.0+ rated games."[:2000],
+                            clamp_escaped_text(
+                                f"🎉 **{safe_friend}** has already played, started, or rated all of your 4.0+ rated games.",
+                                2000,
+                            ),
                             log=logger,
                         )
                 else:
@@ -265,7 +316,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
             embed = discord.Embed(
                 title=f"💡 Recommendations for {friend_username}"[:256],
-                description=desc[:4096],
+                description=clamp_escaped_text(desc, 4096),
                 color=COLOR_PLAYED
             )
 
@@ -276,10 +327,13 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 stars = rating_to_stars(rating)
                 embed.add_field(
                     name=f"🎮 {title}"[:256],
-                    value=(
-                        f"• {safe_caller}'s Rating: {stars} (`{rating:.1f}`)\n"
-                        f"• [View on Backloggd]({url})"
-                    )[:1024],
+                    value=clamp_escaped_text(
+                        (
+                            f"• {safe_caller}'s Rating: {stars} (`{rating:.1f}`)\n"
+                            f"• [View on Backloggd]({url})"
+                        ),
+                        1024,
+                    ),
                     inline=False
                 )
 
@@ -290,7 +344,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 )
             freshness_text = "\n".join(line for line in freshness_lines if line)
             if freshness_text:
-                embed.add_field(name="⏱ Cache Freshness", value=freshness_text[:1024], inline=False)
+                embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_text, 1024), inline=False)
 
             embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot"[:2048])
             await send_public_followup(interaction, embed=embed)
@@ -327,7 +381,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             else:
                 await send_private_followup(
                     interaction,
-                    f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library."[:2000],
+                    clamp_escaped_text(
+                        f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library.",
+                        2000,
+                    ),
                     log=logger,
                 )
             return
@@ -336,7 +393,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         if not my_numeric_ratings:
             await send_private_followup(
                 interaction,
-                f"ℹ️ **{safe_caller}** has no numeric game ratings in the cached library yet. Similarity needs rated games; unrated backlog and wishlist entries do not count."[:2000],
+                clamp_escaped_text(
+                    f"ℹ️ **{safe_caller}** has no numeric game ratings in the cached library yet. Similarity needs rated games; unrated backlog and wishlist entries do not count.",
+                    2000,
+                ),
                 log=logger,
             )
             return
@@ -502,18 +562,21 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             safe_recommender = escape_display_text(rec["recommender"])
             embed.add_field(
                 name=f"🎮 {rec['title']}"[:256],
-                value=(
-                    f"• Recommended by **{safe_recommender}** ({rec['match_pct']}% taste match)\n"
-                    f"• Their Rating: {stars} (`{rec['rating']:.1f}`)\n"
-                    f"• [View on Backloggd]({url})"
-                )[:1024],
+                value=clamp_escaped_text(
+                    (
+                        f"• Recommended by **{safe_recommender}** ({rec['match_pct']}% taste match)\n"
+                        f"• Their Rating: {stars} (`{rec['rating']:.1f}`)\n"
+                        f"• [View on Backloggd]({url})"
+                    ),
+                    1024,
+                ),
                 inline=False
             )
 
         contributing = ([caller_status] if caller_status is not None else []) + list(other_statuses.values())
         freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
         if freshness_note:
-            embed.add_field(name="⏱ Cache Freshness", value=freshness_note[:1024], inline=False)
+            embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
 
         embed.set_footer(text="Diverse recommendations curated across your server taste matches")
         await send_public_followup(interaction, embed=embed)

@@ -105,6 +105,9 @@ class Database:
         self._client: Optional[libsql_client.Client] = None
         self._operation_lock = asyncio.Lock()
         self._lock_owner_task: Optional[asyncio.Task] = None
+        self._active_pending_deliveries: set[tuple[int, str, str]] = set()
+        self._stale_pending_recovery_checked: bool = False
+        self._stale_recovery_lock = asyncio.Lock()
 
     @property
     def is_turso(self) -> bool:
@@ -113,6 +116,8 @@ class Database:
 
     async def connect(self) -> None:
         """Establish connection and create database tables if they do not exist."""
+        self._active_pending_deliveries.clear()
+        self._stale_pending_recovery_checked = False
         if self.is_turso:
             logger.info("Connecting to Turso cloud database (%s)...", self.turso_url)
             self._client = libsql_client.create_client(
@@ -159,6 +164,8 @@ class Database:
     async def close(self) -> None:
         """Close active database connection."""
         async with self._acquire_operation_lock():
+            self._active_pending_deliveries.clear()
+            self._stale_pending_recovery_checked = False
             if self._client:
                 await self._client.close()
                 self._client = None
@@ -342,7 +349,8 @@ class Database:
         """Connect a Discord member to a normalized shared profile."""
         from bot.ui.helpers import clean_image_url
         clean_avatar = clean_image_url(avatar_url)
-        profile_key = username.strip().lower()
+        display_username = username.strip()
+        profile_key = display_username.lower()
         await self._execute_batch([
             ("""
                 INSERT INTO profiles (profile_key, display_username, avatar_url)
@@ -350,7 +358,7 @@ class Database:
                 ON CONFLICT(profile_key) DO UPDATE SET
                     display_username = excluded.display_username,
                     avatar_url = COALESCE(excluded.avatar_url, profiles.avatar_url)
-            """, (profile_key, username.strip(), clean_avatar)),
+            """, (profile_key, display_username, clean_avatar)),
             ("""
                 INSERT INTO linked_users (discord_id, profile_key, backloggd_username, avatar_url, last_synced_at)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -359,7 +367,7 @@ class Database:
                     backloggd_username = excluded.backloggd_username,
                     avatar_url = COALESCE(excluded.avatar_url, linked_users.avatar_url),
                     last_synced_at = CURRENT_TIMESTAMP;
-            """, (discord_id, profile_key, username, clean_avatar)),
+            """, (discord_id, profile_key, display_username, clean_avatar)),
         ])
         return True
 
@@ -2731,8 +2739,43 @@ class Database:
         )
         return row is not None
 
-    async def seed_feed_source(self, guild_id: int, profile_key: str,
-                               source: str, entry_ids: Iterable[str], *, baseline_messages=()) -> bool:
+    async def get_delivered_journal_entry_ids(
+        self, guild_id: int, profile_key: str, entry_ids: Iterable[str]
+    ) -> set[str]:
+        """Bulk fetch delivered or baselined entry IDs within SQL bind budgets."""
+        normalized_key = profile_key.strip().lower()
+        unique_ids = list(dict.fromkeys(entry_id for entry_id in entry_ids if entry_id))
+        if not unique_ids:
+            return set()
+        found: set[str] = set()
+        for chunk in _iter_sql_chunks(unique_ids, fixed_params=2):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT entry_id FROM profile_seen_journal_deliveries
+                    WHERE guild_id = ? AND profile_key = ? AND entry_id IN ({placeholders})""",
+                [guild_id, normalized_key, *chunk],
+            )
+            found.update(row["entry_id"] for row in rows)
+        return found
+
+    async def get_feed_sources(self, guild_id: int, profile_key: str) -> set[str]:
+        """Return initialized feed source identifiers for a guild/profile."""
+        rows = await self._fetchall(
+            "SELECT source FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ?",
+            (guild_id, profile_key.strip().lower()),
+        )
+        return {row["source"] for row in rows}
+
+    async def seed_feed_source(
+        self,
+        guild_id: int,
+        profile_key: str,
+        source: str,
+        entry_ids: Iterable[str],
+        *,
+        baseline_messages=(),
+        baseline_decisions=(),
+    ) -> bool:
         """Baseline a new source once, atomically; later polls deliver new IDs."""
         profile_key = profile_key.strip().lower()
         params = (guild_id, profile_key, source)
@@ -2744,6 +2787,24 @@ class Database:
             )
         )
         seen_rows = [(guild_id, profile_key, entry_id) for entry_id in unique_ids]
+        default_source = source[:-len("-display-v1")] if source.endswith("-display-v1") else source
+        decision_map: dict[str, tuple[Any, ...]] = {}
+        for item in baseline_decisions:
+            eid = item.get("event_id")
+            if not eid or (isinstance(eid, str) and not eid.strip()):
+                continue
+            decision_map[eid] = (
+                guild_id,
+                profile_key,
+                eid,
+                item.get("source") or default_source,
+                item.get("event_date"),
+                item.get("decision") or "baseline",
+                item.get("reason") or "initial_or_resume_source_baseline",
+                item["payload"],
+                self._format_utc_sql_timestamp(item.get("observed_at")),
+            )
+        decision_rows = list(decision_map.values())
         async with self._transaction() as tx:
             existing = await tx.fetchone(
                 "SELECT 1 FROM profile_feed_sources WHERE guild_id = ? AND profile_key = ? AND source = ?",
@@ -2764,8 +2825,11 @@ class Database:
                         (guild_id, profile_key, entry_id) VALUES {values_sql}""",
                     flat_params,
                 )
-            message_rows = [(guild_id, profile_key, event_id, payload)
-                            for event_id, payload in baseline_messages if event_id]
+            message_rows = [
+                (guild_id, profile_key, event_id, payload)
+                for event_id, payload in baseline_messages
+                if event_id and (not isinstance(event_id, str) or event_id.strip())
+            ]
             for batch in _iter_bounded_row_batches(
                 message_rows, params_per_row=4, fixed_sql_bytes=256
             ):
@@ -2776,29 +2840,116 @@ class Database:
                         VALUES {values_sql}""",
                     [value for row in batch for value in row],
                 )
+            for batch in _iter_bounded_row_batches(
+                decision_rows,
+                params_per_row=9,
+                fixed_params=0,
+                fixed_sql_bytes=256,
+            ):
+                values_sql = ", ".join(
+                    ["(?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))"] * len(batch)
+                )
+                await tx.execute(
+                    f"""INSERT OR IGNORE INTO profile_feed_decisions
+                        (guild_id, profile_key, event_id, source, event_date, decision, reason, payload, observed_at)
+                        VALUES {values_sql}""",
+                    [value for row in batch for value in row],
+                )
             await tx.execute("INSERT OR IGNORE INTO profile_feed_sources VALUES (?, ?, ?)", params)
             return True
 
     async def seed_feed_source_with_messages(
-        self, guild_id: int, profile_key: str, source: str, messages
+        self,
+        guild_id: int,
+        profile_key: str,
+        source: str,
+        messages,
+        *,
+        baseline_decisions=(),
     ) -> bool:
-        """Initialize distinct baseline payloads, seen IDs and source marker atomically."""
+        """Initialize distinct baseline payloads, seen IDs, decisions, and source marker atomically."""
         unique = dict(messages)
         return await self.seed_feed_source(
             guild_id, profile_key, source, unique,
             baseline_messages=list(unique.items()),
+            baseline_decisions=baseline_decisions,
         )
 
+    async def _ensure_stale_pending_recovered(self) -> None:
+        if self._stale_pending_recovery_checked:
+            return
+        async with self._stale_recovery_lock:
+            if self._stale_pending_recovery_checked:
+                return
+            await self.recover_stale_feed_deliveries()
+            self._stale_pending_recovery_checked = True
+
+    async def recover_stale_feed_deliveries(
+        self, guild_id: Optional[int] = None, profile_key: Optional[str] = None
+    ) -> int:
+        """Mark interrupted prior-run pending delivery intents unknown without touching live sends.
+
+        Ownership and recovery timing:
+        - Live in-process send intents are registered in ``_active_pending_deliveries`` by
+          ``begin_feed_delivery`` and cleared when ``store_feed_message``,
+          ``release_feed_delivery``, ``mark_feed_delivery_unknown``, or
+          ``mark_feed_message_deleted`` finishes.
+        - Stale ``pending`` rows from prior runs are recovered once per database connection
+          on the first ``get_feed_messages()`` or ``begin_feed_delivery()`` call (with no write
+          issued when none exist) and remain excluded from concurrent ``get_feed_messages()``
+          reads while sends are in flight.
+        """
+        if guild_id is not None and profile_key is not None:
+            normalized_key = profile_key.strip().lower()
+            rows = await self._fetchall(
+                """SELECT guild_id, profile_key, event_id
+                   FROM profile_feed_messages
+                   WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'""",
+                (guild_id, normalized_key),
+            )
+        else:
+            rows = await self._fetchall(
+                """SELECT guild_id, profile_key, event_id
+                   FROM profile_feed_messages
+                   WHERE delivery_state = 'pending'"""
+            )
+        if not rows:
+            if guild_id is None and profile_key is None:
+                self._stale_pending_recovery_checked = True
+            return 0
+        stale_by_scope: dict[tuple[int, str], list[str]] = {}
+        for row in rows:
+            scope = (int(row["guild_id"]), row["profile_key"])
+            eid = row["event_id"]
+            if (scope[0], scope[1], eid) in self._active_pending_deliveries:
+                continue
+            stale_by_scope.setdefault(scope, []).append(eid)
+        if not stale_by_scope:
+            if guild_id is None and profile_key is None:
+                self._stale_pending_recovery_checked = True
+            return 0
+        statements = []
+        recovered = 0
+        for (scope_guild_id, scope_profile_key), event_ids in stale_by_scope.items():
+            unique_ids = list(dict.fromkeys(event_ids))
+            recovered += len(unique_ids)
+            for chunk in _iter_sql_chunks(unique_ids, fixed_params=2):
+                placeholders = ",".join("?" for _ in chunk)
+                statements.append((
+                    f"""UPDATE profile_feed_messages SET delivery_state = 'unknown'
+                        WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'
+                          AND event_id IN ({placeholders})""",
+                    [scope_guild_id, scope_profile_key, *chunk],
+                ))
+        await self._execute_batch(statements)
+        if guild_id is None and profile_key is None:
+            self._stale_pending_recovery_checked = True
+        return recovered
+
     async def get_feed_messages(self, guild_id: int, profile_key: str):
-        """Retain source aliases and Discord message IDs across polls/restarts."""
+        """Retain source aliases and Discord message IDs across polls/restarts without mutating live pending intents."""
+        await self._ensure_stale_pending_recovered()
         profile_key = profile_key.strip().lower()
-        # A pending write without a confirmed response may have crossed a process
-        # restart. Mark it uncertain so the next poll never blindly reposts it.
-        await self._execute(
-            """UPDATE profile_feed_messages SET delivery_state = 'unknown'
-               WHERE guild_id = ? AND profile_key = ? AND delivery_state = 'pending'""",
-            (guild_id, profile_key),
-        )
         return await self._fetchall(
             """SELECT event_id, payload, message_id, channel_id, delivery_state
                FROM profile_feed_messages WHERE guild_id = ? AND profile_key = ?""",
@@ -2895,11 +3046,15 @@ class Database:
                     flat_params,
                 ))
         await self._execute_batch(statements)
+        if saved_state != "pending":
+            for eid in aliases:
+                self._active_pending_deliveries.discard((guild_id, profile_key, eid))
 
     async def begin_feed_delivery(
         self, guild_id: int, profile_key: str, event_ids: Iterable[str], payload: str, channel_id: int
     ) -> bool:
         """Persist a send intent before calling Discord; return false for known or uncertain events."""
+        await self._ensure_stale_pending_recovered()
         profile_key = profile_key.strip().lower()
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
         if not aliases:
@@ -2927,6 +3082,8 @@ class Database:
                         VALUES {values_sql}""",
                     flat_params,
                 )
+            for eid in aliases:
+                self._active_pending_deliveries.add((guild_id, profile_key, eid))
             return True
 
     async def release_feed_delivery(self, guild_id: int, profile_key: str, event_ids: Iterable[str]) -> None:
@@ -2945,6 +3102,8 @@ class Database:
                 [guild_id, normalized_key, *chunk],
             ))
         await self._execute_batch(statements)
+        for eid in aliases:
+            self._active_pending_deliveries.discard((guild_id, normalized_key, eid))
 
     async def mark_feed_delivery_unknown(self, guild_id: int, profile_key: str, event_ids: Iterable[str]) -> None:
         aliases = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
@@ -2961,6 +3120,8 @@ class Database:
                 [guild_id, normalized_key, *chunk],
             ))
         await self._execute_batch(statements)
+        for eid in aliases:
+            self._active_pending_deliveries.discard((guild_id, normalized_key, eid))
 
     async def mark_feed_message_deleted(
         self, guild_id: int, profile_key: str, event_ids: Iterable[str], payload: str
@@ -2978,6 +3139,8 @@ class Database:
                 [payload, guild_id, normalized_key, *chunk],
             ))
         await self._execute_batch(statements)
+        for eid in aliases:
+            self._active_pending_deliveries.discard((guild_id, normalized_key, eid))
 
     async def record_profile_activity_observations(
         self,

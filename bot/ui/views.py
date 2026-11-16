@@ -27,14 +27,25 @@ class ExpiringView(View):
     def __init__(self, *, timeout: float = 180):
         super().__init__(timeout=timeout)
         self.message = None
+        self._retired = False
+
+    def retire(self) -> None:
+        """Stop this view cleanly and release its message handle when superseded."""
+        self._retired = True
+        self.message = None
+        self.stop()
 
     async def on_timeout(self):
+        # discord.py marks naturally timed-out views finished before this hook.
+        if self._retired:
+            return
         for item in self.children:
             if getattr(item, "url", None) is None:
                 item.disabled = True
-        if self.message:
+        message = self.message
+        if message:
             try:
-                await self.message.edit(view=self)
+                await message.edit(view=self)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 logger.debug("Ignoring expected Discord error during expired view cleanup", exc_info=True)
 
@@ -78,6 +89,9 @@ class RouletteView(ExpiringView):
                 "❌ Only the person who ran `/roulette` can spin again!",
                 ephemeral=True
             )
+            return
+
+        if self.is_finished():
             return
 
         await self.on_reroll(interaction)

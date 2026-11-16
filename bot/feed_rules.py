@@ -73,6 +73,7 @@ def merge_milestones(activities, logs):
                             platform=log.platform or event.platform,
                             is_replay=log.is_replay or event.is_replay,
                             session_labels=log.session_labels,
+                            review_notes=log.review_notes or event.review_notes,
                             event_ids=tuple(dict.fromkeys((*event.event_ids, *log.event_ids))))
             consumed.add(log.activity_id)
         merged.append(event)
@@ -126,6 +127,7 @@ def link_backdated_milestones(merged, *, baseline_or_saved_ids=(), uncertain_jou
                 platform=log.platform or act.platform,
                 is_replay=log.is_replay or act.is_replay,
                 session_labels=log.session_labels,
+                review_notes=log.review_notes or act.review_notes,
                 event_ids=tuple(dict.fromkeys((*act.event_ids, *log.event_ids))),
             )
             consumed_log_ids.add(log.activity_id)
@@ -151,7 +153,8 @@ def merge_ratings_and_reviews(merged):
             matches = [e for e in merged if e.action_type in {"playing", "completed", "replay"}
                        and e.game_slug == event.game_slug
                        and ((e.reference and e.reference == event.reference)
-                            or (e.occurred_at and e.occurred_at == event.occurred_at))]
+                            or (e.occurred_at and e.occurred_at == event.occurred_at)
+                            or event.activity_id in e.event_ids)]
             if len(matches) == 1:
                 index = merged.index(matches[0])
                 combined = replace(matches[0], review_notes=event.review_notes or matches[0].review_notes,

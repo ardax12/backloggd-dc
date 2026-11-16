@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from backloggd.models import GameEntry, GameStatus, UserLibrary
 from bot.cogs.account import AccountCog
 from bot.cogs.games import GamesCog
 from bot.cogs.social import SocialCog
@@ -332,6 +333,141 @@ class ProfileUxTests(unittest.IsolatedAsyncioTestCase):
         embed = interaction.followup.send.call_args.kwargs["embed"]
         self.assertNotIn("Recently Played", [field.name for field in embed.fields])
         db.get_user_recent_ratings.assert_not_awaited()
+
+    async def test_profile_uses_sdk_canonical_username_for_stats_and_single_subscription_lookup(self):
+        profile = SimpleNamespace(
+            username="Canonical_Name", avatar_url=None, bio=None, badges=[], favorite_games=[],
+            played_count=4, playing_count=0, backlog_count=0, wishlist_count=0,
+        )
+
+        async def stats_by_username(name: str):
+            if name == "Canonical_Name":
+                return {"total_games": 5, "rated_count": 3, "average_rating": 4.25}
+            return {"total_games": 0, "rated_count": 0, "average_rating": None}
+
+        sync_service = LibrarySyncService()
+        db = SimpleNamespace(
+            get_profile_sync_info=AsyncMock(return_value=None),
+            is_profile_library_subscribed=AsyncMock(return_value=True),
+            get_profile_stats=AsyncMock(side_effect=stats_by_username),
+            record_profile_sync_attempt=AsyncMock(),
+            replace_user_library=AsyncMock(return_value=True),
+        )
+        api = SimpleNamespace(
+            get_user_profile=AsyncMock(return_value=profile),
+            get_user_journal=AsyncMock(return_value=[]),
+            get_user_reviews=AsyncMock(return_value=[]),
+            get_user_library=AsyncMock(return_value=UserLibrary(username="Canonical_Name", games={})),
+        )
+        cog = UsersCog(SimpleNamespace(db=db, backloggd=api, library_sync=sync_service))
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            user=SimpleNamespace(id=1, display_avatar=None),
+            guild=None,
+        )
+
+        try:
+            await UsersCog.profile.callback(cog, interaction, "legacy_input")
+            await asyncio.sleep(0)
+        finally:
+            await sync_service.close()
+
+        db.get_profile_stats.assert_awaited_once_with("Canonical_Name")
+        self.assertEqual(db.is_profile_library_subscribed.await_count, 1)
+        api.get_user_library.assert_awaited_once_with("Canonical_Name", force_refresh=True)
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        view = interaction.followup.send.call_args.kwargs["view"]
+        self.assertEqual(embed.url, "https://www.backloggd.com/u/Canonical_Name/")
+        self.assertEqual(view.children[0].url, "https://www.backloggd.com/u/Canonical_Name/")
+        stats_field = next(f for f in embed.fields if "Average Rating" in f.name)
+        self.assertIn("4.25", stats_field.value)
+        self.assertIn("3", stats_field.value)
+
+    async def test_shared_profile_canonical_stats_and_relink_guards(self):
+        import tempfile
+        from pathlib import Path
+        from bot.db import Database
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / "profile_canon.db"), turso_url="")
+            await db.connect()
+            try:
+                await db.link_user(10, "  User_One.1  ")
+                await db.link_user(20, "  user_one.1  ")
+                await db.replace_user_library(
+                    10,
+                    "User_One.1",
+                    UserLibrary(
+                        username="User_One.1",
+                        games={
+                            "hades": GameEntry(slug="hades", title="Hades", rating=4.5, status=GameStatus.PLAYED),
+                        },
+                    ),
+                )
+
+                # Shared connections exclude caller safely
+                conns = await db.get_profile_connections("USER_ONE.1", [10, 20, 30], exclude_discord_id=10)
+                self.assertEqual([row["discord_id"] for row in conns], [20])
+
+                # Same-profile relink notice preserves nonexclusive link and safe escaping/URL
+                account_cog = AccountCog(SimpleNamespace(db=db, backloggd=SimpleNamespace()))
+                i_same = SimpleNamespace(
+                    response=SimpleNamespace(defer=AsyncMock()),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                    user=SimpleNamespace(id=10),
+                    guild=None,
+                )
+                await AccountCog.link.callback(account_cog, i_same, "  user_one.1 ")
+                same_msg = i_same.followup.send.call_args.args[0]
+                self.assertIn("User\\_One.1", same_msg)
+                self.assertIn("https://www.backloggd.com/u/User_One.1/", same_msg)
+
+                # Different-profile relink guard refuses overwrite without /unlink
+                i_diff = SimpleNamespace(
+                    response=SimpleNamespace(defer=AsyncMock()),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                    user=SimpleNamespace(id=10),
+                    guild=None,
+                )
+                await AccountCog.link.callback(account_cog, i_diff, "OtherUser")
+                diff_msg = i_diff.followup.send.call_args.args[0]
+                self.assertIn("/unlink", diff_msg)
+                self.assertEqual((await db.get_linked_user(10))["profile_key"], "user_one.1")
+
+                # /profile queried with lowercase spelling uses canonical SDK username & 1 sub check
+                profile = SimpleNamespace(
+                    username="User_One.1", avatar_url=None, bio=None, badges=[], favorite_games=[],
+                    played_count=1, playing_count=0, backlog_count=0, wishlist_count=0,
+                )
+                api = SimpleNamespace(
+                    get_user_profile=AsyncMock(return_value=profile),
+                    get_user_journal=AsyncMock(return_value=[]),
+                    get_user_reviews=AsyncMock(return_value=[]),
+                )
+                orig_sub = db.is_profile_library_subscribed
+                sub_calls = 0
+
+                async def counted_sub(name: str):
+                    nonlocal sub_calls
+                    sub_calls += 1
+                    return await orig_sub(name)
+
+                db.is_profile_library_subscribed = counted_sub
+                users_cog = UsersCog(SimpleNamespace(db=db, backloggd=api))
+                i_prof = SimpleNamespace(
+                    response=SimpleNamespace(defer=AsyncMock()),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                    user=SimpleNamespace(id=99, display_avatar=None),
+                    guild=None,
+                )
+                await UsersCog.profile.callback(users_cog, i_prof, "user_one.1")
+                self.assertEqual(sub_calls, 1)
+                embed = i_prof.followup.send.call_args.kwargs["embed"]
+                self.assertEqual(embed.url, "https://www.backloggd.com/u/User_One.1/")
+                self.assertIn("4.5", "\n".join(f.value for f in embed.fields))
+            finally:
+                await db.close()
 
 
 if __name__ == "__main__":

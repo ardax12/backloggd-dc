@@ -110,18 +110,24 @@ class UsersCog(commands.Cog, name="Users"):
             rated_count = None
             recent_played = journal_entries[:5] if journal_entries else []
 
-            canonical_key = profile_data.username.strip().lower()
+            canonical_username = profile_data.username.strip()
+            canonical_key = canonical_username.lower()
+            sub_checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
+            subscribed = (
+                bool(await sub_checker(canonical_key))
+                if sub_checker is not None
+                else bool(target_discord_id)
+            )
             statuses = await ensure_profiles_fresh(
                 self.bot,
-                [(canonical_key, profile_data.username)],
+                [(canonical_key, canonical_username)],
                 now=self.clock(),
                 require_subscribed=True,
+                subscribed=subscribed,
             )
             status = statuses.get(canonical_key)
-            sub_checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
-            subscribed = bool(await sub_checker(profile_data.username)) if sub_checker is not None else bool(target_discord_id)
 
-            stats = await self.bot.db.get_profile_stats(target_username)
+            stats = await self.bot.db.get_profile_stats(canonical_username)
             if stats and stats.get("rated_count", 0) > 0:
                 avg_rating = stats.get("average_rating")
                 rated_count = stats.get("rated_count")

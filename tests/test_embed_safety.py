@@ -7,6 +7,7 @@ os.environ["TURSO_DATABASE_URL"] = ""
 os.environ["TURSO_AUTH_TOKEN"] = ""
 os.environ["DEV_GUILD_ID"] = ""
 
+from datetime import datetime, timezone
 import re
 from types import SimpleNamespace
 import unittest
@@ -15,6 +16,8 @@ from unittest.mock import AsyncMock
 import discord
 
 from bot.cogs.account import AccountCog
+from bot.cogs.discovery import DiscoveryCog
+from bot.cogs.feed import FeedCog
 from bot.ui.embeds import create_game_embed, create_profile_embed
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.helpers import clean_image_url
@@ -348,6 +351,164 @@ class ImageUrlAndAccountThumbnailTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("thumbnail", refresh_payload)
                 else:
                     self.assertEqual(refresh_payload["thumbnail"]["url"], expected_thumb)
+
+
+class HealthErrorAndFreshnessClampTests(unittest.IsolatedAsyncioTestCase):
+    async def test_feed_status_renders_health_errors_as_safe_redacted_prose_outside_backticks(self):
+        now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+
+        async def run_status(raw_error: str) -> tuple[dict, str]:
+            db = SimpleNamespace(
+                get_linked_user=AsyncMock(return_value={
+                    "profile_key": "millers",
+                    "backloggd_username": "Millers",
+                }),
+                get_guild_feed_preference=AsyncMock(return_value=True),
+                get_feed_channel=AsyncMock(return_value=100),
+                get_guild_profile_member_sources=AsyncMock(return_value=[{"discord_id": 10}]),
+                has_guild_admin_follow=AsyncMock(return_value=False),
+                get_guild_profile_feed_status=AsyncMock(return_value={
+                    "channel_id": 100,
+                    "active": True,
+                    "initialized_sources": ["activity-display-v1"],
+                    "source_health": [
+                        {
+                            "source": "activity",
+                            "last_attempt_at": now,
+                            "last_success_at": now,
+                            "coverage": "partial",
+                            "unresolved_gap_since": None,
+                            "unresolved_gap_until": None,
+                            "last_error": raw_error,
+                        }
+                    ],
+                    "suppression_counts": {},
+                    "delivery_counts": {},
+                }),
+            )
+            guild = SimpleNamespace(
+                id=1,
+                name="Guild",
+                chunked=True,
+                members=[SimpleNamespace(id=10)],
+                get_channel=lambda cid: SimpleNamespace(id=cid, mention=f"<#{cid}>"),
+            )
+            bot = SimpleNamespace(db=db, get_channel=lambda cid: None)
+            cog = FeedCog(bot)
+            interaction = SimpleNamespace(
+                user=SimpleNamespace(id=10),
+                guild=guild,
+                guild_id=1,
+                response=SimpleNamespace(defer=AsyncMock()),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+            await FeedCog.feed_status.callback(cog, interaction)
+            embed = interaction.followup.send.await_args.kwargs["embed"]
+            payload = _assert_embed_payload_limits(self, embed)
+            health_field = next(f["value"] for f in payload["fields"] if "Source Health" in f["name"])
+            return payload, health_field
+
+        # 1. Backticks, mentions, forged links, multiline quote, and boundary escapes
+        malicious_error = "bad `break [link](https://evil.example) @everyone\n> quoted " + ("*" * 120)
+        _, health_val = await run_status(malicious_error)
+        self.assertNotIn("Error: `", health_val)
+        self.assertIn("Error: bad \\`break \\[link\\](https://evil.example)", health_val)
+        self.assertNotIn("@everyone", health_val)
+        self.assertNotIn("\n> quoted", health_val)
+        self.assertLessEqual(len(health_val), 1024)
+        activity_line = health_val.splitlines()[0]
+        self.assertTrue(activity_line.endswith("..."), activity_line)
+        before_dots = activity_line[:-3]
+        trailing = len(before_dots) - len(before_dots.rstrip("\\"))
+        self.assertEqual(trailing % 2, 0, activity_line)
+
+        # 2. Internal secrets / tokens / URL credentials must not leak raw
+        secret_error = (
+            "HTTP 401 auth_token=tok_secret_123 Bearer jwt_secret_456 "
+            "https://admin:pw_secret_789@db.internal/v1/execute"
+        )
+        _, secret_health = await run_status(secret_error)
+        self.assertNotIn("tok_secret_123", secret_health)
+        self.assertNotIn("jwt_secret_456", secret_health)
+        self.assertNotIn("pw_secret_789", secret_health)
+
+        # 3. Ordinary error renders cleanly as readable prose without backtick delimiters
+        _, plain_health = await run_status("upstream 503 service unavailable")
+        self.assertIn("Error: upstream 503 service unavailable", plain_health)
+        self.assertNotIn("`upstream 503", plain_health)
+
+    async def test_feed_list_pages_clamp_escaped_descriptions_at_escape_boundaries(self):
+        bot = SimpleNamespace(db=SimpleNamespace())
+        cog = FeedCog(bot)
+        tricky_name = ("*" * 110) + "_"
+        candidates = [
+            {
+                "display_username": tricky_name,
+                "sources": "member + admin follow",
+                "feed_state": "Paused (" + ("*" * 80) + ")",
+            }
+            for _ in range(20)
+        ]
+        pages = cog._feed_list_pages(candidates, 100)
+        self.assertEqual(len(pages), 1)
+        payload = _assert_embed_payload_limits(self, pages[0])
+        desc = payload["description"]
+        self.assertLessEqual(len(desc), 4000)
+        self.assertTrue(desc.endswith("..."), desc)
+        before_dots = desc[:-3]
+        trailing = len(before_dots) - len(before_dots.rstrip("\\"))
+        self.assertEqual(trailing % 2, 0, desc)
+
+    async def test_recommend_clamps_long_escaped_freshness_without_splitting_escapes_or_escaping_plain_slots(self):
+        now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+        caller_name = ("_" * 520) + "Caller [x](https://evil.example)"
+        friend_name = ("*" * 520) + "Friend @everyone"
+
+        db = SimpleNamespace(
+            get_linked_user=AsyncMock(side_effect=[
+                {"backloggd_username": caller_name, "profile_key": "caller_k"},
+                {"backloggd_username": friend_name, "profile_key": "friend_k"},
+            ]),
+            get_profile_sync_info=AsyncMock(return_value={
+                "last_synced_at": datetime(2026, 11, 15, 0, 0, tzinfo=timezone.utc),
+                "game_count": 5,
+                "last_error": "upstream timeout",
+            }),
+            get_profile_ratings_dict=AsyncMock(side_effect=[
+                {"hades": 5.0},
+                {},
+            ]),
+            get_profile_library_entries=AsyncMock(return_value={}),
+            get_games_by_slugs=AsyncMock(return_value={"hades": {"title": "Hades_II [Beta]"}}),
+        )
+        cog = DiscoveryCog(SimpleNamespace(db=db, backloggd=SimpleNamespace()), clock=lambda: now)
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10, display_name="Caller"),
+            guild=SimpleNamespace(id=1, name="Guild", members=[SimpleNamespace(id=10), SimpleNamespace(id=20)]),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        friend = SimpleNamespace(id=20, display_name="FriendDisplay")
+
+        await DiscoveryCog.recommend.callback(cog, interaction, user=friend)
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        payload = _assert_embed_payload_limits(self, embed)
+
+        # Plain text slots remain unescaped
+        self.assertTrue(payload["title"].startswith("💡 Recommendations for " + ("*" * 50)))
+        self.assertNotIn("\\*", payload["title"])
+        self.assertEqual(payload["fields"][0]["name"], "🎮 Hades_II [Beta]")
+        self.assertTrue(payload["footer"]["text"].startswith("Recommended by " + ("_" * 50)))
+        self.assertNotIn("\\_", payload["footer"]["text"])
+
+        # Escaped freshness field is clamped cleanly at backslash boundaries
+        freshness_val = next(f["value"] for f in payload["fields"] if "Freshness" in f["name"])
+        self.assertLessEqual(len(freshness_val), 1024)
+        self.assertNotIn("@everyone", freshness_val)
+        self.assertTrue(freshness_val.endswith("..."), freshness_val)
+        before_dots = freshness_val[:-3]
+        trailing = len(before_dots) - len(before_dots.rstrip("\\"))
+        self.assertEqual(trailing % 2, 0, freshness_val)
 
 
 if __name__ == "__main__":

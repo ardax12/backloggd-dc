@@ -13,12 +13,12 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import discord
 
 from bot.cogs.social import SocialCog
-from bot.db import Database
+from bot.db import Database, _MAX_SQL_BIND_PARAMS
 from tests.test_interaction_visibility_protocol import (
     StatefulDiscordInteraction,
     _FakeHTTPResp,
@@ -179,6 +179,169 @@ class DuelCallbackBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 await callback(btn_inter)
         self.assertEqual(btn_inter.visible_ephemeral_messages(), [])
         self.assertEqual(btn_inter.public_text_history, [])
+
+    async def test_duel_callback_resolves_all_shared_titles_with_single_pass_escaping_and_blank_fallback(self):
+        lib_a = [
+            SimpleNamespace(slug="top-fav", title="Top Fav: Special", status="played", rating=5.0, cover_url=None, release_year=2020),
+            SimpleNamespace(slug="top-disagree", title="Top Disagree", status="played", rating=5.0, cover_url=None, release_year=2020),
+            SimpleNamespace(slug="final-fantasy-vii-rebirth", title="FINAL FANTASY VII REBIRTH", status="played", rating=4.9, cover_url=None, release_year=2024),
+            SimpleNamespace(slug="persona-5-royal", title="Persona_5 *Royal* [Edition](https://evil.example) @everyone", status="played", rating=5.0, cover_url=None, release_year=2020),
+            SimpleNamespace(slug="blank-title", title="   ", status="played", rating=4.5, cover_url=None, release_year=2021),
+            SimpleNamespace(slug="uncached-slug", title="Uncached Slug", status="played", rating=4.3, cover_url=None, release_year=2022),
+        ]
+        lib_b = [
+            SimpleNamespace(slug="top-fav", title="Top Fav: Special", status="played", rating=5.0, cover_url=None, release_year=2020),
+            SimpleNamespace(slug="top-disagree", title="Top Disagree", status="played", rating=1.0, cover_url=None, release_year=2020),
+            SimpleNamespace(slug="final-fantasy-vii-rebirth", title="FINAL FANTASY VII REBIRTH", status="played", rating=4.8, cover_url=None, release_year=2024),
+            SimpleNamespace(slug="persona-5-royal", title="Persona_5 *Royal* [Edition](https://evil.example) @everyone", status="played", rating=4.0, cover_url=None, release_year=2020),
+            SimpleNamespace(slug="blank-title", title="   ", status="played", rating=4.4, cover_url=None, release_year=2021),
+            SimpleNamespace(slug="uncached-slug", title="Uncached Slug", status="played", rating=4.2, cover_url=None, release_year=2022),
+        ]
+        await self.db.replace_user_library(10, "Alpha", lib_a)
+        await self.db.replace_user_library(20, "Beta", lib_b)
+        await self.db._execute("UPDATE cached_games SET title = '   ' WHERE slug = 'blank-title'")
+
+        self.bot.backloggd = SimpleNamespace(
+            get_game=AsyncMock(side_effect=AssertionError("duel callback must never fetch live game metadata"))
+        )
+
+        orig_get_games_by_slugs = self.db.get_games_by_slugs
+        lookup_calls = []
+
+        async def spy_get_games_by_slugs(slugs):
+            lookup_calls.append(set(slugs))
+            result = await orig_get_games_by_slugs(slugs)
+            result.pop("uncached-slug", None)
+            return result
+
+        self.db.get_games_by_slugs = spy_get_games_by_slugs
+        try:
+            callback = await self._render_duel_callback()
+            self.assertEqual(len(lookup_calls), 1)
+            self.assertEqual(lookup_calls[0], {"top-fav", "top-disagree"})
+
+            btn_inter = self._button_interaction(guild=self.guild, user_id=10, display_name="Alpha")
+            await callback(btn_inter)
+        finally:
+            self.db.get_games_by_slugs = orig_get_games_by_slugs
+
+        self.assertEqual(len(lookup_calls), 2)
+        self.assertEqual(
+            lookup_calls[1],
+            {"final-fantasy-vii-rebirth", "persona-5-royal", "blank-title", "uncached-slug"},
+        )
+        self.bot.backloggd.get_game.assert_not_awaited()
+
+        pub = btn_inter.visible_public_messages()
+        self.assertEqual(len(pub), 1)
+        payload = pub[0]["embed"].to_dict()
+        shared_field = payload["fields"][0]["value"]
+        disagree_field = payload["fields"][1]["value"]
+
+        self.assertIn("Top Fav: Special", shared_field)
+        self.assertIn("FINAL FANTASY VII REBIRTH", shared_field)
+        self.assertNotIn("Final Fantasy Vii Rebirth", shared_field)
+        self.assertIn("Blank Title", shared_field)
+        self.assertIn("Uncached Slug", shared_field)
+        self.assertIn("Persona\\_5 \\*Royal\\* \\[Edition\\](https://evil.example)", shared_field)
+        self.assertIn("Persona\\_5 \\*Royal\\* \\[Edition\\](https://evil.example)", disagree_field)
+        self.assertNotIn("\\\\_", shared_field)
+        self.assertNotIn("@everyone", shared_field)
+        self.assertNotIn("@everyone", disagree_field)
+
+    async def test_duel_callback_bounds_metadata_lookup_above_800_shared_slugs(self):
+        lib_a = [
+            SimpleNamespace(
+                slug=f"slug-{i:04d}",
+                title=f"Title {i}",
+                status="played",
+                rating=5.0 if i in (0, 2) else (4.5 if i == 3 else 3.0),
+                cover_url=None,
+                release_year=2020,
+            )
+            for i in range(850)
+        ]
+        lib_b = [
+            SimpleNamespace(
+                slug=f"slug-{i:04d}",
+                title=f"Title {i}",
+                status="played",
+                rating=5.0 if i == 0 else (1.0 if i == 2 else (4.5 if i == 3 else 3.0)),
+                cover_url=None,
+                release_year=2020,
+            )
+            for i in range(850)
+        ]
+        await self.db.replace_user_library(10, "Alpha", lib_a)
+        await self.db.replace_user_library(20, "Beta", lib_b)
+        await self.db._execute(
+            "UPDATE cached_games SET title = ? WHERE slug = ?",
+            ("NieR:Automata — Game of the YoRHa", "slug-0003"),
+        )
+
+        callback = await self._render_duel_callback()
+
+        fetchall_param_counts = []
+        orig_fetchall = self.db._fetchall
+
+        async def track_fetchall(query, params=()):
+            if "cached_games" in query:
+                fetchall_param_counts.append(len(params))
+            return await orig_fetchall(query, params)
+
+        self.db._fetchall = track_fetchall
+        try:
+            btn_inter = self._button_interaction(guild=self.guild, user_id=10, display_name="Alpha")
+            await callback(btn_inter)
+        finally:
+            self.db._fetchall = orig_fetchall
+
+        self.assertEqual(len(fetchall_param_counts), 2)
+        self.assertTrue(all(count <= _MAX_SQL_BIND_PARAMS for count in fetchall_param_counts))
+        shared_field = btn_inter.visible_public_messages()[0]["embed"].fields[0].value
+        self.assertIn("NieR:Automata — Game of the YoRHa", shared_field)
+
+    async def test_duel_callback_db_metadata_failure_and_cancellation_preserve_parent_post(self):
+        # Add an extra shared slug so on_compare must query get_games_by_slugs.
+        lib_a = [
+            SimpleNamespace(slug=f"g{i}", title=f"Game {i}", status="played", rating=5.0 - (i * 0.1), cover_url=None, release_year=2020)
+            for i in range(5)
+        ]
+        lib_b = [
+            SimpleNamespace(slug=f"g{i}", title=f"Game {i}", status="played", rating=4.5, cover_url=None, release_year=2020)
+            for i in range(5)
+        ]
+        await self.db.replace_user_library(10, "Alpha", lib_a)
+        await self.db.replace_user_library(20, "Beta", lib_b)
+
+        callback = await self._render_duel_callback()
+
+        with patch.object(
+            self.db,
+            "get_games_by_slugs",
+            side_effect=RuntimeError("SELECT * FROM cached_games WHERE auth_token='secret_db_tok'"),
+        ):
+            btn_err = self._button_interaction(guild=self.guild, user_id=10, display_name="Alpha")
+            with self.assertLogs("backloggd.cogs.social", level="ERROR") as logs:
+                await callback(btn_err)
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(btn_err.visible_public_messages(), [])
+        ephem = btn_err.visible_ephemeral_messages()
+        self.assertEqual(len(ephem), 1)
+        self.assertNotIn("secret_db_tok", ephem[0]["content"])
+        self.assertEqual(btn_err.message.edits, [])
+        self.assertFalse(self.parent_message.get("deleted", False))
+
+        with patch.object(self.db, "get_games_by_slugs", side_effect=asyncio.CancelledError()):
+            btn_cancel = self._button_interaction(guild=self.guild, user_id=10, display_name="Alpha")
+            with self.assertRaises(asyncio.CancelledError):
+                await callback(btn_cancel)
+
+        self.assertEqual(btn_cancel.visible_public_messages(), [])
+        self.assertEqual(btn_cancel.visible_ephemeral_messages(), [])
+        self.assertEqual(btn_cancel.message.edits, [])
+        self.assertFalse(self.parent_message.get("deleted", False))
 
 
 if __name__ == "__main__":

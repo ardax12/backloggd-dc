@@ -21,7 +21,7 @@ from bot.services.library_sync import (
     sync_profile_library,
 )
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
-from bot.ui.helpers import build_backloggd_user_url, clean_image_url
+from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, clean_image_url
 
 logger = logging.getLogger("backloggd.cogs.account")
 
@@ -228,7 +228,7 @@ class AccountCog(commands.Cog, name="Account"):
         existing_link = await self.bot.db.get_linked_user(interaction.user.id)
         if existing_link:
             linked_name = existing_link["backloggd_username"]
-            if linked_name.lower() == clean_user.lower():
+            if linked_name.strip().lower() == clean_user.lower():
                 message = await self._build_same_profile_link_notice(interaction, linked_name)
                 await send_private_followup(interaction, message, log=logger)
             else:
@@ -280,7 +280,7 @@ class AccountCog(commands.Cog, name="Account"):
                     "ℹ️ Your account connection changed while verifying this profile. "
                     "Please run `/link` again."
                 )
-            elif current_link["backloggd_username"].lower() == profile.username.strip().lower():
+            elif current_link["backloggd_username"].strip().lower() == profile.username.strip().lower():
                 conflict_message = await self._build_same_profile_link_notice(
                     interaction, current_link["backloggd_username"]
                 )
@@ -334,9 +334,7 @@ class AccountCog(commands.Cog, name="Account"):
             if len(duplicate_names) > len(shown_names):
                 shown_names.append(f"and {len(duplicate_names) - len(shown_names)} more")
             max_names_len = 1024 - len(disclaimer)
-            names_text = ", ".join(shown_names)
-            if len(names_text) > max_names_len:
-                names_text = names_text[: max(0, max_names_len - 3)].rstrip(", \\") + "..."
+            names_text = clamp_escaped_text(", ".join(shown_names), max_names_len)
             embed.add_field(
                 name="Also linked in this server",
                 value=names_text + disclaimer,
@@ -399,7 +397,7 @@ class AccountCog(commands.Cog, name="Account"):
         already_running = self.library_sync.is_refreshing(profile_key)
         embed = discord.Embed(
             title="🔄 Refresh In Progress..." if already_running else "🔄 Library Refresh Queued",
-            description=(
+            description=clamp_escaped_text(
                 (
                     f"A refresh for **[{safe_username}]({user_url})** is already running; "
                     "this message will update when it finishes."
@@ -408,8 +406,9 @@ class AccountCog(commands.Cog, name="Account"):
                 else (
                     f"Queued a library refresh for **[{safe_username}]({user_url})** in the background. "
                     "This message will update when it finishes."
-                )
-            )[:4096],
+                ),
+                4096,
+            ),
             color=COLOR_PRIMARY,
         )
         clean_avatar = clean_image_url(linked["avatar_url"])

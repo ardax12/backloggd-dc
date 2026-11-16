@@ -1,5 +1,6 @@
 """GamesCog: Handles /game with live Discord autocomplete and server score shelf."""
 
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ from typing import List, Optional
 from uuid import uuid4
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
 from bot.ui.views import LinkButtonView, GameCardView, RatingsView
-from bot.ui.helpers import build_backloggd_game_url
+from bot.ui.helpers import build_backloggd_game_url, clamp_escaped_text
 from bot.input_validation import escape_display_text
 from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
@@ -32,6 +33,7 @@ _MAX_INLINE_SLUG_LEN = _DISCORD_CHOICE_LIMIT - len(_SLUG_TAG_PREFIX)
 _MAX_AUTOCOMPLETE_CACHE = 500
 _MAX_FALLBACK_SLUGS = 500
 _FALLBACK_TTL_SECONDS = 1800.0
+_DEFAULT_AUTOCOMPLETE_TIMEOUT_SECONDS = 2.0
 _MAX_DISPLAY_EXCERPT_LEN = 120
 
 
@@ -51,11 +53,22 @@ class _FallbackEntry:
 
 
 class GamesCog(commands.Cog, name="Games"):
-    def __init__(self, bot, *, clock=None, monotonic_clock=None, fallback_ttl_seconds: float = _FALLBACK_TTL_SECONDS):
+    def __init__(
+        self,
+        bot,
+        *,
+        clock=None,
+        monotonic_clock=None,
+        fallback_ttl_seconds: float = _FALLBACK_TTL_SECONDS,
+        autocomplete_timeout_seconds: float = _DEFAULT_AUTOCOMPLETE_TIMEOUT_SECONDS,
+    ):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic_clock or time.monotonic
         self._fallback_ttl_seconds = float(fallback_ttl_seconds)
+        self._autocomplete_timeout_seconds = float(autocomplete_timeout_seconds)
+        if self._autocomplete_timeout_seconds <= 0:
+            raise ValueError("autocomplete_timeout_seconds must be positive")
         # Bounded caches kept independent so query-cache pruning never wipes fallback tokens.
         self._autocomplete_cache: OrderedDict[str, List[app_commands.Choice[str]]] = OrderedDict()
         self._fallback_entries: OrderedDict[str, _FallbackEntry] = OrderedDict()
@@ -104,7 +117,10 @@ class GamesCog(commands.Cog, name="Games"):
             self._autocomplete_cache.pop(cache_key)
 
         try:
-            results = await self.bot.backloggd.search_games(clean_query)
+            results = await asyncio.wait_for(
+                self.bot.backloggd.search_games(clean_query),
+                timeout=self._autocomplete_timeout_seconds,
+            )
             choices = []
             for g in results[:15]:  # Discord limit is 25, 15 keeps it fast
                 name = f"{g.title} ({g.release_year})" if g.release_year else g.title
@@ -123,6 +139,15 @@ class GamesCog(commands.Cog, name="Games"):
                     self._autocomplete_cache.pop(next(iter(self._autocomplete_cache)))
             self._autocomplete_cache[cache_key] = choices
             return choices
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Autocomplete search timed out after %.2fs for '%s'",
+                self._autocomplete_timeout_seconds,
+                clean_query,
+            )
+            return []
         except Exception as e:
             logger.warning("Autocomplete search error for '%s': %s", clean_query, e)
             return []
@@ -156,10 +181,13 @@ class GamesCog(commands.Cog, name="Games"):
                     hint = f' for "{_format_display_excerpt(expired[query])}"' if query in expired else ""
                     await send_private_followup(
                         interaction,
-                        (
-                            f"⏳ That autocomplete selection{hint} has expired. "
-                            "Please type the game title again and re-select it from the autocomplete list."
-                        )[:2000],
+                        clamp_escaped_text(
+                            (
+                                f"⏳ That autocomplete selection{hint} has expired. "
+                                "Please type the game title again and re-select it from the autocomplete list."
+                            ),
+                            2000,
+                        ),
                         log=logger,
                     )
                     return
@@ -169,7 +197,10 @@ class GamesCog(commands.Cog, name="Games"):
                     safe_query = _format_display_excerpt(query)
                     await send_private_followup(
                         interaction,
-                        f"❌ No games found matching **{safe_query}** on Backloggd."[:2000],
+                        clamp_escaped_text(
+                            f"❌ No games found matching **{safe_query}** on Backloggd.",
+                            2000,
+                        ),
                         log=logger,
                     )
                     return
@@ -188,10 +219,10 @@ class GamesCog(commands.Cog, name="Games"):
                     prefix = f"I found several games matching **{safe_query}**: "
                     max_opts_len = 2000 - len(prefix) - len(suffix)
                     if len(options) > max_opts_len:
-                        options = options[: max(0, max_opts_len - 3)].rstrip("; \\") + "..."
+                        options = clamp_escaped_text(options, max(3, max_opts_len))
                     await send_private_followup(
                         interaction,
-                        f"{prefix}{options}{suffix}",
+                        clamp_escaped_text(f"{prefix}{options}{suffix}", 2000),
                         log=logger,
                     )
                     return
@@ -202,7 +233,10 @@ class GamesCog(commands.Cog, name="Games"):
                 safe_slug = _format_display_excerpt(slug)
                 await send_private_followup(
                     interaction,
-                    f"❌ Could not retrieve details for game: **{safe_slug}**."[:2000],
+                    clamp_escaped_text(
+                        f"❌ Could not retrieve details for game: **{safe_slug}**.",
+                        2000,
+                    ),
                     log=logger,
                 )
                 return
@@ -265,7 +299,10 @@ class GamesCog(commands.Cog, name="Games"):
             safe_title = _format_display_excerpt(query or title)
             await send_private_followup(
                 interaction,
-                f"❌ An error occurred while fetching information for **{safe_title}**."[:2000],
+                clamp_escaped_text(
+                    f"❌ An error occurred while fetching information for **{safe_title}**.",
+                    2000,
+                ),
                 log=logger,
             )
 

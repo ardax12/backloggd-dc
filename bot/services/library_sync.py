@@ -492,15 +492,20 @@ async def schedule_profile_refresh(
     freshness_window_seconds: Optional[float] = None,
     now=None,
     require_subscribed: bool = True,
+    subscribed: Optional[bool] = None,
 ) -> Optional[asyncio.Task]:
     """Coalesce a background full-library refresh through the shared LibrarySyncService."""
     service: Optional[LibrarySyncService] = getattr(bot, "library_sync", None)
     if service is None:
         return None
     profile_key = username.strip().lower()
-    if require_subscribed and hasattr(bot.db, "is_profile_library_subscribed"):
-        if not await bot.db.is_profile_library_subscribed(profile_key):
-            return None
+    if require_subscribed:
+        if subscribed is not None:
+            if not subscribed:
+                return None
+        elif hasattr(bot.db, "is_profile_library_subscribed"):
+            if not await bot.db.is_profile_library_subscribed(profile_key):
+                return None
     await seed_profile_sync_state(bot, username, service=service, now=now)
     return service.request(
         profile_key,

@@ -153,6 +153,7 @@ async def ensure_profiles_fresh(
     now: Optional[datetime] = None,
     freshness_window_seconds: float = FRESHNESS_WINDOW_SECONDS,
     require_subscribed: bool = True,
+    subscribed: Optional[bool] = None,
 ) -> dict[str, ProfileFreshness]:
     """Deduplicate profiles, schedule background refreshes when stale/absent, and return freshness state."""
     current_now = _ensure_utc(now)
@@ -197,6 +198,7 @@ async def ensure_profiles_fresh(
                 freshness_window_seconds=freshness_window_seconds,
                 now=current_now,
                 require_subscribed=require_subscribed,
+                subscribed=subscribed,
             )
             status = evaluate_profile_freshness(
                 info,

@@ -338,6 +338,97 @@ class StatusAwareRecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unknown status", msg_server.lower())
         self.assertNotIn("already", msg_server.lower())
 
+    async def test_friend_recommend_without_qualifying_ratings_reports_caller_not_excluded(self):
+        from datetime import datetime, timezone
+        from backloggd import GameEntry, GameStatus
+
+        now = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+        await self.db.link_user(10, "Alice_One")
+        await self.db.link_user(20, "Bob *Twin*")
+
+        bob_items = [
+            GameEntry(slug="shared-low", title="Shared Low", rating=None, status=GameStatus.UNKNOWN),
+            GameEntry(slug="other", title="Other", rating=4.5, status=GameStatus.PLAYED),
+        ]
+        await self.db.replace_profile_library("Bob *Twin*", bob_items, synced_at=now)
+        members = [
+            SimpleNamespace(id=10, display_name="Alice_One"),
+            SimpleNamespace(id=20, display_name="Bob *Twin*"),
+            SimpleNamespace(id=30, display_name="Unlinked [Friend](https://evil.example)"),
+        ]
+        cog = DiscoveryCog(SimpleNamespace(db=self.db), clock=lambda: now)
+
+        # Case 1: Caller has only unrated backlog/wishlist entries (no numeric ratings at all)
+        await self.db.replace_profile_library(
+            "Alice_One",
+            [GameEntry(slug="wish-only", title="Wish Only", rating=None, status=GameStatus.WISHLIST)],
+            synced_at=now,
+        )
+        for target_member in (members[1], members[2]):  # linked friend and unlinked friend
+            inter = SimpleNamespace(
+                user=SimpleNamespace(id=10, display_name="Alice_One"),
+                guild=SimpleNamespace(name="Server", members=members),
+                response=SimpleNamespace(defer=AsyncMock()),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+            await DiscoveryCog.recommend.callback(cog, inter, user=target_member)
+            msg = inter.followup.send.await_args.args[0]
+            self.assertIn("do not have any games rated 4.0 or above", msg)
+            self.assertNotIn("already played", msg.lower())
+            self.assertNotIn("unknown status", msg.lower())
+
+        # Case 2: Caller has ratings all strictly below 4.0 (including a slug unknown in friend's library)
+        await self.db.replace_profile_library(
+            "Alice_One",
+            [
+                GameEntry(slug="shared-low", title="Shared Low", rating=3.5, status=GameStatus.PLAYED),
+                GameEntry(slug="meh", title="Meh", rating=2.0, status=GameStatus.PLAYED),
+            ],
+            synced_at=now,
+        )
+        for target_member in (members[1], members[2]):
+            inter = SimpleNamespace(
+                user=SimpleNamespace(id=10, display_name="Alice_One"),
+                guild=SimpleNamespace(name="Server", members=members),
+                response=SimpleNamespace(defer=AsyncMock()),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+            await DiscoveryCog.recommend.callback(cog, inter, user=target_member)
+            msg = inter.followup.send.await_args.args[0]
+            self.assertIn("do not have any games rated 4.0 or above", msg)
+            self.assertNotIn("already played", msg.lower())
+            self.assertNotIn("unknown status", msg.lower())
+
+        # Case 3: Caller has 4.0+ games, all excluded (played/rated) by linked friend -> escapes friend name
+        await self.db.replace_profile_library(
+            "Alice_One",
+            [GameEntry(slug="other", title="Other", rating=4.5, status=GameStatus.PLAYED)],
+            synced_at=now,
+        )
+        inter_excl = SimpleNamespace(
+            user=SimpleNamespace(id=10, display_name="Alice_One"),
+            guild=SimpleNamespace(name="Server", members=members),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await DiscoveryCog.recommend.callback(cog, inter_excl, user=members[1])
+        msg_excl = inter_excl.followup.send.await_args.args[0]
+        self.assertIn("already played, started, or rated all of your 4.0+ rated games", msg_excl)
+        self.assertIn("Bob \\*Twin\\*", msg_excl)
+
+        # Case 4: Same 4.0+ caller library against unlinked friend -> public embed with escaped names
+        inter_unlinked = SimpleNamespace(
+            user=SimpleNamespace(id=10, display_name="Alice_One"),
+            guild=SimpleNamespace(name="Server", members=members),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await DiscoveryCog.recommend.callback(cog, inter_unlinked, user=members[2])
+        embed = inter_unlinked.followup.send.await_args.kwargs["embed"]
+        self.assertIn("Other", embed.fields[0].name)
+        self.assertIn("Alice\\_One", embed.description)
+        self.assertIn("Unlinked \\[Friend\\](https://evil.example)", embed.description)
+
 
 if __name__ == "__main__":
     unittest.main()

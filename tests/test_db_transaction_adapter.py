@@ -381,6 +381,26 @@ class DbTransactionAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(admin_res["deactivated"])
                 self.assertFalse(await db.has_feed_source(1, "soloadmin", "activity-display-v1"))
 
+    async def test_link_user_strips_whitespace_and_preserves_overwrite_on_both_backends(self):
+        for label, db in (("sqlite", self.db), ("turso", self.turso_db)):
+            with self.subTest(backend=label):
+                self.assertTrue(await db.link_user(42, "  Millers  "))
+                linked = await db.get_linked_user(42)
+                self.assertIsNotNone(linked)
+                self.assertEqual(linked["profile_key"], "millers")
+                self.assertEqual(linked["backloggd_username"], "Millers")
+                profile = await db.get_profile("millers")
+                self.assertEqual(profile["display_username"], "Millers")
+
+                # Existing link overwrite contract remains intact for link_user
+                self.assertTrue(await db.link_user(42, "  Other_Name  "))
+                relinked = await db.get_linked_user(42)
+                self.assertEqual(relinked["profile_key"], "other_name")
+                self.assertEqual(relinked["backloggd_username"], "Other_Name")
+                self.assertFalse(await db.link_user_if_unlinked(42, "Blocked_Name"))
+                still_linked = await db.get_linked_user(42)
+                self.assertEqual(still_linked["backloggd_username"], "Other_Name")
+
 
 if __name__ == "__main__":
     unittest.main()
