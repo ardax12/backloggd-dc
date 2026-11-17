@@ -24,6 +24,104 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self.directory.cleanup()
 
+    async def test_initial_limited_coverage_keeps_extent_unknown_instead_of_using_event_dates(self):
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+        entries = [
+            replace(completion_event(), activity_id="old", occurred_at="2026-11-13T08:00:00Z"),
+            replace(completion_event(), activity_id="future", occurred_at="2026-11-17T08:00:00Z"),
+            replace(completion_event(), activity_id="malformed", occurred_at="not-a-date"),
+        ]
+        api = SimpleNamespace(
+            get_user_activity_snapshot=AsyncMock(return_value=SimpleNamespace(
+                entries=entries, coverage="limited", pages_read=1,
+            )),
+            get_user_journal=AsyncMock(return_value=[]),
+        )
+
+        await FeedCog(
+            SimpleNamespace(db=self.db, backloggd=api), clock=lambda: now,
+        )._fetch_feed_sources("Millers")
+
+        health = await self.db.get_profile_feed_source("millers", "activity")
+        self.assertIsNone(health["unresolved_gap_since"])
+        self.assertIsNone(health["unresolved_gap_until"])
+        self.assertEqual(health["gap_reason"], "limited")
+
+    async def test_failure_after_known_boundary_records_an_open_continuity_gap(self):
+        await self.db.record_feed_source_success(
+            "millers", "activity", coverage="exhausted", pages_read=2,
+            boundary_event_id="known-boundary",
+        )
+        before = await self.db.get_profile_feed_source("millers", "activity")
+
+        await self.db.record_feed_source_failure("millers", "activity", "blocked")
+
+        after = await self.db.get_profile_feed_source("millers", "activity")
+        self.assertEqual(
+            after["unresolved_gap_since"], before["last_continuous_boundary_at"],
+        )
+        self.assertIsNone(after["unresolved_gap_until"])
+        self.assertEqual(after["gap_reason"], "source_failure")
+
+    async def test_failure_gap_state_matches_sqlite_and_libturso(self):
+        from datetime import datetime, timezone
+        from tests.test_feed_batch_writes import CountingTursoClient
+
+        t0 = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 11, 11, 9, 0, tzinfo=timezone.utc)
+        turso_path = Path(self.directory.name) / "turso-failure-health.db"
+        seed = Database(str(turso_path), turso_url="")
+        await seed.connect()
+        await seed.close()
+        turso_db = Database(str(turso_path), turso_url="https://failure-health.turso.io")
+        turso_db._client = CountingTursoClient(str(turso_path))
+        try:
+            for label, db in (("sqlite", self.db), ("turso", turso_db)):
+                key = f"failure-{label}"
+                await db.record_feed_source_success(
+                    key, "activity", coverage="exhausted", pages_read=2,
+                    boundary_event_id="known", now=t0,
+                )
+                await db.record_feed_source_attempt(key, "activity", now=t1)
+                await db.record_feed_source_failure(key, "activity", "blocked")
+                health = await db.get_profile_feed_source(key, "activity")
+                self.assertEqual(health["last_continuous_boundary_at"], "2026-11-10 08:00:00")
+                self.assertEqual(health["unresolved_gap_since"], "2026-11-10 08:00:00")
+                self.assertIsNone(health["unresolved_gap_until"])
+                self.assertEqual(health["gap_reason"], "source_failure")
+                self.assertEqual(health["last_attempt_at"], "2026-11-11 09:00:00")
+                self.assertEqual(health["last_error"], "blocked")
+        finally:
+            await turso_db.close()
+
+    async def test_feed_source_health_uses_one_injected_utc_clock(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 11, 16, 15, 30, tzinfo=timezone(timedelta(hours=3)))
+        clock_calls = []
+
+        def clock():
+            clock_calls.append(now)
+            return now
+
+        api = SimpleNamespace(
+            get_user_activity_snapshot=AsyncMock(return_value=SimpleNamespace(
+                entries=[], coverage="exhausted", pages_read=1,
+            )),
+            get_user_journal=AsyncMock(return_value=[]),
+        )
+        feed = FeedCog(SimpleNamespace(db=self.db, backloggd=api), clock=clock)
+
+        await feed._fetch_feed_sources("Millers")
+        self.assertEqual(clock_calls, [now])
+
+        for source in ("activity", "journal"):
+            health = await self.db.get_profile_feed_source("millers", source)
+            self.assertEqual(health["last_attempt_at"], "2026-11-16 12:30:00")
+            self.assertEqual(health["last_success_at"], "2026-11-16 12:30:00")
+
     async def test_unsupported_latest_page_is_useful_but_keeps_an_unknown_gap(self):
         api = SimpleNamespace(
             get_user_activity=AsyncMock(return_value=[completion_event()]),
@@ -39,7 +137,9 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["pages_read"], 1)
         self.assertIsNotNone(health["last_attempt_at"])
         self.assertIsNotNone(health["last_success_at"])
-        self.assertIsNotNone(health["unresolved_gap_since"])
+        self.assertIsNone(health["unresolved_gap_since"])
+        self.assertIsNone(health["unresolved_gap_until"])
+        self.assertEqual(health["gap_reason"], "unsupported")
         self.assertIsNone(health["last_continuous_boundary_event_id"])
 
     async def test_public_snapshot_api_receives_only_the_last_continuous_boundary(self):
@@ -68,18 +168,20 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(health["unresolved_gap_since"])
 
     async def test_unsupported_fetches_do_not_clear_gap_until_a_boundary_is_reached(self):
+        from datetime import datetime, timezone
+        boundary_time = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
         await self.db.record_feed_source_attempt("millers", "activity")
         await self.db.record_feed_source_success(
             "millers", "activity", coverage="exhausted", pages_read=3,
-            boundary_event_id="boundary-1",
+            boundary_event_id="boundary-1", now=boundary_time,
         )
         await self.db.record_feed_source_attempt("millers", "activity")
         await self.db.record_feed_source_success(
             "millers", "activity", coverage="unsupported", pages_read=1,
         )
         unresolved = await self.db.get_profile_feed_source("millers", "activity")
-        gap_started = unresolved["unresolved_gap_since"]
-        self.assertIsNotNone(gap_started)
+        self.assertEqual(unresolved["unresolved_gap_since"], "2026-11-10 08:00:00")
+        self.assertIsNone(unresolved["unresolved_gap_until"])
         self.assertEqual(unresolved["last_continuous_boundary_event_id"], "boundary-1")
 
         await self.db.record_feed_source_attempt("millers", "activity")
@@ -126,28 +228,29 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["successes"], 0)
         self.assertIn("unknown activity coverage", health["last_error"])
 
-    async def test_limited_outage_recovery_records_gap_until_and_closes_on_boundary(self):
+    async def test_limited_outage_recovery_keeps_open_gap_until_boundary_commit(self):
         from datetime import datetime, timezone
+        boundary_time = datetime(2026, 11, 10, 9, 30, tzinfo=timezone.utc)
         await self.db.record_feed_source_attempt("millers", "activity")
         await self.db.record_feed_source_success(
             "millers", "activity", coverage="exhausted", pages_read=2,
-            boundary_event_id="b-1",
+            boundary_event_id="b-1", now=boundary_time,
         )
         gap_until = datetime(2026, 11, 12, 9, 30, tzinfo=timezone.utc)
         await self.db.record_feed_source_attempt("millers", "activity")
         await self.db.record_feed_source_success(
             "millers", "activity", coverage="limited", pages_read=5,
-            gap_until=gap_until,
+            gap_until=gap_until, now=datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc),
         )
         health = await self.db.get_profile_feed_source("millers", "activity")
-        self.assertIsNotNone(health["unresolved_gap_since"])
-        self.assertEqual(health["unresolved_gap_until"], "2026-11-12 09:30:00")
+        self.assertEqual(health["unresolved_gap_since"], "2026-11-10 09:30:00")
+        self.assertIsNone(health["unresolved_gap_until"])
         self.assertEqual(health["gap_reason"], "limited")
 
         await self.db.record_feed_source_attempt("millers", "activity")
         await self.db.record_feed_source_success(
             "millers", "activity", coverage="boundary_reached", pages_read=2,
-            boundary_event_id="b-2",
+            boundary_event_id="b-2", now=datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc),
         )
         closed = await self.db.get_profile_feed_source("millers", "activity")
         self.assertIsNone(closed["unresolved_gap_since"])
@@ -155,9 +258,10 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed["last_continuous_boundary_event_id"], "b-2")
 
     async def test_direct_insert_matches_attempt_first_across_coverages_and_deferred_commit(self):
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         from tests.test_feed_batch_writes import CountingTursoClient
 
+        now = datetime(2026, 11, 16, 15, 30, tzinfo=timezone(timedelta(hours=3)))
         gap_until = datetime(2026, 11, 14, 8, 15, tzinfo=timezone.utc)
         cases = [
             ("exhausted", "b-exh", False, True, None),
@@ -194,67 +298,44 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
                         attempt_key = f"attempt_{idx}"
 
                         await db.record_feed_source_success(
-                            direct_key,
-                            "activity",
-                            coverage=coverage,
-                            pages_read=2,
-                            boundary_event_id=boundary_id,
-                            defer_boundary_commit=defer_commit,
-                            gap_until=case_gap_until,
+                            direct_key, "activity", coverage=coverage, pages_read=2,
+                            boundary_event_id=boundary_id, defer_boundary_commit=defer_commit,
+                            gap_until=case_gap_until, now=now,
                         )
-                        await db.record_feed_source_attempt(attempt_key, "activity")
+                        await db.record_feed_source_attempt(attempt_key, "activity", now=now)
                         await db.record_feed_source_success(
-                            attempt_key,
-                            "activity",
-                            coverage=coverage,
-                            pages_read=2,
-                            boundary_event_id=boundary_id,
-                            defer_boundary_commit=defer_commit,
-                            gap_until=case_gap_until,
+                            attempt_key, "activity", coverage=coverage, pages_read=2,
+                            boundary_event_id=boundary_id, defer_boundary_commit=defer_commit,
+                            gap_until=case_gap_until, now=now,
                         )
 
                         direct_row = await db.get_profile_feed_source(direct_key, "activity")
                         attempt_row = await db.get_profile_feed_source(attempt_key, "activity")
-
                         self.assertEqual(direct_row["attempts"], 0)
                         self.assertEqual(attempt_row["attempts"], 1)
                         self.assertEqual(direct_row["successes"], 1)
                         self.assertEqual(attempt_row["successes"], 1)
                         self.assertIsNone(direct_row["last_attempt_at"])
-                        self.assertIsNotNone(attempt_row["last_attempt_at"])
+                        self.assertEqual(attempt_row["last_attempt_at"], "2026-11-16 12:30:00")
 
                         for field in (
-                            "coverage",
-                            "pages_read",
-                            "last_continuous_boundary_event_id",
-                            "gap_reason",
-                            "last_error",
+                            "coverage", "pages_read", "last_continuous_boundary_event_id",
+                            "last_success_at", "last_continuous_boundary_at",
+                            "unresolved_gap_since", "unresolved_gap_until", "gap_reason", "last_error",
                         ):
                             self.assertEqual(direct_row[field], attempt_row[field], field)
-                        self.assertEqual(
-                            direct_row["last_continuous_boundary_at"] is not None,
-                            attempt_row["last_continuous_boundary_at"] is not None,
-                        )
-                        self.assertEqual(
-                            direct_row["unresolved_gap_since"] is not None,
-                            attempt_row["unresolved_gap_since"] is not None,
-                        )
-                        self.assertEqual(
-                            direct_row["unresolved_gap_until"] is not None,
-                            attempt_row["unresolved_gap_until"] is not None,
-                        )
+                        self.assertEqual(direct_row["last_success_at"], "2026-11-16 12:30:00")
 
                         closes_gap = coverage == "exhausted" or (
                             coverage == "boundary_reached" and bool(boundary_id)
                         )
                         if immediate_commit:
                             self.assertEqual(direct_row["last_continuous_boundary_event_id"], boundary_id)
-                            self.assertIsNotNone(direct_row["last_continuous_boundary_at"])
+                            self.assertEqual(direct_row["last_continuous_boundary_at"], "2026-11-16 12:30:00")
                             self.assertIsNone(direct_row["unresolved_gap_since"])
                             self.assertIsNone(direct_row["unresolved_gap_until"])
                             self.assertIsNone(direct_row["gap_reason"])
                         elif closes_gap and defer_commit:
-                            # Deferred commit must never imply a committed boundary before recipients finish.
                             self.assertIsNone(direct_row["last_continuous_boundary_event_id"])
                             self.assertIsNone(direct_row["last_continuous_boundary_at"])
                             self.assertIsNone(direct_row["unresolved_gap_since"])
@@ -263,35 +344,155 @@ class FeedSourceHealthTests(unittest.IsolatedAsyncioTestCase):
                         else:
                             self.assertIsNone(direct_row["last_continuous_boundary_event_id"])
                             self.assertIsNone(direct_row["last_continuous_boundary_at"])
-                            self.assertIsNotNone(direct_row["unresolved_gap_since"])
-                            self.assertIsNotNone(direct_row["unresolved_gap_until"])
+                            self.assertIsNone(direct_row["unresolved_gap_since"])
+                            self.assertIsNone(direct_row["unresolved_gap_until"])
                             self.assertEqual(direct_row["gap_reason"], coverage)
-                            if case_gap_until is not None:
-                                self.assertEqual(direct_row["unresolved_gap_until"], "2026-11-14 08:15:00")
 
-                        # Explicit commit after deferred success advances boundary only when coverage closes gaps.
                         await db.commit_feed_source_boundary(
-                            direct_key, "activity", coverage=coverage, boundary_event_id=boundary_id
+                            direct_key, "activity", coverage=coverage,
+                            boundary_event_id=boundary_id, now=now,
                         )
                         await db.commit_feed_source_boundary(
-                            attempt_key, "activity", coverage=coverage, boundary_event_id=boundary_id
+                            attempt_key, "activity", coverage=coverage,
+                            boundary_event_id=boundary_id, now=now,
                         )
                         after_direct = await db.get_profile_feed_source(direct_key, "activity")
                         after_attempt = await db.get_profile_feed_source(attempt_key, "activity")
                         if closes_gap:
                             self.assertEqual(after_direct["last_continuous_boundary_event_id"], boundary_id)
                             self.assertEqual(after_attempt["last_continuous_boundary_event_id"], boundary_id)
-                            self.assertIsNotNone(after_direct["last_continuous_boundary_at"])
-                            self.assertIsNotNone(after_attempt["last_continuous_boundary_at"])
+                            self.assertEqual(after_direct["last_continuous_boundary_at"], "2026-11-16 12:30:00")
+                            self.assertEqual(after_attempt["last_continuous_boundary_at"], "2026-11-16 12:30:00")
                             self.assertIsNone(after_direct["unresolved_gap_since"])
                             self.assertIsNone(after_attempt["unresolved_gap_since"])
                             self.assertIsNone(after_direct["gap_reason"])
                         else:
                             self.assertIsNone(after_direct["last_continuous_boundary_event_id"])
                             self.assertIsNone(after_attempt["last_continuous_boundary_event_id"])
-                            self.assertIsNotNone(after_direct["unresolved_gap_since"])
-                            self.assertIsNotNone(after_attempt["unresolved_gap_since"])
+                            self.assertIsNone(after_direct["unresolved_gap_since"])
+                            self.assertIsNone(after_attempt["unresolved_gap_since"])
+                            self.assertIsNone(after_direct["unresolved_gap_until"])
+                            self.assertIsNone(after_attempt["unresolved_gap_until"])
                             self.assertEqual(after_direct["gap_reason"], coverage)
+        finally:
+            await turso_db.close()
+
+    async def test_status_text_keeps_unknown_and_recipient_gaps_open_until_committed_boundary(self):
+        from datetime import datetime, timezone
+        from tests.test_feed_batch_writes import CountingTursoClient
+
+        turso_path = Path(self.directory.name) / "turso-status-health.db"
+        seed = Database(str(turso_path), turso_url="")
+        await seed.connect()
+        await seed.close()
+        turso_db = Database(str(turso_path), turso_url="https://status-health.turso.io")
+        turso_db._client = CountingTursoClient(str(turso_path))
+
+        async def source_health_text(db, now):
+            await db.link_user(10, "Millers")
+            await db.set_guild_feed_preference(1, 10, True)
+            await db.set_feed_channel(1, 100)
+            await db.reconcile_guild_feed_activity(
+                1, ["millers"], now=now, present_member_ids=[10],
+            )
+            interaction = SimpleNamespace(
+                guild=SimpleNamespace(
+                    id=1, chunked=True, members=[SimpleNamespace(id=10)],
+                ),
+                guild_id=1,
+                user=SimpleNamespace(id=10),
+                response=SimpleNamespace(defer=AsyncMock()),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+            feed = FeedCog(SimpleNamespace(db=db), clock=lambda: now)
+            await FeedCog.feed_status.callback(feed, interaction)
+            return interaction.followup.send.call_args.kwargs["embed"].fields[0].value
+
+        try:
+            for backend, db in (("sqlite", self.db), ("turso", turso_db)):
+                with self.subTest(backend=backend):
+                    unknown_at = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="limited", pages_read=2,
+                        gap_until=datetime(2026, 11, 8, 8, 0, tzinfo=timezone.utc),
+                        now=unknown_at,
+                    )
+                    field = await source_health_text(db, unknown_at)
+                    self.assertIn("Coverage extent unknown (no continuous boundary)", field)
+                    self.assertNotIn("Gap bounds conflict", field)
+
+                    first_boundary = datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc)
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="exhausted", pages_read=3,
+                        boundary_event_id="b-1", now=first_boundary,
+                    )
+                    limited_at = datetime(2026, 11, 12, 9, 0, tzinfo=timezone.utc)
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="limited", pages_read=5,
+                        gap_until=datetime(2026, 11, 9, 9, 0, tzinfo=timezone.utc),
+                        now=limited_at,
+                    )
+                    field = await source_health_text(db, limited_at)
+                    self.assertIn("Coverage gap:", field)
+                    self.assertIn("→ present", field)
+                    self.assertNotIn("Gap bounds conflict", field)
+                    await db._execute(
+                        """UPDATE profile_feed_source_health SET unresolved_gap_until = ?
+                           WHERE profile_key = 'millers' AND source = 'activity'""",
+                        ("2026-11-09 09:00:00",),
+                    )
+                    conflicted = await source_health_text(db, limited_at)
+                    self.assertIn("Gap bounds conflict; extent unknown", conflicted)
+                    self.assertNotIn("Coverage gap:", conflicted)
+                    await db._execute(
+                        """UPDATE profile_feed_source_health SET unresolved_gap_until = NULL
+                           WHERE profile_key = 'millers' AND source = 'activity'""",
+                        (),
+                    )
+
+                    recovery_at = datetime(2026, 11, 13, 9, 0, tzinfo=timezone.utc)
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="boundary_reached", pages_read=2,
+                        boundary_event_id="b-2", defer_boundary_commit=True,
+                        now=recovery_at,
+                    )
+                    field = await source_health_text(db, recovery_at)
+                    self.assertIn("Coverage gap:", field)
+                    await db.commit_feed_source_boundary(
+                        "millers", "activity", coverage="boundary_reached",
+                        boundary_event_id="b-2", now=recovery_at,
+                    )
+                    field = await source_health_text(db, recovery_at)
+                    self.assertNotIn("Coverage gap:", field)
+
+                    fetch_at = datetime(2026, 11, 14, 9, 0, tzinfo=timezone.utc)
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="exhausted", pages_read=1,
+                        boundary_event_id="b-3", defer_boundary_commit=True,
+                        now=fetch_at,
+                    )
+                    recipient_gap_at = datetime(2026, 11, 14, 9, 5, tzinfo=timezone.utc)
+                    await db.record_feed_target_gap("millers", now=recipient_gap_at)
+                    field = await source_health_text(db, recipient_gap_at)
+                    self.assertIn("Recipient gap:", field)
+                    self.assertIn("→ present", field)
+
+                    retry_at = datetime(2026, 11, 14, 9, 10, tzinfo=timezone.utc)
+                    await db.record_feed_source_success(
+                        "millers", "activity", coverage="exhausted", pages_read=1,
+                        boundary_event_id="b-4", defer_boundary_commit=True,
+                        now=retry_at,
+                    )
+                    self.assertIn(
+                        "Recipient gap:", await source_health_text(db, retry_at),
+                    )
+                    await db.commit_feed_source_boundary(
+                        "millers", "activity", coverage="exhausted",
+                        boundary_event_id="b-4", now=retry_at,
+                    )
+                    self.assertNotIn(
+                        "Recipient gap:", await source_health_text(db, retry_at),
+                    )
         finally:
             await turso_db.close()
 

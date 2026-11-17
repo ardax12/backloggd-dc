@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
+from dataclasses import dataclass
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -44,6 +45,14 @@ class _ProfileNotFoundSignal(Exception):
     def __init__(self, username: str):
         super().__init__(username)
         self.username = username
+
+
+@dataclass(frozen=True)
+class _LibraryRatingSnapshot:
+    """Request-scoped live results; public rating callers still receive a dict."""
+
+    ratings: Dict[str, Optional[float]]
+    titles: Dict[str, str]
 
 
 class SocialCog(commands.Cog, name="Social"):
@@ -118,13 +127,36 @@ class SocialCog(commands.Cog, name="Social"):
             return info is not None
         return False
 
-    async def _fetch_live_library_ratings(self, username: str) -> Dict[str, Optional[float]]:
+    async def _fetch_live_library_snapshot(self, username: str) -> _LibraryRatingSnapshot:
         async with self._live_library_semaphore:
             lib = await self.bot.backloggd.get_user_library(username)
-        return lib.to_ratings_dict()
+        ratings = lib.to_ratings_dict()
+        titles = {}
+        games = getattr(lib, "games", None)
+        if isinstance(games, dict):
+            for raw_slug, game in games.items():
+                slug = getattr(game, "slug", None)
+                title = getattr(game, "title", None)
+                slug = slug if isinstance(slug, str) and slug.strip() else raw_slug
+                if (
+                    isinstance(slug, str)
+                    and slug.strip()
+                    and isinstance(title, str)
+                    and title.strip()
+                ):
+                    titles[slug] = title.strip()
+        return _LibraryRatingSnapshot(ratings=ratings, titles=titles)
+
+    async def _fetch_live_library_ratings(self, username: str) -> Dict[str, Optional[float]]:
+        """Compatibility wrapper retaining the numeric ratings result shape."""
+        return (await self._fetch_live_library_snapshot(username)).ratings
 
     async def _get_or_fetch_ratings(self, username: str) -> Dict[str, Optional[float]]:
         """Fetch user's library ratings mapping (slug -> score), coalescing live fetches."""
+        return (await self._get_or_fetch_library_snapshot(username)).ratings
+
+    async def _get_or_fetch_library_snapshot(self, username: str) -> _LibraryRatingSnapshot:
+        """Return ratings plus live titles without persisting unlinked library data."""
         if self._closing:
             raise asyncio.CancelledError("Social cog is shutting down")
 
@@ -132,12 +164,13 @@ class SocialCog(commands.Cog, name="Social"):
         if self._closing:
             raise asyncio.CancelledError("Social cog is shutting down")
         if profile and profile["last_synced_at"] is not None:
-            return await self.bot.db.get_profile_ratings_dict(username)
+            ratings = await self.bot.db.get_profile_ratings_dict(username)
+            return _LibraryRatingSnapshot(ratings=ratings, titles={})
 
         profile_key = username.strip().lower()
         task = self._live_library_tasks.get(profile_key)
         if task is None or task.done():
-            task = asyncio.create_task(self._fetch_live_library_ratings(username))
+            task = asyncio.create_task(self._fetch_live_library_snapshot(username))
             self._live_library_tasks[profile_key] = task
             self._tracked_live_tasks.add(task)
             task.add_done_callback(self._tracked_live_tasks.discard)
@@ -181,11 +214,13 @@ class SocialCog(commands.Cog, name="Social"):
         await defer_interaction(interaction)
 
         # Target resolution
+        caller_profile_key = None
         try:
             if user2 is None:
                 # user1 is target, user2 is caller
                 u1_name = await self._resolve_username(interaction, user1)
                 u2_name = await self._resolve_username(interaction, None)
+                caller_profile_key = u2_name.lower() if u2_name else None
                 if not u2_name:
                     await send_private_followup(
                         interaction,
@@ -196,6 +231,8 @@ class SocialCog(commands.Cog, name="Social"):
             else:
                 u1_name = await self._resolve_username(interaction, user1)
                 u2_name = await self._resolve_username(interaction, user2)
+                if parse_discord_member_id(user2) == interaction.user.id:
+                    caller_profile_key = u2_name.lower() if u2_name else None
         except InvalidUsernameError as err:
             await send_private_followup(interaction, f"❌ {err}", log=logger)
             return
@@ -236,8 +273,9 @@ class SocialCog(commands.Cog, name="Social"):
             async def _load_ratings(name: str, subscribed: bool, status):
                 try:
                     if subscribed and status is not None and status.missing and getattr(self.bot, "library_sync", None) is not None:
-                        return await self.bot.db.get_profile_ratings_dict(name)
-                    return await self._get_or_fetch_ratings(name)
+                        ratings = await self.bot.db.get_profile_ratings_dict(name)
+                        return _LibraryRatingSnapshot(ratings=ratings, titles={})
+                    return await self._get_or_fetch_library_snapshot(name)
                 except (UserNotFoundError, ResourceNotFoundError) as exc:
                     raise _ProfileNotFoundSignal(name) from exc
 
@@ -251,7 +289,8 @@ class SocialCog(commands.Cog, name="Social"):
                     if isinstance(item, asyncio.CancelledError):
                         raise item
                     raise item
-            ratings1, ratings2 = loaded
+            snapshot1, snapshot2 = loaded
+            ratings1, ratings2 = snapshot1.ratings, snapshot2.ratings
 
             if not ratings1 or not ratings2:
                 if not ratings1 and sub1 and s1 is not None and s1.missing:
@@ -269,9 +308,15 @@ class SocialCog(commands.Cog, name="Social"):
                     )
                     return
                 empty_user = safe_u1 if not ratings1 else safe_u2
+                empty_username = u1_name if not ratings1 else u2_name
+                empty_library_message = (
+                    "Your library has no logged games to compare yet."
+                    if caller_profile_key == empty_username.lower()
+                    else f"**{empty_user}**'s library has no logged games to compare yet."
+                )
                 await send_private_followup(
                     interaction,
-                    f"❌ **{empty_user}** does not have any logged games in their library to compare.",
+                    f"❌ {empty_library_message}",
                     log=logger,
                 )
                 return
@@ -316,11 +361,14 @@ class SocialCog(commands.Cog, name="Social"):
                 r2 = rated2[slug]
                 delta = abs(r1 - r2)
                 meta = cached_meta.get(slug)
-                raw_title = meta["title"] if meta else None
-                title = (
-                    raw_title.strip()
-                    if isinstance(raw_title, str) and raw_title.strip()
-                    else slug.replace("-", " ").title()
+                cached_title = meta["title"] if meta else None
+                if not isinstance(cached_title, str) or not cached_title.strip():
+                    cached_title = None
+                live_title = snapshot1.titles.get(slug) or snapshot2.titles.get(slug)
+                if not isinstance(live_title, str) or not live_title.strip():
+                    live_title = None
+                title = cached_title.strip() if cached_title else (
+                    live_title.strip() if live_title else slug.replace("-", " ").title()
                 )
                 # Shared loves (both rated 4.0+)
                 if r1 >= 4.0 and r2 >= 4.0:
@@ -469,18 +517,40 @@ class SocialCog(commands.Cog, name="Social"):
                         log=logger,
                     )
                 else:
+                    is_caller = target_discord_id == interaction.user.id
+                    has_synced_library = bool(
+                        target_subscribed
+                        or (target_status is not None and not target_status.missing)
+                    )
+                    if has_synced_library:
+                        empty_message = (
+                            "Your synced Backloggd library contains no logged games yet."
+                            if is_caller
+                            else f"**{safe_target}**'s synced Backloggd library contains no logged games yet."
+                        )
+                    elif is_caller:
+                        empty_message = "Your live Backloggd library contains no logged games yet."
+                    else:
+                        empty_message = (
+                            f"A live Backloggd fetch found no logged games in **{safe_target}**'s library."
+                        )
                     await send_private_followup(
                         interaction,
-                        f"❌ **{safe_target}** does not have any cached ratings yet. Use `/refresh` to sync your library.",
+                        f"❌ {empty_message}",
                         log=logger,
                     )
                 return
 
             my_numeric_ratings = numeric_ratings(my_ratings)
             if not my_numeric_ratings:
+                empty_ratings_message = (
+                    "Your library has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity."
+                    if target_discord_id == interaction.user.id
+                    else f"**{safe_target}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity."
+                )
                 await send_private_followup(
                     interaction,
-                    f"ℹ️ **{safe_target}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity.",
+                    f"ℹ️ {empty_ratings_message}",
                     log=logger,
                 )
                 return

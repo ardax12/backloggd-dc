@@ -56,6 +56,8 @@ class FeedCog(commands.Cog, name="Feed"):
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._activity_snapshot_meta = {}
         self._unavailable_target_reasons: dict[int, str] = {}
+        self._closing = False
+        self._draining_task: asyncio.Task | None = None
 
     def _inspect_target_channel(
         self,
@@ -116,16 +118,62 @@ class FeedCog(commands.Cog, name="Feed"):
 
     async def cog_load(self):
         # Start loop when cog is loaded and bot event loop is active
-        if not self.journal_feed_loop.is_running():
+        if not self._closing and not self.journal_feed_loop.is_running():
             self.journal_feed_loop.start()
 
-    def cog_unload(self):
-        if self.journal_feed_loop.is_running():
-            self.journal_feed_loop.cancel()
+    async def close(self) -> None:
+        """Stop accepting polls, cancel the loop and wait for its work to unwind."""
+        self._closing = True
+        current = asyncio.current_task()
+        if self._draining_task is not None:
+            if self._draining_task is not current and not self._draining_task.done():
+                await asyncio.shield(self._draining_task)
+            return
+
+        async def _drain() -> None:
+            task = self.journal_feed_loop.get_task()
+            if task is None or task is current:
+                return
+            if not task.done() and not task.cancelling():
+                self.journal_feed_loop.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self._draining_task = asyncio.create_task(_drain())
+        try:
+            await asyncio.shield(self._draining_task)
+        except asyncio.CancelledError:
+            await asyncio.shield(self._draining_task)
+            raise
+        finally:
+            if self._draining_task.done():
+                self._draining_task = None
+
+    async def cog_unload(self) -> None:
+        await self.close()
 
     async def _authoritative_member_ids(self, guild):
         """Return a complete cached member snapshot, or None when unavailable."""
         return await resolve_guild_member_ids(self.bot, guild)
+
+    @staticmethod
+    def _feed_enrollment_state_copy(status: dict) -> str:
+        """Describe baseline state without treating missing membership as proof of a gap."""
+        if status.get("pending_reconciliation"):
+            return (
+                "Source continuity is still being verified. No baseline reset is assumed; "
+                "a complete member snapshot is required to resolve it."
+            )
+        if status.get("active"):
+            initialized = set(status.get("initialized_sources") or ())
+            expected = {"activity-display-v1", "journal-display-v1"}
+            if expected.issubset(initialized):
+                return "This profile is already active with initialized baselines; this command does not reset them."
+            if initialized:
+                return "This profile is already active; any uninitialized source will be baselined without resetting existing sources."
+            return "This profile is active and its source baseline is pending the first successful check."
+        if status.get("last_active_at") is not None:
+            return "This profile is resuming after a proven inactive period; existing history will be skipped as a fresh baseline is established."
+        return "This is the first enrollment; existing history will be skipped as the initial baseline is established."
 
     async def _reconcile_legacy_guild(self, guild, *, pending_guild_ids: set[int] | None = None):
         guild_id = getattr(guild, "id", None)
@@ -333,6 +381,7 @@ class FeedCog(commands.Cog, name="Feed"):
             dirty=total_changed > 0,
             now=self.clock(),
             require_subscribed=True,
+            subscribed=is_subscribed,
         )
         return True
 
@@ -347,11 +396,14 @@ class FeedCog(commands.Cog, name="Feed"):
         sources = {}
         profile_key = username.strip().lower()
         database = getattr(self.bot, "db", None)
+        health_now = self.clock()
         self._activity_snapshot_meta.pop(profile_key, None)
         try:
             health = None
             if database and hasattr(database, "record_feed_source_attempt"):
-                await database.record_feed_source_attempt(profile_key, "activity")
+                await database.record_feed_source_attempt(
+                    profile_key, "activity", now=health_now,
+                )
                 health = await database.get_profile_feed_source(profile_key, "activity")
             snapshot_method = getattr(self.bot.backloggd, "get_user_activity_snapshot", None)
             if snapshot_method:
@@ -393,11 +445,6 @@ class FeedCog(commands.Cog, name="Feed"):
                 boundary_event_id = parsed[0].activity_id if parsed else prior_boundary
             elif coverage == "exhausted" and parsed:
                 boundary_event_id = parsed[0].activity_id
-            gap_until = None
-            if coverage in {"limited", "unsupported"}:
-                entry_times = [parse_utc_datetime(item.occurred_at) for item in parsed]
-                valid_times = [dt for dt in entry_times if dt is not None]
-                gap_until = min(valid_times) if valid_times else self.clock()
             sources["activity"] = parsed
             self._activity_snapshot_meta[profile_key] = {
                 "coverage": coverage,
@@ -406,6 +453,7 @@ class FeedCog(commands.Cog, name="Feed"):
                 "boundary_event_id": boundary_event_id,
                 "had_unresolved_gap": had_unresolved_gap,
                 "had_prior_failure": had_prior_failure,
+                "observed_at": health_now,
             }
             if database and hasattr(database, "record_feed_source_success"):
                 await database.record_feed_source_success(
@@ -415,7 +463,7 @@ class FeedCog(commands.Cog, name="Feed"):
                     pages_read=pages_read,
                     boundary_event_id=boundary_event_id,
                     defer_boundary_commit=defer_boundary_commit,
-                    gap_until=gap_until,
+                    now=health_now,
                 )
             if isinstance(poll_context, dict):
                 poll_context.setdefault("activity_health", {})[profile_key] = {"last_error": None}
@@ -425,7 +473,9 @@ class FeedCog(commands.Cog, name="Feed"):
                 await database.record_feed_source_failure(profile_key, "activity", str(error))
         try:
             if database and hasattr(database, "record_feed_source_attempt"):
-                await database.record_feed_source_attempt(profile_key, "journal")
+                await database.record_feed_source_attempt(
+                    profile_key, "journal", now=health_now,
+                )
             entries = await self.bot.backloggd.get_user_journal(
                 username, max_pages=100, require_complete=True
             )
@@ -433,6 +483,7 @@ class FeedCog(commands.Cog, name="Feed"):
             if database and hasattr(database, "record_feed_source_success"):
                 await database.record_feed_source_success(
                     profile_key, "journal", coverage="exhausted", pages_read=None,
+                    now=health_now,
                 )
         except Exception as error:
             logger.warning("Could not read journal for %s: %s", username, error)
@@ -718,10 +769,45 @@ class FeedCog(commands.Cog, name="Feed"):
         )
         events = merge_ratings_and_reviews(events)
         events.sort(key=lambda e: e.occurred_at or calendar_date(e.played_date) or "")
-        known_ratings = {}
-        for previous in sorted(canonical_activity.values(), key=lambda e: e.occurred_at or ""):
-            if previous.source == "activity" and previous.rating is not None:
-                known_ratings[previous.game_slug] = previous.rating
+        activity_rating_history: dict[str, list[tuple[datetime, float]]] = {}
+        for previous in (*canonical_activity.values(), *events):
+            if previous.source != "activity" or previous.rating is None:
+                continue
+            observed_action_at = parse_utc_datetime(previous.occurred_at)
+            if observed_action_at is not None:
+                activity_rating_history.setdefault(previous.game_slug, []).append(
+                    (observed_action_at, previous.rating)
+                )
+
+        journal_rating_history: dict[str, list[tuple[datetime, float]]] = {}
+        journal_rating_times_unknown: set[str] = set()
+        journal_rating_events = [
+            event for event in canonical_journal.values() if event.rating is not None
+        ]
+        if journal_rating_events:
+            decision_getter = getattr(self.bot.db, "get_feed_event_decisions", None)
+            journal_decisions = (
+                await decision_getter(
+                    guild_id,
+                    profile_key,
+                    [event.activity_id for event in journal_rating_events],
+                )
+                if callable(decision_getter)
+                else {}
+            )
+            for journal_event in journal_rating_events:
+                row = journal_decisions.get(journal_event.activity_id)
+                decision = dict(row) if row is not None else None
+                if decision is None or decision["decision"] not in {"baseline", "eligible"}:
+                    journal_rating_times_unknown.add(journal_event.game_slug)
+                    continue
+                observed_at = parse_utc_datetime(decision.get("observed_at"))
+                if observed_at is None:
+                    journal_rating_times_unknown.add(journal_event.game_slug)
+                    continue
+                journal_rating_history.setdefault(journal_event.game_slug, []).append(
+                    (observed_at, journal_event.rating)
+                )
         alias_check_ids = []
         seen_alias_check_ids = set()
         for event in events:
@@ -792,7 +878,12 @@ class FeedCog(commands.Cog, name="Feed"):
                         previous_rating = old.get("rating")
                     event = replace(event, previous_rating=previous_rating)
             elif event.action_type == "rated":
-                old_rating = known_ratings.get(event.game_slug)
+                old_rating = self._previous_rating_from_history(
+                    event,
+                    activity_rating_history.get(event.game_slug, ()),
+                    journal_rating_history.get(event.game_slug, ()),
+                    journal_time_unknown=event.game_slug in journal_rating_times_unknown,
+                )
                 if old_rating != event.rating:
                     event = replace(event, previous_rating=old_rating)
             message_id = record["message_id"] if record else None
@@ -817,8 +908,6 @@ class FeedCog(commands.Cog, name="Feed"):
                             "channel_id": old_channel,
                             "delivery_state": alias_state,
                         }
-                if event.source == "activity" and event.rating is not None:
-                    known_ratings[event.game_slug] = event.rating
                 continue
             if state in {"pending", "unknown", "deleted"}:
                 await self.bot.db.store_feed_message(
@@ -990,9 +1079,47 @@ class FeedCog(commands.Cog, name="Feed"):
                 }
             if not record:
                 await asyncio.sleep(1)
-            if event.source == "activity" and event.rating is not None:
-                known_ratings[event.game_slug] = event.rating
         return target_ok
+
+    @staticmethod
+    def _previous_rating_from_history(
+        event,
+        activity_history,
+        journal_history,
+        *,
+        journal_time_unknown: bool = False,
+    ):
+        """Use the latest strictly earlier rating observation, never played_date."""
+        action_time = parse_utc_datetime(event.occurred_at)
+        if action_time is None:
+            return None
+
+        activity_candidates = [
+            (timestamp, rating)
+            for timestamp, rating in activity_history
+            if timestamp < action_time
+        ]
+        if activity_candidates:
+            latest_at = max(timestamp for timestamp, _ in activity_candidates)
+            latest_ratings = {
+                rating for timestamp, rating in activity_candidates if timestamp == latest_at
+            }
+            return next(iter(latest_ratings)) if len(latest_ratings) == 1 else None
+
+        if journal_time_unknown:
+            return None
+        journal_candidates = [
+            (timestamp, rating)
+            for timestamp, rating in journal_history
+            if timestamp < action_time
+        ]
+        if not journal_candidates:
+            return None
+        latest_at = max(timestamp for timestamp, _ in journal_candidates)
+        latest_ratings = {
+            rating for timestamp, rating in journal_candidates if timestamp == latest_at
+        }
+        return next(iter(latest_ratings)) if len(latest_ratings) == 1 else None
 
     async def _apply_discovery_policy(
         self,
@@ -1255,18 +1382,38 @@ class FeedCog(commands.Cog, name="Feed"):
             if already_tracked:
                 accepted.append(event)
                 continue
-            concurrent_stricter = any(
-                alias in authoritative
-                and authoritative[alias]["decision"] != decision_map[alias]["decision"]
-                and decision_priority.get(authoritative[alias]["decision"], 99)
-                < decision_priority.get(local_decision, 99)
-                for alias in aliases
+            final_decision = self._final_alias_decision(
+                aliases,
+                authoritative,
+                decision_map,
+                fallback=local_decision,
             )
-            if concurrent_stricter:
-                continue
-            if local_decision in {"eligible", "baseline"}:
+            if final_decision in {"eligible", "baseline"}:
                 accepted.append(event)
         return accepted
+
+    @staticmethod
+    def _final_alias_decision(aliases, authoritative, request_decisions, *, fallback=None):
+        """Choose the strictest persisted alias decision, using request state for missing rows."""
+        priority = {
+            "suppressed_pre_activation": 0,
+            "suppressed_old": 1,
+            "held_ambiguous": 2,
+            "held_future": 3,
+            "held_uncertain": 4,
+            "baseline": 5,
+            "eligible": 6,
+        }
+        decisions = []
+        for alias in aliases:
+            row = authoritative.get(alias)
+            if row is None:
+                row = request_decisions.get(alias)
+            if row is not None:
+                decisions.append(row["decision"])
+        if not decisions:
+            return fallback
+        return min(decisions, key=lambda decision: priority.get(decision, 99))
 
     @staticmethod
     def _valid_alias(value: Any) -> str | None:
@@ -1360,6 +1507,7 @@ class FeedCog(commands.Cog, name="Feed"):
             if event.reference:
                 incoming_reference_counts[event.reference] = incoming_reference_counts.get(event.reference, 0) + 1
         reconciled = []
+        identity_operations = []
         for event in events:
             previous = alias_lookup.get(event.activity_id)
             if previous:
@@ -1378,14 +1526,16 @@ class FeedCog(commands.Cog, name="Feed"):
                     )))
                     resolved = replace(event, event_ids=aliases)
                     _, _, event_date = classify_feed_event(event, now)
-                    await self.bot.db.resolve_feed_event_decision(
-                        guild_id, profile_key, event.activity_id,
-                        json.dumps(asdict(resolved), sort_keys=True), event_date,
-                    )
+                    identity_operations.append({
+                        "kind": "resolve",
+                        "event_id": event.activity_id,
+                        "event_date": event_date,
+                        "payload": json.dumps(asdict(resolved), sort_keys=True),
+                    })
                     reconciled.append(resolved)
                     continue
                 if len(matches) > 1 or (matches and incoming_reference_counts[event.reference] > 1):
-                    await self._record_ambiguous_event(guild_id, profile_key, event, now)
+                    identity_operations.append(self._build_ambiguous_event_decision(event, now))
                     continue
                 # A new stable public reference proves this is a distinct event.
                 reconciled.append(event)
@@ -1406,19 +1556,43 @@ class FeedCog(commands.Cog, name="Feed"):
                 )
             ]
             if is_session and prior_sessions:
-                await self._record_ambiguous_event(guild_id, profile_key, event, now)
+                identity_operations.append(self._build_ambiguous_event_decision(event, now))
                 continue
             reconciled.append(event)
+        if identity_operations:
+            persist_identity = getattr(self.bot.db, "persist_feed_identity_decisions", None)
+            if callable(persist_identity):
+                await persist_identity(guild_id, profile_key, operations=identity_operations)
+            else:
+                # Retain compatibility with lightweight DB adapters while the
+                # published Database path uses one bounded transaction.
+                for operation in identity_operations:
+                    if operation["kind"] == "resolve":
+                        await self.bot.db.resolve_feed_event_decision(
+                            guild_id, profile_key, operation["event_id"],
+                            operation["payload"], operation.get("event_date"),
+                        )
+                    else:
+                        await self.bot.db.record_feed_event_decision(
+                            guild_id, profile_key, operation["event_id"],
+                            source=operation["source"], event_date=operation["event_date"],
+                            decision="held_ambiguous", reason=operation["reason"],
+                            payload=operation["payload"], observed_at=operation["observed_at"],
+                        )
         return reconciled
 
-    async def _record_ambiguous_event(self, guild_id, profile_key, event, now):
+    @staticmethod
+    def _build_ambiguous_event_decision(event, now):
         _, _, event_date = classify_feed_event(event, now)
-        await self.bot.db.record_feed_event_decision(
-            guild_id, profile_key, event.activity_id, source=event.source,
-            event_date=event_date, decision="held_ambiguous",
-            reason="raw_session_identity_changed_without_stable_reference",
-            payload=json.dumps(asdict(event), sort_keys=True),
-        )
+        return {
+            "kind": "ambiguity",
+            "event_id": event.activity_id,
+            "source": event.source,
+            "event_date": event_date,
+            "reason": "raw_session_identity_changed_without_stable_reference",
+            "payload": json.dumps(asdict(event), sort_keys=True),
+            "observed_at": now,
+        }
 
     @staticmethod
     def _keep_old_posted_sessions_and_unlink_old_baselines(events, explicit_actions, saved, now):
@@ -1586,13 +1760,20 @@ class FeedCog(commands.Cog, name="Feed"):
                 log=logger,
             )
             return
-        await self.bot.db.set_guild_feed_preference(interaction.guild_id, interaction.user.id, True)
+        member_ids = await self._authoritative_member_ids(interaction.guild)
+        await self.bot.db.set_guild_feed_preference(
+            interaction.guild_id, interaction.user.id, True, member_ids=member_ids,
+        )
+        status = await self.bot.db.get_guild_profile_feed_status(
+            interaction.guild_id, linked["profile_key"],
+        )
         channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
         message = f"Your linked profile **{escape_display_text(linked['backloggd_username'])}** is enabled for this server."
         if channel_id is None:
-            message += " The feed is pending until an admin runs `/setchannel`."
-        else:
-            message += " Existing history will be skipped when the profile is first checked."
+            message += " The feed is pending until an admin runs `/setchannel`; no Discord delivery can happen before a channel is configured."
+        if member_ids is None:
+            message += " No Discord delivery will happen until a complete member snapshot is available."
+        message += " " + self._feed_enrollment_state_copy(status)
         await send_private_followup(interaction, message, log=logger)
 
     @feed.command(name="off", description="Stop your linked profile from participating in this server's feed")
@@ -1722,14 +1903,37 @@ class FeedCog(commands.Cog, name="Feed"):
             last_ok = self._format_rel_timestamp(row["last_success_at"])
             cov = str(row["coverage"] or "unknown").replace("`", "")
             line = f"**{display_name}:** {baselined} · Last OK: {last_ok} · Coverage: `{cov}`"
-            if row["unresolved_gap_since"]:
-                gap_since = self._format_rel_timestamp(row["unresolved_gap_since"])
-                gap_until = (
-                    self._format_rel_timestamp(row["unresolved_gap_until"])
-                    if "unresolved_gap_until" in row.keys() and row["unresolved_gap_until"]
-                    else "present"
-                )
-                line += f" · Gap: {gap_since} \u2192 {gap_until}"
+            health_keys = row.keys()
+            gap_since_raw = row["unresolved_gap_since"]
+            gap_until_raw = (
+                row["unresolved_gap_until"]
+                if "unresolved_gap_until" in health_keys else None
+            )
+            gap_since_at = parse_sync_timestamp(gap_since_raw)
+            gap_until_at = parse_sync_timestamp(gap_until_raw)
+            gap_reason = row["gap_reason"] if "gap_reason" in health_keys else None
+            last_boundary_at = (
+                row["last_continuous_boundary_at"]
+                if "last_continuous_boundary_at" in health_keys else None
+            )
+            if gap_since_at and gap_until_at and gap_until_at < gap_since_at:
+                line += " · Gap bounds conflict; extent unknown"
+            elif gap_since_raw:
+                gap_label = {
+                    "unavailable_feed_target": "Recipient gap",
+                    "source_failure": "Continuity gap",
+                }.get(gap_reason, "Coverage gap")
+                gap_since = self._format_rel_timestamp(gap_since_raw)
+                gap_until = self._format_rel_timestamp(gap_until_raw) if gap_until_raw else "present"
+                line += f" · {gap_label}: {gap_since} \u2192 {gap_until}"
+            elif gap_reason or cov in {"limited", "unsupported"}:
+                line += " · Coverage extent unknown (no continuous boundary)"
+            if (
+                cov in {"limited", "unsupported"}
+                and last_boundary_at is None
+                and gap_since_raw
+            ):
+                line += " · Source extent unknown (no continuous boundary)"
             if row["last_error"]:
                 err = format_health_error_excerpt(row["last_error"], max_length=120)
                 line += f" · Error: {err}"
@@ -1820,11 +2024,15 @@ class FeedCog(commands.Cog, name="Feed"):
                 log=logger,
             )
             return
+        member_ids = await self._authoritative_member_ids(interaction.guild)
         created = await self.bot.db.add_guild_admin_follow(
-            interaction.guild_id, profile.username, profile.avatar_url, interaction.user.id
+            interaction.guild_id,
+            profile.username,
+            profile.avatar_url,
+            interaction.user.id,
+            member_ids=member_ids,
         )
         channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
-        member_ids = await self._authoritative_member_ids(interaction.guild)
         if member_ids is not None and channel_id is not None:
             candidates = await self.bot.db.get_guild_feed_candidates(interaction.guild_id, member_ids)
             await self.bot.db.reconcile_guild_feed_activity(
@@ -1833,17 +2041,19 @@ class FeedCog(commands.Cog, name="Feed"):
                 now=self.clock(),
                 present_member_ids=member_ids,
             )
+        status = await self.bot.db.get_guild_profile_feed_status(
+            interaction.guild_id, profile.username.lower(),
+        )
         safe_profile = escape_display_text(profile.username)
         if not created:
             message = f"**{safe_profile}** is already followed in this server."
         else:
             message = f"Added **{safe_profile}** to this server's activity feed."
         if channel_id is None:
-            message += " The follow is pending until an admin runs `/setchannel`."
-        elif member_ids is None:
-            message += " The feed will pick it up after Discord provides a complete member snapshot."
-        else:
-            message += " Existing history will be skipped on its first check."
+            message += " The follow is pending until an admin runs `/setchannel`; no Discord delivery can happen before a channel is configured."
+        if member_ids is None:
+            message += " No Discord delivery will happen until Discord provides a complete member snapshot."
+        message += " " + self._feed_enrollment_state_copy(status)
         await send_private_followup(interaction, message, log=logger)
 
     @feed.command(name="remove", description="Remove a public profile follow from this server's feed")
@@ -1971,6 +2181,8 @@ class FeedCog(commands.Cog, name="Feed"):
     async def journal_feed_loop(self):
         """Periodically check linked users' journals and broadcast new logs."""
         try:
+            if self._closing:
+                return
             if not self.bot.db or not self.bot.db.is_connected:
                 return
 
@@ -2062,10 +2274,16 @@ class FeedCog(commands.Cog, name="Feed"):
                     sources = await self._fetch_feed_sources(
                         username, **fetch_options
                     )
+                    meta = self._activity_snapshot_meta.get(profile_key)
+                    health_now = meta.get("observed_at") if meta else None
+                    if health_now is None:
+                        health_now = self.clock()
                     await self._observe_profile_activity(profile_key, username, sources)
                     all_guilds_ok = bool(active_targets) and not skipped
                     if skipped:
-                        await self.bot.db.record_feed_target_gap(profile_key)
+                        await self.bot.db.record_feed_target_gap(
+                            profile_key, now=health_now,
+                        )
                     for guild_id, target_username, target_avatar, channel in [*active_targets, *skipped]:
                         try:
                             delivery_options = {'deliver': False} if channel is None else {}
@@ -2085,13 +2303,13 @@ class FeedCog(commands.Cog, name="Feed"):
                         except Exception as e:
                             all_guilds_ok = False
                             logger.warning("Error publishing activity for %s in guild %d: %s", target_username, guild_id, e)
-                    meta = self._activity_snapshot_meta.get(profile_key)
                     if all_guilds_ok and meta and "activity" in sources and hasattr(self.bot.db, "commit_feed_source_boundary"):
                         await self.bot.db.commit_feed_source_boundary(
                             profile_key,
                             "activity",
                             coverage=meta["coverage"],
                             boundary_event_id=meta.get("boundary_event_id"),
+                            now=health_now,
                         )
                 except Exception as e:
                     logger.warning("Error polling activity for %s: %s", username, e)

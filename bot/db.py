@@ -341,6 +341,12 @@ class Database:
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         return str(value)
 
+    @classmethod
+    def _now_utc_sql_timestamp(cls, value: Optional[Any]) -> str:
+        from datetime import datetime, timezone
+        current = value if value is not None else datetime.now(timezone.utc)
+        return cls._format_utc_sql_timestamp(current)
+
     # =========================================================================
     # User Account Linking
     # =========================================================================
@@ -515,6 +521,25 @@ class Database:
         )
         return row is not None
 
+    async def get_profiles_library_subscription_map(
+        self, profile_keys: Iterable[str],
+    ) -> dict[str, bool]:
+        """Return linked-member subscription evidence for normalized profiles in bounded chunks."""
+        normalized = list(dict.fromkeys(
+            key.strip().lower() for key in profile_keys if key and key.strip()
+        ))
+        result = {key: False for key in normalized}
+        for chunk in _iter_sql_chunks(normalized):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT DISTINCT profile_key FROM linked_users
+                    WHERE profile_key IN ({placeholders})""",
+                chunk,
+            )
+            for row in rows:
+                result[row["profile_key"]] = True
+        return result
+
     async def get_profile(self, username: str) -> Optional[Any]:
         """Fetch canonical profile data without attributing it to one Discord member."""
         return await self._fetchone("""
@@ -634,20 +659,34 @@ class Database:
         return [profiles[key] for key in sorted(profiles)]
 
     async def set_guild_feed_preference(
-        self, guild_id: int, discord_id: int, enabled: bool
+        self,
+        guild_id: int,
+        discord_id: int,
+        enabled: bool,
+        *,
+        member_ids: Optional[Iterable[int]] = None,
     ) -> Optional[str]:
         """Set a member's server-local feed preference; return their profile key."""
-        linked = await self.get_linked_user(discord_id)
-        if not linked:
-            return None
-        await self._execute(
-            """INSERT INTO guild_feed_preferences (guild_id, discord_id, enabled, updated_at)
-               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(guild_id, discord_id) DO UPDATE SET
-                   enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP""",
-            (guild_id, discord_id, bool(enabled)),
-        )
-        return linked["profile_key"]
+        async with self._transaction() as tx:
+            linked = await tx.fetchone(
+                "SELECT profile_key FROM linked_users WHERE discord_id = ? LIMIT 1",
+                (discord_id,),
+            )
+            if not linked:
+                return None
+            profile_key = linked["profile_key"]
+            if enabled and member_ids is not None:
+                await self._resolve_pending_reconciliation_tx(
+                    tx, guild_id, member_ids, profile_key=profile_key,
+                )
+            await tx.execute(
+                """INSERT INTO guild_feed_preferences (guild_id, discord_id, enabled, updated_at)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(guild_id, discord_id) DO UPDATE SET
+                       enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP""",
+                (guild_id, discord_id, bool(enabled)),
+            )
+            return profile_key
 
     async def get_guild_feed_preference(self, guild_id: int, discord_id: int) -> bool:
         """Absent member preferences are disabled."""
@@ -910,15 +949,29 @@ class Database:
                 if int(cid) != removed_discord_id and int(cid) in stored_member_set
             ]
             if not still_prior_admin and not narrowed_candidates:
-                await self._deactivate_guild_profile_tx(tx, guild_id, profile_key)
+                if present_member_ids is not None or (not stored_member_ids and not has_admin):
+                    await self._deactivate_guild_profile_tx(tx, guild_id, profile_key)
+                    await tx.execute(
+                        "DELETE FROM guild_profile_feed_reconciliation WHERE guild_id = ? AND profile_key = ?",
+                        (guild_id, profile_key),
+                    )
+                    return {
+                        "profile_key": profile_key,
+                        "deactivated": True,
+                        "pending_reconciliation": False,
+                        "has_admin": False,
+                        "remaining_members": [],
+                    }
                 await tx.execute(
-                    "DELETE FROM guild_profile_feed_reconciliation WHERE guild_id = ? AND profile_key = ?",
+                    """UPDATE guild_profile_feed_reconciliation
+                       SET had_admin_source = 0, candidate_member_ids = '[]'
+                       WHERE guild_id = ? AND profile_key = ?""",
                     (guild_id, profile_key),
                 )
                 return {
                     "profile_key": profile_key,
-                    "deactivated": True,
-                    "pending_reconciliation": False,
+                    "deactivated": False,
+                    "pending_reconciliation": True,
                     "has_admin": False,
                     "remaining_members": [],
                 }
@@ -1129,28 +1182,39 @@ class Database:
         return matching
 
     async def add_guild_admin_follow(
-        self, guild_id: int, username: str, avatar_url: Optional[str], added_by: int
+        self,
+        guild_id: int,
+        username: str,
+        avatar_url: Optional[str],
+        added_by: int,
+        *,
+        member_ids: Optional[Iterable[int]] = None,
     ) -> bool:
         """Add an idempotent server follow to a validated public profile."""
         from bot.ui.helpers import clean_image_url
         display_username = username.strip()
         profile_key = display_username.lower()
         clean_avatar = clean_image_url(avatar_url)
-        await self._execute(
-            """INSERT INTO profiles (profile_key, display_username, avatar_url)
-               VALUES (?, ?, ?)
-               ON CONFLICT(profile_key) DO UPDATE SET
-                   display_username = excluded.display_username,
-                   avatar_url = COALESCE(excluded.avatar_url, profiles.avatar_url)""",
-            (profile_key, display_username, clean_avatar),
-        )
-        inserted = await self._rowcount_execute(
-            """INSERT OR IGNORE INTO guild_admin_follows
-               (guild_id, profile_key, display_username, avatar_url, added_by)
-               VALUES (?, ?, ?, ?, ?)""",
-            (guild_id, profile_key, display_username, clean_avatar, added_by),
-        )
-        return inserted > 0
+        async with self._transaction() as tx:
+            if member_ids is not None:
+                await self._resolve_pending_reconciliation_tx(
+                    tx, guild_id, member_ids, profile_key=profile_key,
+                )
+            await tx.execute(
+                """INSERT INTO profiles (profile_key, display_username, avatar_url)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(profile_key) DO UPDATE SET
+                       display_username = excluded.display_username,
+                       avatar_url = COALESCE(excluded.avatar_url, profiles.avatar_url)""",
+                (profile_key, display_username, clean_avatar),
+            )
+            inserted = await tx.execute(
+                """INSERT OR IGNORE INTO guild_admin_follows
+                   (guild_id, profile_key, display_username, avatar_url, added_by)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (guild_id, profile_key, display_username, clean_avatar, added_by),
+            )
+            return inserted > 0
 
     async def remove_guild_admin_follow(self, guild_id: int, username: str) -> bool:
         return await self._rowcount_execute(
@@ -1169,6 +1233,7 @@ class Database:
         return {
             "active": False,
             "last_active_at": None,
+            "pending_reconciliation": False,
             "initialized_sources": [],
             "suppression_counts": {},
             "delivery_counts": {},
@@ -1189,20 +1254,28 @@ class Database:
             key: self._empty_feed_status() for key in normalized_keys
         }
 
-        for chunk in _iter_sql_chunks(normalized_keys, fixed_params=1):
+        for chunk in _iter_sql_chunks(normalized_keys, fixed_params=2):
             placeholders = ",".join("?" for _ in chunk)
             params = [guild_id, *chunk]
+            activity_params = [guild_id, guild_id, *chunk]
 
             activity_rows = await self._fetchall(
-                f"""SELECT profile_key, active, last_active_at
-                    FROM guild_profile_feed_activity
-                    WHERE guild_id = ? AND profile_key IN ({placeholders})""",
-                params,
+                f"""SELECT profile.profile_key, COALESCE(activity.active, 0) AS active,
+                           activity.last_active_at,
+                           pending.profile_key IS NOT NULL AS pending_reconciliation
+                    FROM profiles AS profile
+                    LEFT JOIN guild_profile_feed_activity AS activity
+                      ON activity.guild_id = ? AND activity.profile_key = profile.profile_key
+                    LEFT JOIN guild_profile_feed_reconciliation AS pending
+                      ON pending.guild_id = ? AND pending.profile_key = profile.profile_key
+                    WHERE profile.profile_key IN ({placeholders})""",
+                activity_params,
             )
             for row in activity_rows:
                 entry = results[row["profile_key"]]
                 entry["active"] = bool(row["active"])
                 entry["last_active_at"] = row["last_active_at"]
+                entry["pending_reconciliation"] = bool(row["pending_reconciliation"])
 
             source_rows = await self._fetchall(
                 f"""SELECT profile_key, source
@@ -1295,15 +1368,18 @@ class Database:
         )
         return row["last_active_at"] if row else None
 
-    async def record_feed_source_attempt(self, profile_key: str, source: str) -> None:
+    async def record_feed_source_attempt(
+        self, profile_key: str, source: str, *, now: Optional[Any] = None,
+    ) -> None:
+        now_sql = self._now_utc_sql_timestamp(now)
         await self._execute(
             """INSERT INTO profile_feed_source_health
                (profile_key, source, attempts, last_attempt_at)
-               VALUES (?, ?, 1, CURRENT_TIMESTAMP)
+               VALUES (?, ?, 1, ?)
                ON CONFLICT(profile_key, source) DO UPDATE SET
                    attempts = profile_feed_source_health.attempts + 1,
-                   last_attempt_at = CURRENT_TIMESTAMP""",
-            (profile_key.strip().lower(), source),
+                   last_attempt_at = excluded.last_attempt_at""",
+            (profile_key.strip().lower(), source, now_sql),
         )
 
     async def record_feed_source_success(
@@ -1316,25 +1392,28 @@ class Database:
         boundary_event_id: Optional[str] = None,
         defer_boundary_commit: bool = False,
         gap_until: Optional[Any] = None,
+        now: Optional[Any] = None,
     ) -> None:
         closes_gap = coverage == "exhausted" or (coverage == "boundary_reached" and bool(boundary_event_id))
         commit_boundary = bool(closes_gap and not defer_boundary_commit)
-        gap_until_sql = self._format_utc_sql_timestamp(gap_until)
+        now_sql = self._now_utc_sql_timestamp(now)
+        # Event occurrence timestamps do not prove the endpoint of a coverage
+        # gap. Keep the argument for compatible callers, but never persist it.
+        _ = gap_until
         await self._execute(
             """INSERT INTO profile_feed_source_health
                (profile_key, source, attempts, successes, last_attempt_at, last_success_at,
                 coverage, pages_read, last_continuous_boundary_event_id,
                 last_continuous_boundary_at, unresolved_gap_since, unresolved_gap_until,
                 gap_reason, last_error)
-               VALUES (?, ?, 0, 1, NULL, CURRENT_TIMESTAMP, ?, ?,
+               VALUES (?, ?, 0, 1, NULL, ?, ?, ?,
                        CASE WHEN ? THEN ? ELSE NULL END,
-                       CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
-                       CASE WHEN ? THEN NULL ELSE CURRENT_TIMESTAMP END,
-                       CASE WHEN ? THEN NULL ELSE COALESCE(?, CURRENT_TIMESTAMP) END,
-                       CASE WHEN ? THEN NULL ELSE ? END, NULL)
+                       CASE WHEN ? THEN ? ELSE NULL END,
+                       NULL, NULL,
+                       CASE WHEN ? THEN NULL WHEN ? THEN NULL ELSE ? END, NULL)
                ON CONFLICT(profile_key, source) DO UPDATE SET
                    successes = profile_feed_source_health.successes + 1,
-                   last_success_at = CURRENT_TIMESTAMP,
+                   last_success_at = excluded.last_success_at,
                    coverage = excluded.coverage,
                    pages_read = excluded.pages_read,
                    last_continuous_boundary_event_id = CASE
@@ -1342,24 +1421,16 @@ class Database:
                        ELSE profile_feed_source_health.last_continuous_boundary_event_id
                    END,
                    last_continuous_boundary_at = CASE
-                       WHEN ? THEN CURRENT_TIMESTAMP
+                       WHEN ? THEN excluded.last_continuous_boundary_at
                        ELSE profile_feed_source_health.last_continuous_boundary_at
                    END,
                    unresolved_gap_since = CASE
                        WHEN ? THEN NULL
                        WHEN ? THEN profile_feed_source_health.unresolved_gap_since
-                       ELSE COALESCE(
-                           profile_feed_source_health.unresolved_gap_since,
-                           profile_feed_source_health.last_continuous_boundary_at,
-                           profile_feed_source_health.last_success_at,
-                           CURRENT_TIMESTAMP
-                       )
+                       ELSE COALESCE(profile_feed_source_health.unresolved_gap_since,
+                                     profile_feed_source_health.last_continuous_boundary_at)
                    END,
-                   unresolved_gap_until = CASE
-                       WHEN ? THEN NULL
-                       WHEN ? THEN profile_feed_source_health.unresolved_gap_until
-                       ELSE COALESCE(?, CURRENT_TIMESTAMP)
-                   END,
+                   unresolved_gap_until = NULL,
                    gap_reason = CASE
                        WHEN ? THEN NULL
                        WHEN ? THEN profile_feed_source_health.gap_reason
@@ -1369,23 +1440,20 @@ class Database:
             (
                 profile_key.strip().lower(),
                 source,
+                now_sql,
                 coverage,
                 pages_read,
                 commit_boundary,
                 boundary_event_id,
                 commit_boundary,
-                bool(closes_gap),
-                bool(closes_gap),
-                gap_until_sql,
+                now_sql,
+                commit_boundary,
                 bool(closes_gap),
                 coverage,
                 commit_boundary,
                 commit_boundary,
                 commit_boundary,
                 bool(closes_gap),
-                commit_boundary,
-                bool(closes_gap),
-                gap_until_sql,
                 commit_boundary,
                 bool(closes_gap),
                 coverage,
@@ -1399,28 +1467,44 @@ class Database:
         *,
         coverage: str,
         boundary_event_id: Optional[str] = None,
+        now: Optional[Any] = None,
     ) -> None:
         """Advance continuous boundary and clear unresolved gaps after delivery finishes."""
         closes_gap = coverage == "exhausted" or (coverage == "boundary_reached" and bool(boundary_event_id))
         if not closes_gap:
             return
+        now_sql = self._now_utc_sql_timestamp(now)
         await self._execute(
             """UPDATE profile_feed_source_health
                SET last_continuous_boundary_event_id = COALESCE(?, last_continuous_boundary_event_id),
-                   last_continuous_boundary_at = CURRENT_TIMESTAMP,
+                   last_continuous_boundary_at = ?,
                    unresolved_gap_since = NULL,
                    unresolved_gap_until = NULL,
                    gap_reason = NULL
                WHERE profile_key = ? AND source = ?""",
-            (boundary_event_id, profile_key.strip().lower(), source),
+            (boundary_event_id, now_sql, profile_key.strip().lower(), source),
         )
 
     async def record_feed_source_failure(self, profile_key: str, source: str, error: str) -> None:
         await self._execute(
             """INSERT INTO profile_feed_source_health
-               (profile_key, source, attempts, last_attempt_at, last_error)
-               VALUES (?, ?, 0, NULL, ?)
-               ON CONFLICT(profile_key, source) DO UPDATE SET last_error = excluded.last_error""",
+               (profile_key, source, attempts, last_attempt_at, last_error,
+                unresolved_gap_since, unresolved_gap_until, gap_reason)
+               VALUES (?, ?, 0, NULL, ?, NULL, NULL, NULL)
+               ON CONFLICT(profile_key, source) DO UPDATE SET
+                   last_error = excluded.last_error,
+                   unresolved_gap_since = COALESCE(
+                       profile_feed_source_health.unresolved_gap_since,
+                       profile_feed_source_health.last_continuous_boundary_at
+                   ),
+                   unresolved_gap_until = NULL,
+                   gap_reason = CASE
+                       WHEN profile_feed_source_health.gap_reason IS NOT NULL
+                           THEN profile_feed_source_health.gap_reason
+                       WHEN profile_feed_source_health.last_continuous_boundary_at IS NOT NULL
+                           THEN 'source_failure'
+                       ELSE NULL
+                   END""",
             (profile_key.strip().lower(), source, str(error)[:500]),
         )
 
@@ -1478,14 +1562,186 @@ class Database:
         event_date: Optional[str],
     ) -> None:
         """Allow an ambiguous candidate to resolve only after strong identity evidence."""
-        await self._execute(
-            """UPDATE profile_feed_decisions
-               SET decision = 'eligible', reason = 'resolved_by_stable_reference',
-                   event_date = COALESCE(?, event_date), payload = ?
-               WHERE guild_id = ? AND profile_key = ? AND event_id = ?
-                 AND decision = 'held_ambiguous'""",
-            (event_date, payload, guild_id, profile_key.strip().lower(), event_id),
+        await self.persist_feed_identity_decisions(
+            guild_id,
+            profile_key,
+            operations=[{
+                "kind": "resolve",
+                "event_id": event_id,
+                "event_date": event_date,
+                "payload": payload,
+            }],
         )
+
+    async def persist_feed_identity_decisions(
+        self,
+        guild_id: int,
+        profile_key: str,
+        *,
+        operations: Iterable[dict[str, Any]],
+    ) -> None:
+        """Apply ordered ambiguity and strong-reference decisions in bounded SQL batches.
+
+        Ambiguity is insert-once, so a retry keeps the first observation time. A
+        stable-reference resolution only tightens an existing ambiguous decision
+        and cannot alter protected delivery/archive records.
+        """
+        normalized_key = profile_key.strip().lower()
+        ordered_operations = []
+        event_ids = []
+        resolution_ids = set()
+        for operation in operations:
+            event_id = operation.get("event_id")
+            kind = operation.get("kind")
+            if not event_id or kind not in {"ambiguity", "resolve"}:
+                continue
+            ordered_operations.append(dict(operation))
+            if event_id not in event_ids:
+                event_ids.append(event_id)
+            if kind == "resolve":
+                resolution_ids.add(event_id)
+        if not ordered_operations:
+            return
+
+        async with self._transaction() as tx:
+            current_rows: dict[str, Any] = {}
+            for chunk in _iter_sql_chunks(event_ids, fixed_params=2):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = await tx.fetchall(
+                    f"""SELECT event_id, source, event_date, decision, reason, payload, observed_at
+                        FROM profile_feed_decisions
+                        WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})""",
+                    [guild_id, normalized_key, *chunk],
+                )
+                current_rows.update((row["event_id"], row) for row in rows)
+
+            protected_ids: set[str] = set()
+            for chunk in _iter_sql_chunks(sorted(resolution_ids), fixed_params=2):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = await tx.fetchall(
+                    f"""SELECT event_id FROM profile_feed_messages
+                        WHERE guild_id = ? AND profile_key = ? AND event_id IN ({placeholders})
+                          AND (message_id IS NOT NULL
+                               OR delivery_state IN ('sent', 'deleted', 'pending', 'unknown'))""",
+                    [guild_id, normalized_key, *chunk],
+                )
+                protected_ids.update(row["event_id"] for row in rows)
+
+            states = {
+                event_id: row["decision"] if row is not None else None
+                for event_id, row in current_rows.items()
+            }
+            for event_id in event_ids:
+                states.setdefault(event_id, None)
+            inserts: dict[str, dict[str, Any]] = {}
+            revisions: dict[str, dict[str, Any]] = {}
+
+            # Replay request-local operations in order. This retains first-seen
+            # timestamps while allowing later strong evidence in the same request
+            # to resolve only a held ambiguous candidate.
+            for operation in ordered_operations:
+                event_id = operation["event_id"]
+                if operation["kind"] == "ambiguity":
+                    if states[event_id] is not None:
+                        continue
+                    inserts[event_id] = {
+                        "event_id": event_id,
+                        "source": operation["source"],
+                        "event_date": operation.get("event_date"),
+                        "decision": "held_ambiguous",
+                        "reason": operation["reason"],
+                        "payload": operation["payload"],
+                        "observed_at": self._format_utc_sql_timestamp(
+                            operation.get("observed_at")
+                        ),
+                    }
+                    states[event_id] = "held_ambiguous"
+                    continue
+
+                if states[event_id] != "held_ambiguous" or event_id in protected_ids:
+                    continue
+                if event_id in inserts:
+                    inserted = inserts[event_id]
+                    inserted.update({
+                        "decision": "eligible",
+                        "reason": "resolved_by_stable_reference",
+                        "event_date": operation.get("event_date") or inserted["event_date"],
+                        "payload": operation["payload"],
+                    })
+                else:
+                    revisions[event_id] = {
+                        "event_id": event_id,
+                        "event_date": operation.get("event_date"),
+                        "payload": operation["payload"],
+                    }
+                states[event_id] = "eligible"
+
+            insert_rows = [
+                (
+                    guild_id,
+                    normalized_key,
+                    item["event_id"],
+                    item["source"],
+                    item["event_date"],
+                    item["decision"],
+                    item["reason"],
+                    item["payload"],
+                    item["observed_at"],
+                )
+                for item in inserts.values()
+            ]
+            for batch in _iter_bounded_row_batches(
+                insert_rows,
+                params_per_row=9,
+                fixed_params=0,
+                fixed_sql_bytes=256,
+            ):
+                values_sql = ", ".join(
+                    ["(?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))"] * len(batch)
+                )
+                await tx.execute(
+                    f"""INSERT OR IGNORE INTO profile_feed_decisions
+                        (guild_id, profile_key, event_id, source, event_date, decision, reason, payload, observed_at)
+                        VALUES {values_sql}""",
+                    [value for row in batch for value in row],
+                )
+
+            revision_rows = [
+                (event_id, item["event_date"], item["payload"])
+                for event_id, item in revisions.items()
+            ]
+            for batch in _iter_bounded_row_batches(
+                revision_rows,
+                params_per_row=3,
+                fixed_params=2,
+                fixed_sql_bytes=1024,
+            ):
+                values_sql = ", ".join(["(?, ?, ?)"] * len(batch))
+                await tx.execute(
+                    f"""WITH resolutions(event_id, event_date, payload) AS (VALUES {values_sql})
+                        UPDATE profile_feed_decisions
+                        SET decision = 'eligible',
+                            reason = 'resolved_by_stable_reference',
+                            event_date = COALESCE(
+                                (SELECT event_date FROM resolutions
+                                 WHERE resolutions.event_id = profile_feed_decisions.event_id),
+                                profile_feed_decisions.event_date
+                            ),
+                            payload = (SELECT payload FROM resolutions
+                                       WHERE resolutions.event_id = profile_feed_decisions.event_id)
+                        WHERE guild_id = ? AND profile_key = ?
+                          AND decision = 'held_ambiguous'
+                          AND event_id IN (SELECT event_id FROM resolutions)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM profile_feed_messages AS message
+                              WHERE message.guild_id = profile_feed_decisions.guild_id
+                                AND message.profile_key = profile_feed_decisions.profile_key
+                                AND message.event_id = profile_feed_decisions.event_id
+                                AND (message.message_id IS NOT NULL
+                                     OR message.delivery_state IN ('sent', 'deleted', 'pending', 'unknown'))
+                          )""",
+                    [value for row in batch for value in row] + [guild_id, normalized_key],
+                )
 
     async def has_feed_source(self, guild_id: int, profile_key: str, source: str) -> bool:
         return await self._fetchone(
@@ -1793,16 +2049,20 @@ class Database:
             (guild_id,),
         )
 
-    async def record_feed_target_gap(self, profile_key: str) -> None:
+    async def record_feed_target_gap(self, profile_key: str, *, now: Optional[Any] = None) -> None:
         """Disclose incomplete recipient processing without claiming an upstream error."""
+        now_sql = self._now_utc_sql_timestamp(now)
         await self._execute(
             """UPDATE profile_feed_source_health
-               SET unresolved_gap_since = COALESCE(unresolved_gap_since,
-                       last_continuous_boundary_at, last_success_at, CURRENT_TIMESTAMP),
-                   unresolved_gap_until = CURRENT_TIMESTAMP,
-                   gap_reason = COALESCE(gap_reason, 'unavailable_feed_target')
+               SET unresolved_gap_since = COALESCE(unresolved_gap_since, ?),
+                   unresolved_gap_until = NULL,
+                   gap_reason = CASE
+                       WHEN unresolved_gap_since IS NULL
+                           THEN 'unavailable_feed_target'
+                       ELSE COALESCE(gap_reason, 'unavailable_feed_target')
+                   END
                WHERE profile_key = ? AND source = 'activity'""",
-            (profile_key,),
+            (now_sql, profile_key,),
         )
 
     async def get_guild_feed_candidates(

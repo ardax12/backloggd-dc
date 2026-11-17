@@ -39,8 +39,71 @@ class StatsCog(commands.Cog, name="Stats"):
         self.played_count_timeout = max(0.0, float(played_count_timeout))
         self.profile_count_concurrency = max(1, int(profile_count_concurrency))
         self._profile_count_slots = asyncio.Semaphore(self.profile_count_concurrency)
+        self._closing = False
+        self._profile_count_workers: set[asyncio.Task] = set()
+        self._active_count_operations: set[asyncio.Task] = set()
+        self._close_task: asyncio.Task | None = None
+
+    async def close(self) -> None:
+        """Stop count work and wait for all SDK workers to unwind."""
+        self._closing = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._drain_count_work())
+        drain_task = self._close_task
+        try:
+            await asyncio.shield(drain_task)
+        except asyncio.CancelledError:
+            # Do not let bot shutdown cancellation close the SDK underneath a
+            # worker that is still unwinding its request.
+            await asyncio.shield(drain_task)
+            raise
+
+    async def _drain_count_work(self) -> None:
+        current = asyncio.current_task()
+        operations = [
+            task for task in self._active_count_operations
+            if task is not current and not task.done()
+        ]
+        for task in operations:
+            task.cancel()
+        if operations:
+            # Each count operation owns cancellation and gathering of its
+            # workers. Let that cleanup run once before handling any orphan.
+            await asyncio.gather(*operations, return_exceptions=True)
+
+        workers = [
+            task for task in self._profile_count_workers
+            if task is not current and not task.done()
+        ]
+        for task in workers:
+            task.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def cog_unload(self) -> None:
+        await self.close()
 
     async def _played_tab_counts(
+        self,
+        member_ids: List[int],
+        *,
+        profiles: Optional[Sequence[dict]] = None,
+        timeout: Optional[float] = None,
+    ) -> dict:
+        if self._closing:
+            raise asyncio.CancelledError
+        operation = asyncio.current_task()
+        if operation is not None:
+            self._active_count_operations.add(operation)
+        try:
+            return await self._run_played_tab_counts(
+                member_ids, profiles=profiles, timeout=timeout,
+            )
+        finally:
+            if operation is not None:
+                self._active_count_operations.discard(operation)
+
+    async def _run_played_tab_counts(
         self,
         member_ids: List[int],
         *,
@@ -86,13 +149,16 @@ class StatsCog(commands.Cog, name="Stats"):
 
         worker_count = min(self.profile_count_concurrency, len(profile_list))
         workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        self._profile_count_workers.update(workers)
+        for task in workers:
+            task.add_done_callback(self._profile_count_workers.discard)
         try:
             _, pending = await asyncio.wait(workers, timeout=deadline)
             if pending:
                 stop_pulling = True
                 for task in pending:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.gather(*workers, return_exceptions=True)
         except BaseException:
             stop_pulling = True
             for task in workers:
@@ -150,6 +216,7 @@ class StatsCog(commands.Cog, name="Stats"):
             guild_member_ids,
             now=self.clock(),
             profiles=context["profiles"],
+            profiles_are_linked=True,
             require_subscribed=True,
         )
 
@@ -230,6 +297,7 @@ class StatsCog(commands.Cog, name="Stats"):
             guild_member_ids,
             now=self.clock(),
             profiles=context["profiles"],
+            profiles_are_linked=True,
             require_subscribed=True,
         )
         stats_helper = getattr(self.bot.db, "_get_server_stats_for_profiles", None)

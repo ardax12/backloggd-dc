@@ -303,7 +303,10 @@ class FeedUnavailableTargetTests(unittest.IsolatedAsyncioTestCase):
 
                     health = await db.get_profile_feed_source("millers", "activity")
                     self.assertEqual(health["last_continuous_boundary_event_id"], "old-1")
-                    self.assertIsNotNone(health["unresolved_gap_since"])
+                    self.assertEqual(health["last_attempt_at"], "2026-11-13 12:00:00")
+                    self.assertEqual(health["last_success_at"], "2026-11-13 12:00:00")
+                    self.assertEqual(health["unresolved_gap_since"], "2026-11-13 12:00:00")
+                    self.assertIsNone(health["unresolved_gap_until"])
                     self.assertEqual(health["gap_reason"], "unavailable_feed_target")
 
                     pending = [r["event_id"] for r in await db.get_pending_feed_observations(1, "millers")]
@@ -332,6 +335,7 @@ class FeedUnavailableTargetTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(del_rows[0]["delivery_state"], "deleted")
                     health_after = await db.get_profile_feed_source("millers", "activity")
                     self.assertIsNone(health_after["unresolved_gap_since"])
+                    self.assertEqual(health_after["last_continuous_boundary_at"], "2026-11-13 12:00:00")
                 finally:
                     await db.close()
 

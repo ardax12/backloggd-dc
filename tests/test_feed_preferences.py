@@ -184,6 +184,83 @@ class FeedPreferenceTests(unittest.IsolatedAsyncioTestCase):
         await self.db.set_guild_feed_preference(1, 11, True)
         self.assertFalse(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
 
+    async def test_unknown_handoff_keeps_pending_state_until_membership_recovery(self):
+        t0 = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+        await self.db.set_guild_feed_preference(1, 10, True)
+        await self.db.set_guild_feed_preference(1, 11, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers"], now=t0)
+        await self.db.seed_feed_source(1, "millers", "activity-display-v1", ["old-event"])
+        await self.db.record_feed_event_decision(
+            1, "millers", "validated-work", source="activity", event_date="2026-11-13",
+            decision="eligible", reason="recent", payload="{}", observed_at=t0,
+        )
+        await self.db.store_feed_message(
+            1, "millers", ("archived-event",), "{}", 501, 100, delivery_state="deleted",
+        )
+
+        await self.db.unlink_user(10)
+        await self.db.link_user(12, "Millers")
+        await self.db.set_guild_feed_preference(1, 12, True)
+        # No authoritative membership snapshot was available at this addition or removal.
+        await self.db.unlink_user(11)
+
+        status = await self.db.get_guild_profile_feed_status(1, "millers")
+        pending = await self.db._fetchone(
+            "SELECT candidate_member_ids FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+        )
+        self.assertTrue(status["active"])
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["candidate_member_ids"], "[]")
+        self.assertTrue(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+        work = await self.db.get_feed_event_decision(1, "millers", "validated-work")
+        self.assertEqual(work["decision"], "eligible")
+        self.assertEqual(work["observed_at"], "2026-11-13 08:00:00")
+
+        # A restart preserves unresolved intent; recovery finds no original continuous source,
+        # so the profile gets a fresh baseline instead of replaying uncertain history.
+        await self.db.close()
+        self.db = Database(str(Path(self.directory.name) / "preferences.db"), turso_url="")
+        await self.db.connect()
+        recovered = await self.db.reconcile_guild_feed_activity(
+            1, ["millers"], now=datetime(2026, 11, 13, 10, 0, tzinfo=timezone.utc),
+            present_member_ids=[12],
+        )
+        self.assertEqual(recovered["activated"], ["millers"])
+        self.assertFalse(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+        self.assertIsNone(await self.db.get_feed_event_decision(1, "millers", "validated-work"))
+        archive = {row["event_id"]: row for row in await self.db.get_feed_messages(1, "millers")}
+        self.assertEqual(archive["archived-event"]["delivery_state"], "deleted")
+
+    async def test_feed_on_uses_authoritative_membership_to_resolve_pending_handoff(self):
+        t0 = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+        await self.db.link_user(12, "Millers")
+        await self.db.set_guild_feed_preference(1, 10, True)
+        await self.db.set_guild_feed_preference(1, 11, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers"], now=t0)
+        await self.db.seed_feed_source(1, "millers", "activity-display-v1", ["old-event"])
+        await self.db.unlink_user(10)
+
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(
+                id=1, chunked=True,
+                members=[SimpleNamespace(id=value) for value in (10, 11, 12)],
+            ),
+            guild_id=1,
+            user=SimpleNamespace(id=12),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        cog = FeedCog(SimpleNamespace(db=self.db))
+        await FeedCog.feed_on.callback(cog, interaction)
+
+        self.assertTrue(await self.db.get_guild_feed_preference(1, 12))
+        self.assertIsNone(await self.db._fetchone(
+            "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+        ))
+        await self.db.unlink_user(11)
+        self.assertTrue((await self.db.get_guild_profile_feed_status(1, "millers"))["active"])
+        self.assertTrue(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+
     async def test_legacy_unlink_and_relink_to_different_profile_does_not_grandfather(self):
         await self.db.set_feed_channel(1, 100)
         await self.db._execute("DELETE FROM schema_migrations WHERE version >= 3")

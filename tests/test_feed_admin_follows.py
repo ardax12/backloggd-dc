@@ -71,6 +71,35 @@ class AdminFeedFollowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count["count"], 0)
         self.assertIn("pending", interaction.followup.send.call_args.args[0].lower())
 
+    async def test_admin_follow_addition_resolves_pending_member_continuity_atomically(self):
+        t0 = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+        for discord_id in (10, 11):
+            await self.db.link_user(discord_id, "PublicPlayer")
+            await self.db.set_guild_feed_preference(1, discord_id, True)
+        await self.db.reconcile_guild_feed_activity(1, ["publicplayer"], now=t0)
+        await self.db.seed_feed_source(1, "publicplayer", "activity-display-v1", ["old-event"])
+        await self.db.record_feed_event_decision(
+            1, "publicplayer", "validated-work", source="activity", event_date="2026-11-13",
+            decision="eligible", reason="recent", payload="{}", observed_at=t0,
+        )
+        await self.db.unlink_user(10)
+
+        await FeedCog.feed_add.callback(
+            self.cog, self.interaction(member_ids=[10, 11, 99]), "PublicPlayer",
+        )
+        self.assertIsNone(await self.db._fetchone(
+            "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'publicplayer'"
+        ))
+        await self.db.unlink_user(11)
+
+        status = await self.db.get_guild_profile_feed_status(1, "publicplayer")
+        self.assertTrue(status["active"])
+        self.assertTrue(await self.db.has_feed_source(1, "publicplayer", "activity-display-v1"))
+        self.assertEqual(
+            (await self.db.get_feed_event_decision(1, "publicplayer", "validated-work"))["decision"],
+            "eligible",
+        )
+
     async def test_add_is_case_insensitive_idempotent_and_does_not_replace_creator(self):
         interaction = self.interaction()
         await FeedCog.feed_add.callback(self.cog, interaction, "PublicPlayer")

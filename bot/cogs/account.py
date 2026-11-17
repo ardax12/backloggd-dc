@@ -198,8 +198,10 @@ class AccountCog(commands.Cog, name="Account"):
         safe_linked = escape_display_text(linked_name)
         linked_url = build_backloggd_user_url(linked_name)
         if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
+            guild_members = await get_membership_service(self.bot).get_members(interaction.guild)
+            member_ids = [member.id for member in guild_members] if guild_members is not None else None
             await self.bot.db.set_guild_feed_preference(
-                interaction.guild_id, interaction.user.id, True
+                interaction.guild_id, interaction.user.id, True, member_ids=member_ids,
             )
             participation = " Your profile is also enabled for this server's activity feed."
         else:
@@ -268,6 +270,13 @@ class AccountCog(commands.Cog, name="Account"):
             )
             return
 
+        guild_members = None
+        member_ids = None
+        if interaction.guild is not None:
+            guild_members = await get_membership_service(self.bot).get_members(interaction.guild)
+            if guild_members is not None:
+                member_ids = [member.id for member in guild_members]
+
         linked = await self.bot.db.link_user_if_unlinked(
             discord_id=interaction.user.id,
             username=profile.username,
@@ -294,7 +303,7 @@ class AccountCog(commands.Cog, name="Account"):
 
         if interaction.guild is not None and hasattr(self.bot.db, "set_guild_feed_preference"):
             await self.bot.db.set_guild_feed_preference(
-                interaction.guild_id, interaction.user.id, True
+                interaction.guild_id, interaction.user.id, True, member_ids=member_ids,
             )
         await self._seed_sync_state(profile.username)
 
@@ -314,20 +323,18 @@ class AccountCog(commands.Cog, name="Account"):
             embed.set_thumbnail(url=clean_avatar)
 
         duplicate_names = []
-        if interaction.guild:
-            guild_members = await get_membership_service(self.bot).get_members(interaction.guild)
-            if guild_members is not None:
-                members = {member.id: member for member in guild_members}
-                connections = await self.bot.db.get_profile_connections(
-                    profile.username,
-                    list(members),
-                    exclude_discord_id=interaction.user.id,
-                )
-                duplicate_names = [
-                    escape_display_text(members[row["discord_id"]].display_name)
-                    for row in connections
-                    if row["discord_id"] in members
-                ]
+        if interaction.guild and guild_members is not None:
+            members = {member.id: member for member in guild_members}
+            connections = await self.bot.db.get_profile_connections(
+                profile.username,
+                list(members),
+                exclude_discord_id=interaction.user.id,
+            )
+            duplicate_names = [
+                escape_display_text(members[row["discord_id"]].display_name)
+                for row in connections
+                if row["discord_id"] in members
+            ]
         if duplicate_names:
             disclaimer = "\nThese are separate public-profile links; they do not prove who owns the profile."
             shown_names = duplicate_names[:8]

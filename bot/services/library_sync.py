@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Optional
 logger = logging.getLogger("backloggd.library_sync")
 
 SyncOperation = Callable[[], Awaitable[Optional[int]]]
+_SYNC_INFO_NOT_SUPPLIED = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,17 +253,21 @@ async def seed_profile_sync_state(
     *,
     service: Optional[LibrarySyncService] = None,
     now=None,
+    sync_info: Any = _SYNC_INFO_NOT_SUPPLIED,
 ) -> None:
     """Seed coordinator cooldown/backoff state from persisted profile sync metadata."""
     target_service = service if service is not None else getattr(bot, "library_sync", None)
     db = getattr(bot, "db", None)
     if target_service is None or db is None:
         return
-    getter = getattr(db, "get_profile_sync_info", None)
-    if getter is None:
-        return
     profile_key = username.strip().lower()
-    info = await getter(profile_key)
+    if sync_info is _SYNC_INFO_NOT_SUPPLIED:
+        getter = getattr(db, "get_profile_sync_info", None)
+        if getter is None:
+            return
+        info = await getter(profile_key)
+    else:
+        info = sync_info
     if not info:
         return
     if hasattr(target_service, "seed_from_sync_info"):
@@ -493,6 +498,7 @@ async def schedule_profile_refresh(
     now=None,
     require_subscribed: bool = True,
     subscribed: Optional[bool] = None,
+    sync_info: Any = _SYNC_INFO_NOT_SUPPLIED,
 ) -> Optional[asyncio.Task]:
     """Coalesce a background full-library refresh through the shared LibrarySyncService."""
     service: Optional[LibrarySyncService] = getattr(bot, "library_sync", None)
@@ -506,7 +512,9 @@ async def schedule_profile_refresh(
         elif hasattr(bot.db, "is_profile_library_subscribed"):
             if not await bot.db.is_profile_library_subscribed(profile_key):
                 return None
-    await seed_profile_sync_state(bot, username, service=service, now=now)
+    await seed_profile_sync_state(
+        bot, username, service=service, now=now, sync_info=sync_info,
+    )
     return service.request(
         profile_key,
         lambda: sync_profile_library(bot, username, synced_at=now),

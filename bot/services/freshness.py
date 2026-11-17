@@ -180,17 +180,33 @@ async def ensure_profiles_fresh(
     service: Optional[LibrarySyncService] = getattr(bot, "library_sync", None)
     sync_map = await _fetch_sync_info_map(db, deduped)
 
-    statuses: dict[str, ProfileFreshness] = {}
-    for key, (name, _) in deduped.items():
-        info = sync_map.get(key)
-        status = evaluate_profile_freshness(
-            info,
+    statuses = {
+        key: evaluate_profile_freshness(
+            sync_map.get(key),
             profile_key=key,
             username=name,
             now=current_now,
             library_sync=service,
             freshness_window_seconds=freshness_window_seconds,
         )
+        for key, (name, _) in deduped.items()
+    }
+    stale_keys = [key for key, status in statuses.items() if status.stale]
+    subscription_evidence: dict[str, bool] = {}
+    if service is not None and require_subscribed and subscribed is None and stale_keys:
+        subscription_getter = getattr(db, "get_profiles_library_subscription_map", None)
+        if callable(subscription_getter):
+            fetched_subscriptions = await subscription_getter(stale_keys)
+            if isinstance(fetched_subscriptions, dict):
+                subscription_evidence = {
+                    key: bool(fetched_subscriptions[key])
+                    for key in stale_keys
+                    if key in fetched_subscriptions
+                }
+
+    for key, (name, _) in deduped.items():
+        status = statuses[key]
+        info = sync_map.get(key)
         if status.stale and service is not None:
             await schedule_profile_refresh(
                 bot,
@@ -198,9 +214,13 @@ async def ensure_profiles_fresh(
                 freshness_window_seconds=freshness_window_seconds,
                 now=current_now,
                 require_subscribed=require_subscribed,
-                subscribed=subscribed,
+                subscribed=(
+                    subscribed if subscribed is not None
+                    else subscription_evidence.get(key)
+                ),
+                sync_info=info,
             )
-            status = evaluate_profile_freshness(
+            statuses[key] = evaluate_profile_freshness(
                 info,
                 profile_key=key,
                 username=status.username,
@@ -208,7 +228,6 @@ async def ensure_profiles_fresh(
                 library_sync=service,
                 freshness_window_seconds=freshness_window_seconds,
             )
-        statuses[key] = status
     return statuses
 
 
@@ -301,9 +320,11 @@ async def resolve_guild_aggregate_freshness(
     *,
     now: Optional[datetime] = None,
     profiles: Optional[Iterable[Any]] = None,
+    profiles_are_linked: bool = False,
     require_subscribed: bool = True,
 ) -> Optional[str]:
-    """Evaluate guild-wide aggregate freshness, reusing resolved profile context when supplied."""
+    """Evaluate guild freshness; skip subscription reads only with linked-member evidence."""
+    linked_evidence = profiles is None or profiles_are_linked
     if profiles is None:
         db = getattr(bot, "db", None)
         if db is None:
@@ -326,5 +347,6 @@ async def resolve_guild_aggregate_freshness(
         profile_list,
         now=now,
         require_subscribed=require_subscribed,
+        subscribed=True if require_subscribed and linked_evidence else None,
     )
     return format_aggregate_freshness(summarize_aggregate_freshness(statuses.values()))

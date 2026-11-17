@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["TURSO_DATABASE_URL"] = ""
@@ -380,6 +381,192 @@ class DbTransactionAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(admin_res["removed"])
                 self.assertTrue(admin_res["deactivated"])
                 self.assertFalse(await db.has_feed_source(1, "soloadmin", "activity-display-v1"))
+
+    async def test_membership_backed_source_additions_are_atomic_and_keep_handoff_parity(self):
+        t0 = "2026-11-13 08:00:00"
+        for label, db in (("sqlite", self.db), ("turso", self.turso_db)):
+            with self.subTest(backend=label):
+                initial_rollbacks = self.turso_client.rollbacks if label == "turso" else None
+                for discord_id in (10, 11, 12):
+                    await db.link_user(discord_id, "Millers")
+                await db.set_guild_feed_preference(1, 10, True)
+                await db.set_guild_feed_preference(1, 11, True)
+                await db.reconcile_guild_feed_activity(
+                    1, ["millers"], now=t0, present_member_ids=[10, 11],
+                )
+                await db.seed_feed_source(1, "millers", "activity-display-v1", ["old"])
+                await db.record_feed_event_decision(
+                    1, "millers", "validated-work", source="activity", event_date="2026-11-13",
+                    decision="eligible", reason="recent", payload="{}", observed_at=t0,
+                )
+                await db.unlink_user(10)
+
+                # A failure after pending resolution must roll the source and resolution back together.
+                resolve = db._resolve_pending_reconciliation_tx
+
+                async def fail_after_resolve(*args, **kwargs):
+                    await resolve(*args, **kwargs)
+                    raise RuntimeError("abort handoff")
+
+                with patch.object(db, "_resolve_pending_reconciliation_tx", new=fail_after_resolve):
+                    with self.assertRaisesRegex(RuntimeError, "abort handoff"):
+                        await db.set_guild_feed_preference(
+                            1, 12, True, member_ids=[10, 11, 12],
+                        )
+                self.assertIsNotNone(await db._fetchone(
+                    "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+                ))
+                self.assertFalse(await db.get_guild_feed_preference(1, 12))
+                self.assertFalse(db._operation_lock.locked())
+
+                # Cancellation at the same point also restores the pending intent and frees the lock.
+                reached_resolution = asyncio.Event()
+                wait_for_cancel = asyncio.Event()
+
+                async def pause_after_resolve(*args, **kwargs):
+                    await resolve(*args, **kwargs)
+                    reached_resolution.set()
+                    await wait_for_cancel.wait()
+
+                with patch.object(db, "_resolve_pending_reconciliation_tx", new=pause_after_resolve):
+                    task = asyncio.create_task(db.set_guild_feed_preference(
+                        1, 12, True, member_ids=[10, 11, 12],
+                    ))
+                    try:
+                        await asyncio.wait_for(reached_resolution.wait(), timeout=2.0)
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    finally:
+                        wait_for_cancel.set()
+                        if not task.done():
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                self.assertIsNotNone(await db._fetchone(
+                    "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+                ))
+                self.assertFalse(await db.get_guild_feed_preference(1, 12))
+                self.assertFalse(db._operation_lock.locked())
+                if label == "turso":
+                    self.assertEqual(self.turso_client.rollbacks - initial_rollbacks, 2)
+
+                # Retry with authoritative membership proves member 11 bridged the source addition.
+                self.assertEqual(
+                    await db.set_guild_feed_preference(1, 12, True, member_ids=[10, 11, 12]),
+                    "millers",
+                )
+                self.assertIsNone(await db._fetchone(
+                    "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+                ))
+                await db.unlink_user(11)
+                self.assertTrue((await db.get_guild_profile_feed_status(1, "millers"))["active"])
+                self.assertTrue(await db.has_feed_source(1, "millers", "activity-display-v1"))
+                self.assertEqual(
+                    (await db.get_feed_event_decision(1, "millers", "validated-work"))["observed_at"],
+                    t0,
+                )
+
+                # An admin follow can resolve the next handoff with the same atomic evidence.
+                resolve = db._resolve_pending_reconciliation_tx
+
+                async def fail_admin_after_resolve(*args, **kwargs):
+                    await resolve(*args, **kwargs)
+                    raise RuntimeError("abort admin handoff")
+
+                with patch.object(db, "_resolve_pending_reconciliation_tx", new=fail_admin_after_resolve):
+                    with self.assertRaisesRegex(RuntimeError, "abort admin handoff"):
+                        await db.add_guild_admin_follow(
+                            1, "MILLERS", None, 99, member_ids=[12],
+                        )
+                self.assertIsNotNone(await db._fetchone(
+                    "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+                ))
+                self.assertFalse(await db.has_guild_admin_follow(1, "millers"))
+                await db.add_guild_admin_follow(
+                    1, "MILLERS", None, 99, member_ids=[12],
+                )
+                await db.unlink_user(12)
+                self.assertTrue((await db.get_guild_profile_feed_status(1, "millers"))["active"])
+                self.assertTrue(await db.has_guild_admin_follow(1, "millers"))
+
+                # A new admin source cannot bridge an unobserved gap after every original member left.
+                for discord_id in (30, 31, 32):
+                    await db.link_user(discord_id, "Departed")
+                await db.set_guild_feed_preference(1, 30, True)
+                await db.set_guild_feed_preference(1, 31, True)
+                await db.reconcile_guild_feed_activity(1, ["departed"], now=t0)
+                await db.seed_feed_source(1, "departed", "activity-display-v1", ["old"])
+                await db.record_feed_event_decision(
+                    1, "departed", "uncertain-work", source="activity", event_date="2026-11-13",
+                    decision="eligible", reason="recent", payload="{}", observed_at=t0,
+                )
+                await db.unlink_user(30)
+                await db.unlink_user(31)
+                self.assertFalse((await db.get_guild_profile_feed_status(1, "departed"))["active"])
+                await db.add_guild_admin_follow(
+                    1, "Departed", None, 99, member_ids=[32, 99],
+                )
+                self.assertFalse((await db.get_guild_profile_feed_status(1, "departed"))["active"])
+                self.assertFalse(await db.has_feed_source(1, "departed", "activity-display-v1"))
+                self.assertIsNone(await db.get_feed_event_decision(1, "departed", "uncertain-work"))
+
+    async def test_concurrent_source_addition_and_removal_are_serialized_on_both_backends(self):
+        for label, db in (("sqlite", self.db), ("turso", self.turso_db)):
+            with self.subTest(backend=label):
+                for discord_id in (40, 41, 42):
+                    await db.link_user(discord_id, "Concurrent")
+                await db.set_guild_feed_preference(2, 40, True)
+                await db.set_guild_feed_preference(2, 41, True)
+                await db.reconcile_guild_feed_activity(2, ["concurrent"], present_member_ids=[40, 41])
+                await db.seed_feed_source(2, "concurrent", "activity-display-v1", ["old"])
+                await db.record_feed_event_decision(
+                    2, "concurrent", "validated-work", source="activity", event_date="2026-11-13",
+                    decision="eligible", reason="recent", payload="{}", observed_at="2026-11-13 08:00:00",
+                )
+                await db.unlink_user(40)
+
+                resolution_started = asyncio.Event()
+                continue_addition = asyncio.Event()
+                resolve = db._resolve_pending_reconciliation_tx
+
+                async def pause_after_resolution(*args, **kwargs):
+                    result = await resolve(*args, **kwargs)
+                    resolution_started.set()
+                    await continue_addition.wait()
+                    return result
+
+                with patch.object(db, "_resolve_pending_reconciliation_tx", new=pause_after_resolution):
+                    addition = asyncio.create_task(db.set_guild_feed_preference(
+                        2, 42, True, member_ids=[40, 41, 42],
+                    ))
+                    removal_started = asyncio.Event()
+
+                    async def remove_existing_source():
+                        removal_started.set()
+                        return await db.unlink_user(41)
+
+                    removal = None
+                    try:
+                        await asyncio.wait_for(resolution_started.wait(), timeout=2.0)
+                        removal = asyncio.create_task(remove_existing_source())
+                        await asyncio.wait_for(removal_started.wait(), timeout=2.0)
+                        continue_addition.set()
+                        await asyncio.gather(addition, removal)
+                    finally:
+                        continue_addition.set()
+                        for task in (addition, removal):
+                            if task is not None and not task.done():
+                                task.cancel()
+                                await asyncio.gather(task, return_exceptions=True)
+
+                status = await db.get_guild_profile_feed_status(2, "concurrent")
+                self.assertTrue(status["active"])
+                self.assertTrue(await db.has_feed_source(2, "concurrent", "activity-display-v1"))
+                self.assertEqual(
+                    (await db.get_feed_event_decision(2, "concurrent", "validated-work"))["decision"],
+                    "eligible",
+                )
+                self.assertFalse(db._operation_lock.locked())
 
     async def test_link_user_strips_whitespace_and_preserves_overwrite_on_both_backends(self):
         for label, db in (("sqlite", self.db), ("turso", self.turso_db)):

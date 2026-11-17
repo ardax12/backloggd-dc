@@ -305,6 +305,54 @@ class FeedPolicyReadBatchingTests(unittest.IsolatedAsyncioTestCase):
             self.db._fetchone = orig_fetchone
             self.db._fetchall = orig_fetchall
 
+    async def test_final_alias_decision_rejects_earlier_single_alias_event_in_same_poll(self):
+        now = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+        strict_decisions = (
+            "suppressed_pre_activation",
+            "suppressed_old",
+            "held_ambiguous",
+            "held_future",
+            "held_uncertain",
+        )
+        for label, db in (("sqlite", self.db), ("turso", self.turso_db)):
+            await db.link_user(10, "Millers")
+            cog = FeedCog(SimpleNamespace(db=db), clock=lambda: now)
+            for strict_decision in strict_decisions:
+                for reverse in (False, True):
+                    prefix = f"{label}-{strict_decision}-{int(reverse)}"
+                    first_id, second_id = f"{prefix}-a1", f"{prefix}-a2"
+                    await db.record_feed_event_decision(
+                        1, "millers", second_id,
+                        source="activity", event_date="2026-11-01",
+                        decision=strict_decision, reason="preexisting_protection",
+                        payload=json.dumps(asdict(_make_event(second_id))), observed_at=now,
+                    )
+                    single_alias = _make_event(first_id, event_ids=(first_id,))
+                    overlapping = _make_event(
+                        second_id, event_ids=(first_id, second_id),
+                    )
+                    events = [overlapping, single_alias] if reverse else [single_alias, overlapping]
+
+                    accepted = await cog._apply_discovery_policy(1, "millers", events, {}, now)
+
+                    self.assertEqual(
+                        accepted, [],
+                        f"{label}: {strict_decision=} {reverse=}",
+                    )
+                    decisions = await db.get_feed_event_decisions(
+                        1, "millers", [first_id, second_id],
+                    )
+                    self.assertEqual(decisions[first_id]["decision"], strict_decision)
+                    self.assertEqual(decisions[second_id]["decision"], strict_decision)
+                    # A process restart and alias-only retry must still reject the work.
+                    restarted = FeedCog(SimpleNamespace(db=db), clock=lambda: now)
+                    self.assertEqual(
+                        await restarted._apply_discovery_policy(
+                            1, "millers", [_make_event(first_id)], {}, now,
+                        ),
+                        [],
+                    )
+
 
 class FeedPolicyWriteBatchingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

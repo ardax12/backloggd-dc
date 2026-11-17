@@ -391,7 +391,11 @@ class CombinedIntegrationStoryTests(unittest.IsolatedAsyncioTestCase):
         )
         status = await self.db.get_guild_profile_feed_status(1, "millers")
         act_health = next(r for r in status["source_health"] if r["source"] == "activity")
-        self.assertIsNotNone(act_health["unresolved_gap_since"])
+        # The synthetic history above has no committed coverage boundary, so
+        # this outage has unknown extent and must not borrow event dates.
+        self.assertIsNone(act_health["unresolved_gap_since"])
+        self.assertIsNone(act_health["unresolved_gap_until"])
+        self.assertEqual(act_health["gap_reason"], "limited")
         await self.db.record_feed_source_success(
             "millers", "activity", coverage="boundary_reached", pages_read=2, boundary_event_id="new-rate"
         )

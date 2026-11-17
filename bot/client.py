@@ -87,8 +87,12 @@ class BackloggdBot(commands.Bot):
         """Graceful shutdown hook."""
         logger.info("Shutting down BackloggdBot...")
         feed_cog = self.get_cog("Feed")
-        if feed_cog and hasattr(feed_cog, "journal_feed_loop") and feed_cog.journal_feed_loop.is_running():
-            feed_cog.journal_feed_loop.cancel()
+        if feed_cog and hasattr(feed_cog, "close"):
+            await feed_cog.close()
+
+        stats_cog = self.get_cog("Stats")
+        if stats_cog and hasattr(stats_cog, "close"):
+            await stats_cog.close()
 
         account_cog = self.get_cog("Account")
         if account_cog and hasattr(account_cog, "close"):

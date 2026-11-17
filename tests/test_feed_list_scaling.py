@@ -39,6 +39,7 @@ def _normalize_status_for_compare(status: dict) -> dict:
     return {
         "active": bool(status["active"]),
         "last_active_at": status["last_active_at"],
+        "pending_reconciliation": bool(status["pending_reconciliation"]),
         "initialized_sources": list(status["initialized_sources"]),
         "suppression_counts": dict(status["suppression_counts"]),
         "delivery_counts": dict(status["delivery_counts"]),

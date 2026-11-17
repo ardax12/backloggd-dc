@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -109,6 +110,61 @@ class AccountRaceRegressions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("linked", conflict_messages[0].lower())
         self.assertEqual(cog._start_sync_task.call_count, 1)
         self.assertEqual(cog._seed_sync_state.await_count, 1)
+
+    async def test_guild_link_uses_member_snapshot_to_preserve_overlapping_feed_continuity(self):
+        t0 = datetime(2026, 11, 13, 8, 0, tzinfo=timezone.utc)
+        for discord_id in (10, 11):
+            await self.db.link_user(discord_id, "Millers")
+            await self.db.set_guild_feed_preference(1, discord_id, True)
+        await self.db.reconcile_guild_feed_activity(1, ["millers"], now=t0)
+        await self.db.seed_feed_source(1, "millers", "activity-display-v1", ["old-event"])
+        await self.db.record_feed_event_decision(
+            1, "millers", "validated-work", source="activity", event_date="2026-11-13",
+            decision="eligible", reason="recent", payload="{}", observed_at=t0,
+        )
+        await self.db.store_feed_message(
+            1, "millers", ("archived-event",), "{}", 501, 100, delivery_state="deleted",
+        )
+
+        # M1 unlinks in a DM; membership is unavailable to the global unlink operation.
+        await self.db.unlink_user(10)
+        pending = await self.db._fetchone(
+            "SELECT candidate_member_ids FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+        )
+        self.assertEqual(pending["candidate_member_ids"], "[11]")
+
+        api = SimpleNamespace(
+            get_user_profile=AsyncMock(return_value=SimpleNamespace(username="Millers", avatar_url=None))
+        )
+        bot = SimpleNamespace(db=self.db, backloggd=api)
+        cog = AccountCog(bot)
+        cog._seed_sync_state = AsyncMock()
+        cog._start_sync_task = MagicMock()
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=12, display_name="Member 3"),
+            guild=SimpleNamespace(
+                id=1, chunked=True, member_count=3,
+                members=[SimpleNamespace(id=value, display_name=f"Member {value}") for value in (10, 11, 12)],
+            ),
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock(return_value=object())),
+        )
+        await AccountCog.link.callback(cog, interaction, "Millers")
+
+        self.assertIsNone(await self.db._fetchone(
+            "SELECT 1 FROM guild_profile_feed_reconciliation WHERE guild_id = 1 AND profile_key = 'millers'"
+        ))
+        await self.db.unlink_user(11)
+
+        status = await self.db.get_guild_profile_feed_status(1, "millers")
+        self.assertTrue(status["active"])
+        self.assertTrue(await self.db.has_feed_source(1, "millers", "activity-display-v1"))
+        work = await self.db.get_feed_event_decision(1, "millers", "validated-work")
+        self.assertEqual(work["decision"], "eligible")
+        self.assertEqual(work["observed_at"], "2026-11-13 08:00:00")
+        archive = {row["event_id"]: row for row in await self.db.get_feed_messages(1, "millers")}
+        self.assertEqual(archive["archived-event"]["delivery_state"], "deleted")
 
     async def test_unlink_defers_before_slow_database_cleanup(self):
         cleanup_started = asyncio.Event()

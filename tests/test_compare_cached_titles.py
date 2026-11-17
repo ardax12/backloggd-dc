@@ -235,9 +235,153 @@ class CompareCachedTitlesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(count <= _MAX_SQL_BIND_PARAMS for count in fetchall_param_counts))
 
         embed = interaction.followup.send.call_args.kwargs["embed"]
-        # slug-0000 uses cached title; slug-0001 (uncached) falls back cleanly to slug-derived title
+        # slug-0000 uses cached title; slug-0001 keeps its live canonical title
         self.assertIn("Chrono Trigger: Special", embed.fields[0].value)
-        self.assertIn("Slug 0001", embed.fields[0].value)
+        self.assertIn("Slug 1", embed.fields[0].value)
+
+    async def test_compare_uses_canonical_titles_from_uncached_live_libraries(self):
+        games_a = {
+            "final-fantasy-vii-rebirth": GameEntry(
+                slug="final-fantasy-vii-rebirth",
+                title="FINAL FANTASY VII: REBIRTH",
+                rating=5.0,
+                status=GameStatus.PLAYED,
+            ),
+            "persona-5-royal": GameEntry(
+                slug="persona-5-royal",
+                title="Persona_5 *Royal* [Edition](https://evil.example) @everyone",
+                rating=5.0,
+                status=GameStatus.PLAYED,
+            ),
+        }
+        games_b = {
+            "final-fantasy-vii-rebirth": GameEntry(
+                slug="final-fantasy-vii-rebirth",
+                title="Final Fantasy VII: Rebirth",
+                rating=4.5,
+                status=GameStatus.PLAYED,
+            ),
+            "persona-5-royal": GameEntry(
+                slug="persona-5-royal",
+                title="Persona 5 Royal: Special Edition",
+                rating=1.5,
+                status=GameStatus.PLAYED,
+            ),
+        }
+        api = SimpleNamespace(
+            get_user_library=AsyncMock(side_effect=[
+                UserLibrary(username="LiveA", games=games_a),
+                UserLibrary(username="LiveB", games=games_b),
+            ]),
+            get_game=AsyncMock(side_effect=AssertionError("compare must not fetch games individually")),
+        )
+        cog = SocialCog(SimpleNamespace(db=self.db, backloggd=api))
+        interaction = _make_interaction(user_id=101)
+
+        await SocialCog.compare.callback(cog, interaction, "LiveA", "LiveB")
+
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        text = "\n".join(field.value for field in embed.fields)
+        self.assertIn("FINAL FANTASY VII: REBIRTH", text)
+        self.assertNotIn("Final Fantasy Vii Rebirth", text)
+        self.assertIn("Persona\\_5 \\*Royal\\* \\[Edition\\](https://evil.example)", text)
+        self.assertNotIn("\\\\_", text)
+        self.assertNotIn("@everyone", text)
+        self.assertEqual(api.get_user_library.await_count, 2)
+        api.get_game.assert_not_awaited()
+        self.assertEqual(await self.db.get_profile_ratings_dict("LiveA"), {})
+        self.assertEqual(await self.db.get_profile_ratings_dict("LiveB"), {})
+
+    async def test_valid_cached_title_precedes_conflicting_live_titles(self):
+        await self.db._execute(
+            "INSERT INTO cached_games (slug, title) VALUES (?, ?)",
+            ("shared-game", "Cached Canonical Title"),
+        )
+        live_games = {
+            "shared-game": GameEntry(
+                slug="shared-game", title="Live Version A", rating=5.0, status=GameStatus.PLAYED,
+            ),
+            "live-only-game": GameEntry(
+                slug="live-only-game", title="Live Canonical Title", rating=4.5, status=GameStatus.PLAYED,
+            ),
+        }
+        other_games = {
+            "shared-game": GameEntry(
+                slug="shared-game", title="Live Version B", rating=1.0, status=GameStatus.PLAYED,
+            ),
+            "live-only-game": GameEntry(
+                slug="live-only-game", title="Live Canonical Title", rating=4.5, status=GameStatus.PLAYED,
+            ),
+        }
+        api = SimpleNamespace(
+            get_user_library=AsyncMock(side_effect=[
+                UserLibrary(username="LiveA", games=live_games),
+                UserLibrary(username="LiveB", games=other_games),
+            ]),
+            get_game=AsyncMock(side_effect=AssertionError("compare must not fetch games individually")),
+        )
+        cog = SocialCog(SimpleNamespace(db=self.db, backloggd=api))
+        interaction = _make_interaction()
+
+        await SocialCog.compare.callback(cog, interaction, "LiveA", "LiveB")
+
+        text = "\n".join(field.value for field in interaction.followup.send.call_args.kwargs["embed"].fields)
+        self.assertIn("Cached Canonical Title", text)
+        self.assertNotIn("Live Version A", text)
+        self.assertNotIn("Live Version B", text)
+        self.assertIn("Live Canonical Title", text)
+        api.get_game.assert_not_awaited()
+
+    async def test_live_snapshot_failure_cleans_up_and_allows_retry(self):
+        import asyncio
+
+        entered = asyncio.Event()
+        release_failure = asyncio.Event()
+        both_joined = asyncio.Event()
+        calls = 0
+
+        async def fetch_library(username):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await release_failure.wait()
+                raise RuntimeError("temporary live library failure")
+            return UserLibrary(
+                username=username,
+                games={
+                    "retry-game": GameEntry(
+                        slug="retry-game", title="Retry Canonical", rating=4.0,
+                        status=GameStatus.PLAYED,
+                    )
+                },
+            )
+
+        class ObservedWaiters(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                if value == 2:
+                    both_joined.set()
+
+        api = SimpleNamespace(get_user_library=AsyncMock(side_effect=fetch_library))
+        cog = SocialCog(SimpleNamespace(db=self.db, backloggd=api), live_fetch_timeout=5.0)
+        cog._live_library_waiters = ObservedWaiters()
+        first = asyncio.create_task(cog._get_or_fetch_library_snapshot("RetryUser"))
+        await entered.wait()
+        second = asyncio.create_task(cog._get_or_fetch_library_snapshot("retryuser"))
+        await both_joined.wait()
+
+        release_failure.set()
+        failed = await asyncio.gather(first, second, return_exceptions=True)
+        self.assertTrue(all(isinstance(error, RuntimeError) for error in failed))
+        self.assertTrue(all("temporary live library failure" in str(error) for error in failed))
+        self.assertEqual(cog._live_library_tasks, {})
+        self.assertEqual(cog._live_library_waiters, {})
+
+        retry = await cog._get_or_fetch_library_snapshot("RetryUser")
+        self.assertEqual(retry.ratings, {"retry-game": 4.0})
+        self.assertEqual(retry.titles, {"retry-game": "Retry Canonical"})
+        self.assertEqual(calls, 2)
 
 
 if __name__ == "__main__":

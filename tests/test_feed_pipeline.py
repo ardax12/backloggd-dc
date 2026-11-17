@@ -48,6 +48,30 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await self.publish({"activity": [self.activity], "journal": []})
         self.channel.send.assert_awaited_once()
 
+    async def test_final_alias_suppression_prevents_send_for_earlier_single_alias_event(self):
+        await self.baseline()
+        now = self.cog.clock()
+        first_id, later_id = "single-alias-first", "overlap-later"
+        first = replace(self.activity, activity_id=first_id, event_ids=(first_id,))
+        later = replace(
+            self.activity,
+            activity_id=later_id,
+            event_ids=(first_id, later_id),
+        )
+        await self.db.record_feed_event_decision(
+            1, "millers", later_id,
+            source="activity", event_date="2026-11-01",
+            decision="suppressed_old", reason="previously_suppressed",
+            payload=json.dumps({"activity_id": later_id}), observed_at=now,
+        )
+
+        await self.publish({"activity": [first, later], "journal": []})
+
+        self.channel.send.assert_not_awaited()
+        rows = await self.db.get_feed_event_decisions(1, "millers", [first_id, later_id])
+        self.assertEqual(rows[first_id]["decision"], "suppressed_old")
+        self.assertEqual(rows[later_id]["decision"], "suppressed_old")
+
     async def test_late_journal_updates_existing_activity_message(self):
         await self.baseline()
         await self.publish({"activity": [self.activity], "journal": []})
@@ -184,6 +208,223 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("changed their rating", embed.title)
         self.assertIn("3.0", embed.description)
         self.assertIn("4.0", embed.description)
+
+    async def test_journal_only_rating_observed_before_activity_change_is_previous_value(self):
+        await self.baseline()
+        prior = replace(
+            self.log,
+            activity_id="journal-only-prior-rating",
+            rating=3.0,
+            played_date="November, 2026 11",
+            occurred_at=None,
+            event_ids=("journal-only-prior-rating",),
+        )
+        observed_at = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+        self.cog.clock = lambda: observed_at
+        await self.publish({"activity": [], "journal": [prior]})
+        saved_decision = await self.db.get_feed_event_decision(
+            1, "millers", "journal-only-prior-rating",
+        )
+        self.assertEqual(saved_decision["observed_at"], "2026-11-12 12:00:00")
+
+        current = replace(
+            self.activity,
+            activity_id="activity-after-journal-rating",
+            action_type="rated",
+            rating=4.0,
+            played_date=None,
+            occurred_at="2026-11-12T14:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 16, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [current], "journal": []})
+
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertIn("changed their rating", embed.title)
+        self.assertIn("3.0", embed.description)
+        self.assertIn("4.0", embed.description)
+
+    async def test_later_activity_rating_beats_backdated_journal_rating(self):
+        await self.baseline()
+        prior_journal = replace(
+            self.log,
+            activity_id="journal-before-activity-rating",
+            rating=4.0,
+            played_date="November, 2026 10",
+            occurred_at=None,
+            event_ids=("journal-before-activity-rating",),
+        )
+        journal_time = datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)
+        self.cog.clock = lambda: journal_time
+        await self.publish({"activity": [], "journal": [prior_journal]})
+
+        activity_rating = replace(
+            self.activity,
+            activity_id="later-activity-rating",
+            action_type="rated",
+            rating=3.0,
+            played_date=None,
+            occurred_at="2026-11-11T15:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 11, 16, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [activity_rating], "journal": []})
+
+        backdated_journal = replace(
+            self.log,
+            activity_id="journal-newer-played-date",
+            rating=4.5,
+            played_date="November, 2026 12",
+            occurred_at=None,
+            event_ids=("journal-newer-played-date",),
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 10, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [], "journal": [backdated_journal]})
+
+        current = replace(
+            activity_rating,
+            activity_id="activity-rating-after-backdated-journal",
+            rating=5.0,
+            occurred_at="2026-11-12T15:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 18, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [current], "journal": []})
+
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertIn("changed their rating", embed.title)
+        self.assertIn("3.0", embed.description)
+        self.assertIn("5.0", embed.description)
+        self.assertNotIn("4.5", embed.description)
+
+    async def test_conflicting_journal_rating_observations_do_not_invent_a_transition(self):
+        await self.baseline()
+        observed_at = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+        journal_ratings = [
+            replace(
+                self.log,
+                activity_id=f"journal-conflict-{rating}",
+                rating=rating,
+                played_date=played_date,
+                occurred_at=None,
+                event_ids=(f"journal-conflict-{rating}",),
+            )
+            for rating, played_date in ((2.0, "November, 2026 11"), (4.0, "November, 2026 11"))
+        ]
+        self.cog.clock = lambda: observed_at
+        await self.publish({"activity": [], "journal": journal_ratings})
+
+        current = replace(
+            self.activity,
+            activity_id="rating-after-conflicting-journals",
+            action_type="rated",
+            rating=5.0,
+            played_date=None,
+            occurred_at="2026-11-12T14:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 16, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [current], "journal": []})
+
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertNotIn("changed their rating", embed.title)
+        self.assertNotIn(" → ", embed.description)
+
+    async def test_missing_journal_observation_time_omits_previous_rating(self):
+        await self.baseline()
+        prior = replace(
+            self.log,
+            activity_id="journal-unknown-observation",
+            rating=3.0,
+            played_date="November, 2026 11",
+            occurred_at=None,
+            event_ids=("journal-unknown-observation",),
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [], "journal": [prior]})
+        await self.db._execute(
+            "DELETE FROM profile_feed_decisions WHERE guild_id = ? AND profile_key = ? AND event_id = ?",
+            (1, "millers", "journal-unknown-observation"),
+        )
+
+        current = replace(
+            self.activity,
+            activity_id="rating-after-unknown-journal-time",
+            action_type="rated",
+            rating=4.0,
+            played_date=None,
+            occurred_at="2026-11-12T14:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 16, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [current], "journal": []})
+
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertNotIn("changed their rating", embed.title)
+        self.assertNotIn(" → ", embed.description)
+
+    async def test_zero_journal_rating_remains_valid_previous_rating(self):
+        await self.baseline()
+        prior = replace(
+            self.log,
+            activity_id="journal-zero-rating",
+            rating=0.0,
+            played_date="November, 2026 11",
+            occurred_at=None,
+            event_ids=("journal-zero-rating",),
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [], "journal": [prior]})
+
+        current = replace(
+            self.activity,
+            activity_id="activity-after-zero-journal-rating",
+            action_type="rated",
+            rating=4.0,
+            played_date=None,
+            occurred_at="2026-11-12T14:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 16, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [current], "journal": []})
+
+        embed = self.channel.send.call_args.kwargs["embed"]
+        self.assertIn("changed their rating", embed.title)
+        self.assertIn("0.0", embed.description)
+        self.assertIn("4.0", embed.description)
+
+    async def test_journal_rating_history_is_profile_scoped(self):
+        await self.db.link_user(11, "Other")
+        await self.publish({"activity": [], "journal": []})
+        await self.cog._publish_sources(
+            1, "other", "Other", None, self.channel, {"activity": [], "journal": []},
+        )
+        prior = replace(
+            self.log,
+            activity_id="millers-only-journal-rating",
+            rating=3.0,
+            played_date="November, 2026 11",
+            occurred_at=None,
+            event_ids=("millers-only-journal-rating",),
+        )
+        observed_at = datetime(2026, 11, 12, 12, 0, tzinfo=timezone.utc)
+        self.cog.clock = lambda: observed_at
+        await self.publish({"activity": [], "journal": [prior]})
+
+        current = replace(
+            self.activity,
+            activity_id="same-new-rating-id",
+            action_type="rated",
+            rating=4.0,
+            played_date=None,
+            occurred_at="2026-11-12T14:00:00Z",
+        )
+        self.cog.clock = lambda: datetime(2026, 11, 12, 16, 0, tzinfo=timezone.utc)
+        await self.publish({"activity": [current], "journal": []})
+        await self.cog._publish_sources(
+            1, "other", "Other", None, self.channel, {"activity": [current], "journal": []},
+        )
+
+        millers_embed = self.channel.send.await_args_list[1].kwargs["embed"]
+        other_embed = self.channel.send.await_args_list[2].kwargs["embed"]
+        self.assertIn("changed their rating", millers_embed.title)
+        self.assertIn("3.0", millers_embed.description)
+        self.assertNotIn("changed their rating", other_embed.title)
+        self.assertNotIn(" → ", other_embed.description)
 
     async def test_editing_a_sent_rating_shows_previous_value(self):
         await self.baseline()
