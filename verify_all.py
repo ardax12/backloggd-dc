@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["TURSO_DATABASE_URL"] = ""
 os.environ["TURSO_AUTH_TOKEN"] = ""
+os.environ["LIBSQL_DATABASE_URL"] = ""
+os.environ["LIBSQL_AUTH_TOKEN"] = ""
 os.environ["DEV_GUILD_ID"] = ""
 
 # Fix Windows console UTF-8 output

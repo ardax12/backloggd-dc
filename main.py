@@ -17,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger("backloggd.main")
 
 async def handle_health_check(request: web.Request) -> web.Response:
-    """Simple HTTP health check endpoint for cloud hosting platforms like Render."""
+    """Simple HTTP health check endpoint for hosting platforms."""
     return web.json_response({"status": "online", "service": "backloggd-discord-bot"})
 
 async def start_health_server(port: int) -> web.AppRunner:
@@ -39,7 +39,15 @@ async def main():
         )
         sys.exit(1)
 
-    # If hosted on Render/cloud with a PORT environment variable, run web health server
+    session = os.getenv("BACKLOGGD_SESSION", "").strip()
+    if not session or session == "your_backloggd_session_cookie_here":
+        logger.error(
+            "BACKLOGGD_SESSION is required. Set your Backloggd _backloggd_session "
+            "cookie in .env or your deployment environment."
+        )
+        sys.exit(1)
+
+    # Hosting platforms can request a health server through PORT.
     runner = None
     port_env = os.getenv("PORT")
     if port_env and port_env.isdigit():

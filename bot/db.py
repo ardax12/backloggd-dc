@@ -13,7 +13,7 @@ from typing import Any, Iterable, List, Optional
 import aiosqlite
 import libsql_client
 
-from bot.config import DATABASE_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
+from bot.config import DATABASE_PATH, LIBSQL_AUTH_TOKEN, LIBSQL_DATABASE_URL
 from bot.db_adapter import execute_batch_statements, open_transaction
 
 logger = logging.getLogger("backloggd.db")
@@ -82,7 +82,7 @@ class Database:
             # Custom db_path provided (e.g. test_db.db), do not default to cloud Turso
             raw_url = ""
         else:
-            raw_url = TURSO_DATABASE_URL.strip().strip("'\"")
+            raw_url = LIBSQL_DATABASE_URL.strip().strip("'\"")
 
         # Normalize URL to HTTPS for reliable cloud API communication.
         # Libsql WebSocket (hrana2) gets rejected by modern Turso cloud regions with HTTP 400,
@@ -99,7 +99,7 @@ class Database:
             self.turso_url = ""
 
         self.turso_token = (
-            turso_token if turso_token is not None else TURSO_AUTH_TOKEN
+            turso_token if turso_token is not None else LIBSQL_AUTH_TOKEN
         ).strip().strip("'\"")
         self._conn: Optional[aiosqlite.Connection] = None
         self._client: Optional[libsql_client.Client] = None
