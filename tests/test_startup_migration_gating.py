@@ -202,19 +202,19 @@ class StartupMigrationGatingTests(unittest.IsolatedAsyncioTestCase):
             db_leg = Database(str(legacy_path), turso_url="")
             await db_leg.connect()
             try:
-                self.assertEqual((await db_leg._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 8)
+                self.assertEqual((await db_leg._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 9)
                 self.assertEqual(await db_leg.get_profile_ratings_dict("millers"), {"new-game": 4.0, "shared-game": 4.5})
                 self.assertTrue(await db_leg.is_journal_entry_delivered(1, "millers", "legacy-entry-1"))
             finally:
                 await db_leg.close()
 
-            # 2. v1 DB -> preserves user_ratings VIEW, backfills seen_journal_logs -> v2 -> v8
+            # 2. v1 DB -> preserves user_ratings VIEW, backfills seen_journal_logs -> v2 -> v9
             v1_path = Path(tmpdir) / "v1.db"
             _create_partially_migrated_v1(v1_path)
             db_v1 = Database(str(v1_path), turso_url="")
             await db_v1.connect()
             try:
-                self.assertEqual((await db_v1._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 8)
+                self.assertEqual((await db_v1._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 9)
                 self.assertEqual(
                     (await db_v1._fetchone("SELECT type FROM sqlite_master WHERE name = 'user_ratings'"))["type"],
                     "view",
@@ -224,7 +224,7 @@ class StartupMigrationGatingTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await db_v1.close()
 
-            # 3. v2 DB with legacy tables dropped -> upgrades v3..v8 without recreating legacy tables or running CROSS JOIN
+            # 3. v2 DB with legacy tables dropped -> upgrades v3..v9 without recreating legacy tables or running CROSS JOIN
             v2_path = Path(tmpdir) / "v2.db"
             seed = Database(str(v2_path), turso_url="")
             await seed.connect()
@@ -236,6 +236,7 @@ class StartupMigrationGatingTests(unittest.IsolatedAsyncioTestCase):
                         "guild_profile_feed_activity", "guild_admin_follows", "profile_feed_decisions",
                         "profile_feed_source_health", "profile_activity_observations",
                         "profile_activity_observation_sources", "guild_profile_feed_reconciliation",
+                        "guild_profile_feed_recipient_gaps",
                         "feed_sources", "feed_messages", "seen_journal_logs", "seen_journal_deliveries"):
                 await seed._execute(f"DROP TABLE IF EXISTS {tbl}")
             await seed.close()
@@ -251,20 +252,22 @@ class StartupMigrationGatingTests(unittest.IsolatedAsyncioTestCase):
             db_v2._execute = spy_v2
             await db_v2.connect()
             try:
-                self.assertEqual((await db_v2._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 8)
+                self.assertEqual((await db_v2._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 9)
                 self.assertNotIn("CROSS JOIN", "\n".join(v2_sql))
                 self.assertIsNone(await db_v2._fetchone("SELECT 1 FROM sqlite_master WHERE name = 'seen_journal_logs'"))
+                self.assertIsNotNone(await db_v2._fetchone("SELECT 1 FROM sqlite_master WHERE name = 'guild_profile_feed_recipient_gaps'"))
                 self.assertTrue(await db_v2.has_feed_source(1, "millers", "activity-display-v1"))
             finally:
                 await db_v2.close()
 
-            # 4. v7 DB -> upgrades to v8 cleanly skipping v1..v7 & legacy DDL
+            # 4. v7 DB -> upgrades to v9 cleanly skipping v1..v7 & legacy DDL
             v7_path = Path(tmpdir) / "v7.db"
             seed7 = Database(str(v7_path), turso_url="")
             await seed7.connect()
             await seed7.link_user(10, "Millers")
             await seed7._execute("DELETE FROM schema_migrations WHERE version > 7")
             await seed7._execute("DROP TABLE IF EXISTS guild_profile_feed_reconciliation")
+            await seed7._execute("DROP TABLE IF EXISTS guild_profile_feed_recipient_gaps")
             for legacy_table in ("feed_sources", "feed_messages", "seen_journal_logs", "seen_journal_deliveries"):
                 await seed7._execute(f"DROP TABLE IF EXISTS {legacy_table}")
             await seed7.close()
@@ -280,9 +283,10 @@ class StartupMigrationGatingTests(unittest.IsolatedAsyncioTestCase):
             db_v7._execute = spy_v7
             await db_v7.connect()
             try:
-                self.assertEqual((await db_v7._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 8)
+                self.assertEqual((await db_v7._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 9)
                 self.assertNotIn("CROSS JOIN", "\n".join(v7_sql))
                 self.assertIsNotNone(await db_v7._fetchone("SELECT 1 FROM sqlite_master WHERE name = 'guild_profile_feed_reconciliation'"))
+                self.assertIsNotNone(await db_v7._fetchone("SELECT 1 FROM sqlite_master WHERE name = 'guild_profile_feed_recipient_gaps'"))
                 self.assertIsNone(await db_v7._fetchone("SELECT 1 FROM sqlite_master WHERE name = 'feed_sources'"))
             finally:
                 await db_v7.close()
@@ -311,7 +315,7 @@ class StartupMigrationGatingTests(unittest.IsolatedAsyncioTestCase):
             db_recover = Database(str(partial_path), turso_url="")
             await db_recover.connect()
             try:
-                self.assertEqual((await db_recover._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 8)
+                self.assertEqual((await db_recover._fetchone("SELECT MAX(version) AS v FROM schema_migrations"))["v"], 9)
                 self.assertIsNone(await db_recover._fetchone("SELECT 1 FROM sqlite_master WHERE name = 'migration_partial_v2'"))
                 self.assertTrue(await db_recover.is_journal_entry_delivered(1, "millers", "partial-entry"))
             finally:

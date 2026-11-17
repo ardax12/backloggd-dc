@@ -47,16 +47,20 @@ class StatsCog(commands.Cog, name="Stats"):
     async def close(self) -> None:
         """Stop count work and wait for all SDK workers to unwind."""
         self._closing = True
+        current = asyncio.current_task()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._drain_count_work())
         drain_task = self._close_task
-        try:
-            await asyncio.shield(drain_task)
-        except asyncio.CancelledError:
-            # Do not let bot shutdown cancellation close the SDK underneath a
-            # worker that is still unwinding its request.
-            await asyncio.shield(drain_task)
-            raise
+        if drain_task is current:
+            return
+        cancelled: Optional[asyncio.CancelledError] = None
+        while not drain_task.done():
+            try:
+                await asyncio.shield(drain_task)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if cancelled is not None:
+            raise cancelled
 
     async def _drain_count_work(self) -> None:
         current = asyncio.current_task()

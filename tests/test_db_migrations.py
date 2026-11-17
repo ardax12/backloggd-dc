@@ -118,12 +118,13 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
         await db.connect()
         try:
             version = await db._fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-            self.assertEqual(version["version"], 8)
+            self.assertEqual(version["version"], 9)
             self.assertEqual(await db._fetchall("SELECT * FROM guild_feed_preferences"), [])
             self.assertEqual(await db._fetchall("SELECT * FROM profiles"), [])
             self.assertEqual(await db._fetchall("SELECT * FROM profile_activity_observations"), [])
             self.assertEqual(await db._fetchall("SELECT * FROM profile_activity_observation_sources"), [])
             self.assertEqual(await db._fetchall("SELECT * FROM guild_profile_feed_reconciliation"), [])
+            self.assertEqual(await db._fetchall("SELECT * FROM guild_profile_feed_recipient_gaps"), [])
             profile_cols = {row["name"] for row in await db._fetchall("PRAGMA table_info(profiles)")}
             self.assertTrue({"last_sync_attempt_at", "last_sync_error"}.issubset(profile_cols))
             health_cols = {row["name"] for row in await db._fetchall("PRAGMA table_info(profile_feed_source_health)")}
@@ -168,7 +169,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(repeated), 2)
             version = await db._fetchone("SELECT COUNT(*) AS count FROM schema_migrations")
-            self.assertEqual(version["count"], 8)
+            self.assertEqual(version["count"], 9)
         finally:
             await db.close()
 
@@ -222,7 +223,7 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "new-game": 4.0, "shared-game": 4.5
             })
             version = await retry._fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-            self.assertEqual(version["version"], 8)
+            self.assertEqual(version["version"], 9)
         finally:
             await retry.close()
 
@@ -265,8 +266,9 @@ class ProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(row["game_slug"], row["rating"]) for row in rows], [
                 ("new-game", 4.0), ("shared-game", 4.5)
             ])
-            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 8)
+            self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 9)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM profile_activity_observations").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM guild_profile_feed_reconciliation").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM guild_profile_feed_recipient_gaps").fetchone()[0], 0)
         finally:
             await db.close()

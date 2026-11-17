@@ -270,7 +270,7 @@ class CombinedIntegrationStoryTests(unittest.IsolatedAsyncioTestCase):
         try:
             await legacy_db.connect()
             ver = await legacy_db._fetchone("SELECT MAX(version) AS v FROM schema_migrations")
-            self.assertEqual(ver["v"], 8)
+            self.assertEqual(ver["v"], 9)
             pending = await legacy_db.get_legacy_feed_guilds_pending()
             self.assertEqual(pending, [1])
 

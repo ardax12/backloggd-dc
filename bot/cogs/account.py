@@ -42,35 +42,52 @@ class AccountCog(commands.Cog, name="Account"):
     async def close(self) -> None:
         """Idempotently stop account background work and drain owned resources."""
         self._closing = True
-        if self._draining_task is not None and not self._draining_task.done():
-            if asyncio.current_task() is not self._draining_task:
-                await asyncio.shield(self._draining_task)
-            return
-
         caller_task = asyncio.current_task()
+        draining = self._draining_task
+        if draining is not None and not draining.done():
+            if caller_task is not draining:
+                cancelled: Optional[asyncio.CancelledError] = None
+                while not draining.done():
+                    try:
+                        await asyncio.shield(draining)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                if cancelled is not None:
+                    raise cancelled
+            return
 
         async def _drain() -> None:
             current = asyncio.current_task()
-            if self._owns_library_sync and hasattr(self.library_sync, "close"):
-                await self.library_sync.close()
-            while True:
-                pending = [
-                    task
-                    for task in list(self._status_tasks)
-                    if not task.done() and task is not current and task is not caller_task
-                ]
-                if not pending:
-                    break
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-            self._status_tasks.clear()
+            try:
+                if self._owns_library_sync and hasattr(self.library_sync, "close"):
+                    await self.library_sync.close()
+            finally:
+                while True:
+                    pending = [
+                        task
+                        for task in list(self._status_tasks)
+                        if not task.done() and task is not current and task is not caller_task
+                    ]
+                    if not pending:
+                        break
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                self._status_tasks.clear()
 
-        self._draining_task = asyncio.create_task(_drain())
+        draining = asyncio.create_task(_drain())
+        self._draining_task = draining
+        cancelled: Optional[asyncio.CancelledError] = None
         try:
-            await self._draining_task
+            while not draining.done():
+                try:
+                    await asyncio.shield(draining)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+            if cancelled is not None:
+                raise cancelled
         finally:
-            if self._draining_task is not None and self._draining_task.done():
+            if self._draining_task is draining and draining.done():
                 self._draining_task = None
 
     async def cog_unload(self) -> None:

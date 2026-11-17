@@ -109,7 +109,10 @@ class FeedProfileMigrationTests(unittest.IsolatedAsyncioTestCase):
             2,
         )
         version = await self.db._fetchone("SELECT MAX(version) AS version FROM schema_migrations")
-        self.assertEqual(version["version"], 8)
+        self.assertEqual(version["version"], 9)
+        self.assertIsNotNone(await self.db._fetchone(
+            "SELECT 1 FROM sqlite_master WHERE name = 'guild_profile_feed_recipient_gaps'"
+        ))
 
     async def test_interrupted_feed_migration_rolls_back_and_can_retry(self):
         await self.add_legacy_feed_rows()

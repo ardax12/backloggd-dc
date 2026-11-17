@@ -226,7 +226,7 @@ class FeedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(feed.journal_feed_loop.get_task().done())
                 channel.send.assert_awaited_once()
                 pending = {row["event_id"]: row for row in await db.get_feed_messages(1, "millers")}
-                self.assertEqual(pending["during-close"]["delivery_state"], "pending")
+                self.assertEqual(pending["during-close"]["delivery_state"], "unknown")
 
                 # Restart leaves the uncertain intent protected from a duplicate send.
                 await db.close()

@@ -1,10 +1,12 @@
 """Custom Discord Bot Client with lifecycle hooks and Backloggd integration."""
 
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 import logging
 from pathlib import Path
+from typing import Optional
 from backloggd import BackloggdClient
 from bot.command_errors import handle_app_command_error
 from bot.db import Database
@@ -35,6 +37,7 @@ class BackloggdBot(commands.Bot):
         )
         self.library_sync = LibrarySyncService(max_workers=2)
         self.guild_membership = GuildMembershipService()
+        self._close_task: Optional[asyncio.Task] = None
         self.tree.error(self.on_app_command_error)
 
     async def on_app_command_error(
@@ -84,29 +87,57 @@ class BackloggdBot(commands.Bot):
             logger.warning("Could not sync slash commands in setup_hook: %s", e)
 
     async def close(self) -> None:
-        """Graceful shutdown hook."""
-        logger.info("Shutting down BackloggdBot...")
-        feed_cog = self.get_cog("Feed")
-        if feed_cog and hasattr(feed_cog, "close"):
-            await feed_cog.close()
+        """Idempotently drain cogs, shared services, SDK, DB, and Discord client."""
+        current = asyncio.current_task()
+        if self._close_task is None:
+            logger.info("Shutting down BackloggdBot...")
+            discord_close = super().close
 
-        stats_cog = self.get_cog("Stats")
-        if stats_cog and hasattr(stats_cog, "close"):
-            await stats_cog.close()
+            async def _shutdown() -> None:
+                errors: list[Exception] = []
+                stages: list[tuple[str, object]] = []
+                for cog_name in ("Feed", "Stats", "Account", "Social"):
+                    cog = self.get_cog(cog_name)
+                    if cog is not None and callable(getattr(cog, "close", None)):
+                        stages.append((f"cog:{cog_name}", cog.close))
+                stages.extend([
+                    ("guild_membership", self.guild_membership.close),
+                    ("library_sync", self.library_sync.close),
+                    ("backloggd", self.backloggd.close),
+                    ("db", self.db.close),
+                    ("discord", discord_close),
+                ])
+                for stage_name, closer in stages:
+                    try:
+                        await closer()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.error(
+                            "Error during bot shutdown stage %s",
+                            stage_name,
+                            exc_info=exc,
+                        )
+                        errors.append(exc)
+                if errors:
+                    raise errors[0]
 
-        account_cog = self.get_cog("Account")
-        if account_cog and hasattr(account_cog, "close"):
-            await account_cog.close()
+            self._close_task = asyncio.create_task(_shutdown())
 
-        social_cog = self.get_cog("Social")
-        if social_cog and hasattr(social_cog, "close"):
-            await social_cog.close()
-
-        await self.guild_membership.close()
-        await self.library_sync.close()
-        await self.backloggd.close()
-        await self.db.close()
-        await super().close()
+        close_task = self._close_task
+        if close_task is current:
+            return
+        cancelled: Optional[asyncio.CancelledError] = None
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if cancelled is not None:
+            if not close_task.cancelled():
+                close_task.exception()
+            raise cancelled
+        return close_task.result()
 
     async def on_ready(self) -> None:
         """Triggered when connection is established and cache is ready."""

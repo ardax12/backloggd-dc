@@ -216,6 +216,7 @@ class FeedBatchWritesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_seed_feed_source_middle_chunk_failure_and_cancellation_rollback_cleanly(self):
         await self.turso_db.link_user(10, "Millers")
+        self.turso_client.reset_counters()
         ids = [f"rb-{i:04d}" for i in range(600)]  # > 1 chunk (params_per_row=3 -> max 266 rows/chunk)
 
         async def fail_on_third_tx_exec(call_no, query, values):

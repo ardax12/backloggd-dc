@@ -364,6 +364,25 @@ async def _migrate_feed_source_reconciliation(execute: Execute, fetchone: FetchO
     """, ())
 
 
+async def _migrate_guild_recipient_gaps(execute: Execute, fetchone: FetchOne) -> None:
+    """Track per-guild feed recipient delivery gaps separately from profile source uncertainty."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_profile_feed_recipient_gaps (
+            guild_id INTEGER NOT NULL,
+            profile_key TEXT NOT NULL,
+            gap_since TIMESTAMP NOT NULL,
+            reason TEXT NOT NULL,
+            last_error TEXT,
+            PRIMARY KEY (guild_id, profile_key)
+        )
+    """, ())
+    await execute(
+        """CREATE INDEX IF NOT EXISTS idx_guild_profile_recipient_gaps_profile
+           ON guild_profile_feed_recipient_gaps (profile_key, guild_id)""",
+        (),
+    )
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -400,3 +419,6 @@ async def run_migrations(database) -> None:
         if version < 8:
             await _migrate_feed_source_reconciliation(tx.execute, tx.fetchone)
             await tx.execute("INSERT INTO schema_migrations (version) VALUES (8)")
+        if version < 9:
+            await _migrate_guild_recipient_gaps(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (9)")
