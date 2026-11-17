@@ -195,16 +195,6 @@ Database upgrades run automatically on startup (currently schema versions 1-9). 
 
 Scraping and HTML parsing belong in [backloggd-py](https://github.com/ardax12/backloggd-py). This repository handles Discord commands, cached libraries, and announcement rules. To work on both projects locally, install the SDK checkout with `python -m pip install -e /path/to/backloggd-py`.
 
-Run the offline tests and smoke checks with:
-
-```shell
-python -m unittest discover -s tests -q
-python verify_all.py
-python -m pip check
-```
-
-Tests use temporary databases and mocked external services; they do not send Discord messages or scrape live profiles. The full suite can take several minutes.
-
 Docker installs from `requirements.lock`, targeting Linux x86_64 and Python 3.12. After changing dependencies, regenerate it with:
 
 ```shell
