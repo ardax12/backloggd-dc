@@ -168,7 +168,7 @@ Database upgrades run automatically on startup (currently schema versions 1-9). 
 
 **Server totals:** Games Logged adds the Played-tab totals of distinct linked profiles currently in the server. A game owned by two different profiles contributes twice; two Discord accounts linked to the same profile contribute once. Missing totals are marked unavailable or partial.
 
-**Feed setup:** The first successful activity and journal checks establish a starting point silently, so enabling a feed does not dump existing history into the channel. The bot normally checks for updates every five minutes.
+**Feed setup:** The first successful activity and journal checks establish a starting point silently. The bot checks journal page 1 every five minutes, including at setup and after an outage. Backdated entries, edits, or missed entries that stay on later pages may go unnoticed.
 
 **What gets announced:** Started/Finished milestones, identifiable replays, explicit ratings, rating changes, and written reviews. Ordinary daily sessions, backlog/wishlist changes, likes, follows, comments, badges, and lists are hidden. Related events are combined where they can be matched safely.
 

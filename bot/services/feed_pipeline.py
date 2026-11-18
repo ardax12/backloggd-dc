@@ -478,13 +478,16 @@ class FeedPipeline:
                 profile_key, "journal", now=health_now,
             )
             entries = await self.bot.backloggd.get_user_journal(
-                username, max_pages=100, require_complete=True
+                username, max_pages=1, require_complete=False,
             )
-            sources["journal"] = journal_events(entries, username)
+            parsed_journal = journal_events(entries, username)
             await database.record_feed_source_success(
-                profile_key, "journal", coverage="exhausted", pages_read=None,
+                profile_key, "journal", coverage="latest_page", pages_read=1,
                 now=health_now,
             )
+            sources["journal"] = parsed_journal
+            if poll_context is not None:
+                poll_context.setdefault("partial_journals", set()).add(profile_key)
         except Exception as error:
             logger.warning("Could not read journal for %s: %s", username, error)
             await database.record_feed_source_failure(profile_key, "journal", str(error))
@@ -497,8 +500,9 @@ class FeedPipeline:
     ) -> bool:
         self._last_publish_errors.pop((guild_id, profile_key), None)
         target = FeedTarget(guild_id, profile_key, username, avatar_url, channel)
+        partial_journal = profile_key in (poll_context or {}).get("partial_journals", ())
         history = await self._load_and_initialize_history(target, sources)
-        activities, logs = self._merge_source_events(history)
+        activities, logs = self._merge_source_events(history, partial_journal=partial_journal)
         events, now = await self._filter_discoveries(target, activities, logs, history, poll_context)
         if not deliver:
             # Observations stay durable without modifying archived Discord messages.
@@ -609,17 +613,18 @@ class FeedPipeline:
 
 
     @staticmethod
-    def _merge_source_events(history):
+    def _merge_source_events(history, *, partial_journal=False):
         """Combine current observations and canonical history without losing enrichment."""
         sources = history.sources
         persisted_aliases = history.persisted_aliases
         canonical_activity, canonical_journal = history.canonical_activity, history.canonical_journal
+        journal_incomplete = partial_journal or "journal" not in sources
         activity = {e.activity_id: e for e in canonical_activity.values()}
         for event in sources.get("activity", []):
             previous = persisted_aliases.get(event.activity_id)
             if previous:
                 preserved = {}
-                if "journal" not in sources:
+                if journal_incomplete:
                     preserved = {
                         "played_date": event.played_date or previous.played_date,
                         "platform": event.platform or previous.platform,
@@ -646,7 +651,7 @@ class FeedPipeline:
                     (persisted_aliases[alias] for alias in event.event_ids if alias in persisted_aliases),
                     None,
                 )
-                if matched_prev and "journal" not in sources:
+                if matched_prev and journal_incomplete:
                     activity[event.activity_id] = replace(
                         event,
                         played_date=event.played_date or matched_prev.played_date,

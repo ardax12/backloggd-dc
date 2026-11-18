@@ -1527,6 +1527,7 @@ class Database:
         now: Optional[Any] = None,
     ) -> None:
         closes_gap = coverage == "exhausted" or (coverage == "boundary_reached" and bool(boundary_event_id))
+        preserves_gap = closes_gap or coverage == "latest_page"
         commit_boundary = bool(closes_gap and not defer_boundary_commit)
         now_sql = self._now_utc_sql_timestamp(now)
         # Event occurrence timestamps do not prove the endpoint of a coverage
@@ -1580,14 +1581,14 @@ class Database:
                 commit_boundary,
                 now_sql,
                 commit_boundary,
-                bool(closes_gap),
+                preserves_gap,
                 coverage,
                 commit_boundary,
                 commit_boundary,
                 commit_boundary,
-                bool(closes_gap),
+                preserves_gap,
                 commit_boundary,
-                bool(closes_gap),
+                preserves_gap,
                 coverage,
             ),
         )
