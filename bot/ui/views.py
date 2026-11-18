@@ -4,8 +4,13 @@ import asyncio
 import logging
 import discord
 from discord.ui import View, Button
-from typing import Optional, Callable, Coroutine, Any
-from bot.command_errors import GENERIC_COMMAND_ERROR_MESSAGE, defer_interaction, handle_component_error
+from typing import Optional, Callable, Coroutine, Any, Sequence
+from bot.command_errors import (
+    GENERIC_COMMAND_ERROR_MESSAGE,
+    defer_interaction,
+    handle_component_error,
+    send_private_followup,
+)
 from bot.ui.helpers import truncate_button_label
 
 logger = logging.getLogger("backloggd.ui.views")
@@ -226,3 +231,123 @@ class FeedListView(ExpiringView):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
     async def next_button(self, interaction: discord.Interaction, button: Button):
         await self._move(interaction, 1)
+
+
+class ServerTopView(ExpiringView):
+    """Author-only, expiring mode switcher for /server-top leaderboards."""
+
+    def __init__(
+        self,
+        author_id: Optional[int],
+        current_mode: str,
+        modes: Sequence[tuple[str, Optional[str]]],
+        on_mode_change: Callable[
+            [discord.Interaction, str],
+            Coroutine[Any, Any, tuple[Optional[discord.Embed], Optional[str]]],
+        ],
+        *,
+        timeout: float = 180,
+    ):
+        if not modes or len(modes) > 25:
+            raise ValueError("ServerTopView requires between 1 and 25 modes")
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.current_mode = current_mode
+        self.on_mode_change = on_mode_change
+        self._valid_modes = {mode_name for mode_name, _ in modes}
+        self._generation = 0
+        self._edit_lock = asyncio.Lock()
+
+        options = [
+            discord.SelectOption(
+                label=mode_name,
+                value=mode_name,
+                emoji=emoji,
+                default=(mode_name == current_mode),
+            )
+            for mode_name, emoji in modes
+        ]
+        self.select = discord.ui.Select(
+            placeholder="Switch leaderboard mode...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.select.callback = self._handle_select
+        self.add_item(self.select)
+
+    def _set_active_mode(self, mode: str) -> None:
+        self.current_mode = mode
+        for option in self.select.options:
+            option.default = option.value == mode
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Discord.py refreshes the view timeout only after this check passes.
+        if self.author_id is not None and interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "❌ Only the person who ran `/server-top` can switch leaderboard modes.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        # Apply the disabled controls after any in-flight selection edit.
+        async with self._edit_lock:
+            await super().on_timeout()
+
+    async def _handle_select(self, interaction: discord.Interaction) -> None:
+        if self._retired or self.is_finished():
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "⏳ This leaderboard menu has expired. Please run `/server-top` again.",
+                    ephemeral=True,
+                )
+            return
+
+        values = list(self.select.values)
+        if not values and isinstance(getattr(interaction, "data", None), dict):
+            raw_values = interaction.data.get("values")
+            if isinstance(raw_values, list):
+                values = [str(v) for v in raw_values]
+
+        if len(values) != 1 or values[0] not in self._valid_modes:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Invalid leaderboard mode selection. Please choose an option from the menu.",
+                    ephemeral=True,
+                )
+            return
+
+        requested_mode = values[0]
+        # Claim latest selection generation before the first await so a slow earlier
+        # request can never overwrite a newer selection.
+        self._generation += 1
+        generation = self._generation
+
+        if not interaction.response.is_done():
+            await defer_interaction(interaction)
+
+        embed, error_message = await self.on_mode_change(interaction, requested_mode)
+
+        async with self._edit_lock:
+            if generation != self._generation or self._retired or self.is_finished():
+                return
+
+            if error_message is not None or embed is None:
+                await send_private_followup(
+                    interaction,
+                    error_message or GENERIC_COMMAND_ERROR_MESSAGE,
+                    log=logger,
+                )
+                return
+
+            previous_mode = self.current_mode
+            self._set_active_mode(requested_mode)
+            try:
+                edited_message = await interaction.edit_original_response(embed=embed, view=self)
+            except BaseException:
+                self._set_active_mode(previous_mode)
+                raise
+            if edited_message is not None:
+                self.message = edited_message

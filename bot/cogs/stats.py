@@ -8,6 +8,7 @@ from discord.ext import commands
 import logging
 from typing import List, Literal, Optional, Sequence
 from bot.ui.embeds import create_server_top_embed, create_server_stats_embed
+from bot.ui.views import ServerTopView
 from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
@@ -25,6 +26,21 @@ LeaderboardMode = Literal[
     "Hidden Gems",
     "Server Backlog Shame List"
 ]
+
+_LEADERBOARD_MODES: tuple[tuple[str, str, str, str], ...] = (
+    ("Highest Rated", "highest_rated", "⭐ Highest Rated Games", "⭐"),
+    ("Most Played", "most_played", "🎮 Most Played Games", "🎮"),
+    ("Most Polarizing", "polarizing", "🔥 Most Polarizing / Divisive Games", "🔥"),
+    ("Hidden Gems", "hidden_gems", "💎 Hidden Gems (Server Rating 4.5+)", "💎"),
+    ("Server Backlog Shame List", "shame_list", "🪦 Server Backlog Shame List (Most Unplayed)", "🪦"),
+)
+_LEADERBOARD_MODE_SPECS: dict[str, tuple[str, str, str]] = {
+    name: (mode_key, title, emoji)
+    for name, mode_key, title, emoji in _LEADERBOARD_MODES
+}
+_SERVER_TOP_SELECT_MODES: tuple[tuple[str, str], ...] = tuple(
+    (name, emoji) for name, _, _, emoji in _LEADERBOARD_MODES
+)
 
 class StatsCog(commands.Cog, name="Stats"):
     def __init__(
@@ -168,24 +184,24 @@ class StatsCog(commands.Cog, name="Stats"):
             "logged_profiles_missing": len(profile_list) - counted,
         }
 
-    @app_commands.command(name="server-top", description="View server game rankings and specialty leaderboards")
-    @app_commands.describe(mode="Choose leaderboard mode (e.g. Highest Rated, Most Polarizing, Shame List)")
-    async def server_top(
+    async def _load_server_top_embed(
         self,
-        interaction: discord.Interaction,
-        mode: LeaderboardMode = "Highest Rated"
-    ):
-        await defer_interaction(interaction)
+        guild: Optional[discord.Guild],
+        mode: str,
+    ) -> tuple[Optional[discord.Embed], Optional[str]]:
+        if not guild:
+            return None, "❌ This command must be run inside a Discord server."
 
-        if not interaction.guild:
-            await send_private_followup(interaction, "❌ This command must be run inside a Discord server.", log=logger)
-            return
+        spec = _LEADERBOARD_MODE_SPECS.get(mode)
+        if spec is None:
+            raise ValueError(f"Unsupported leaderboard mode: {mode!r}")
+        mode_key, title, _ = spec
 
-        guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
+        guild_member_ids = await resolve_guild_member_ids(self.bot, guild)
         if guild_member_ids is None:
-            await send_private_followup(interaction, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, log=logger)
-            return
-        guild_name = interaction.guild.name
+            return None, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE
+
+        guild_name = guild.name
         context = await self.bot.db.get_guild_stats_context(guild_member_ids)
         profile_keys = context["profile_keys"]
         freshness_note = await resolve_guild_aggregate_freshness(
@@ -197,34 +213,18 @@ class StatsCog(commands.Cog, name="Stats"):
             require_subscribed=True,
         )
 
-        entries = []
-        mode_key = "highest_rated"
-        title = "Highest Rated Games"
-
         if mode == "Highest Rated":
-            mode_key = "highest_rated"
-            title = "⭐ Highest Rated Games"
             entries = await self.bot.db.get_server_top_rated_for_profiles(profile_keys, limit=10, min_ratings=2)
-
         elif mode == "Most Played":
-            mode_key = "most_played"
-            title = "🎮 Most Played Games"
             entries = await self.bot.db.get_server_most_played_for_profiles(profile_keys, limit=10)
-
         elif mode == "Most Polarizing":
-            mode_key = "polarizing"
-            title = "🔥 Most Polarizing / Divisive Games"
             entries = await self.bot.db.get_server_polarizing_for_profiles(profile_keys, limit=10, min_ratings=2)
-
         elif mode == "Hidden Gems":
-            mode_key = "hidden_gems"
-            title = "💎 Hidden Gems (Server Rating 4.5+)"
             entries = await self.bot.db.get_server_hidden_gems_for_profiles(profile_keys, limit=10)
-
         elif mode == "Server Backlog Shame List":
-            mode_key = "shame_list"
-            title = "🪦 Server Backlog Shame List (Most Unplayed)"
             entries = await self.bot.db.get_server_shame_list_for_profiles(profile_keys, limit=10)
+        else:
+            raise ValueError(f"Unsupported leaderboard mode: {mode!r}")
 
         embed = create_server_top_embed(
             title=title,
@@ -233,8 +233,40 @@ class StatsCog(commands.Cog, name="Stats"):
             guild_name=guild_name,
             freshness_note=freshness_note,
         )
+        return embed, None
 
-        await send_public_followup(interaction, embed=embed)
+    @app_commands.command(name="server-top", description="View server game rankings and specialty leaderboards")
+    @app_commands.describe(mode="Choose leaderboard mode (e.g. Highest Rated, Most Polarizing, Shame List)")
+    async def server_top(
+        self,
+        interaction: discord.Interaction,
+        mode: LeaderboardMode = "Highest Rated"
+    ):
+        await defer_interaction(interaction)
+
+        embed, error_message = await self._load_server_top_embed(interaction.guild, mode)
+        if error_message is not None or embed is None:
+            await send_private_followup(
+                interaction,
+                error_message or "❌ This command must be run inside a Discord server.",
+                log=logger,
+            )
+            return
+
+        async def on_mode_change(
+            select_interaction: discord.Interaction,
+            requested_mode: str,
+        ) -> tuple[Optional[discord.Embed], Optional[str]]:
+            return await self._load_server_top_embed(select_interaction.guild, requested_mode)
+
+        author_id = getattr(getattr(interaction, "user", None), "id", None)
+        view = ServerTopView(
+            author_id=author_id,
+            current_mode=mode,
+            modes=_SERVER_TOP_SELECT_MODES,
+            on_mode_change=on_mode_change,
+        )
+        view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
     @app_commands.command(name="server-stats", description="View gaming community statistics for this Discord server")
     async def server_stats(self, interaction: discord.Interaction):
