@@ -131,7 +131,7 @@ def create_profile_embed(
     fallback_avatar_url: Optional[str] = None,
     freshness_note: Optional[str] = None,
     *,
-    playing_count: Optional[int] = None,
+    collection_counts: Optional[dict[str, int]] = None,
 ) -> discord.Embed:
     """Construct embed for /profile command with clean formatting and top-left avatar."""
     user_url = build_backloggd_user_url(profile.username)
@@ -182,21 +182,19 @@ def create_profile_embed(
         embed.description = clamp_escaped_text("\n\n".join(desc_lines), 4096)
 
     # Activity Counter Fields
-    def display_count(value):
+    def display_count(collection: str) -> str:
+        value = getattr(profile, f"{collection}_count", None)
+        if value is None and collection_counts:
+            value = collection_counts.get(collection)
         return "Unavailable" if value is None else format_number(value)
-
-    played = getattr(profile, "played_count", None)
-    playing = playing_count if playing_count is not None else getattr(profile, "playing_count", None)
-    backlog = getattr(profile, "backlog_count", None)
-    wishlist = getattr(profile, "wishlist_count", None)
 
     embed.add_field(
         name="📊 Library Overview",
         value=(
-            f"🎮 **{display_count(played)}** Played\n"
-            f"▶️ **{display_count(playing)}** Playing\n"
-            f"⏳ **{display_count(backlog)}** Backlog\n"
-            f"💖 **{display_count(wishlist)}** Wishlist"
+            f"🎮 **{display_count('played')}** Played\n"
+            f"▶️ **{display_count('playing')}** Playing\n"
+            f"⏳ **{display_count('backlog')}** Backlog\n"
+            f"💖 **{display_count('wishlist')}** Wishlist"
         ),
         inline=True
     )

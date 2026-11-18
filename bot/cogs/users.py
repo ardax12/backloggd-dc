@@ -113,8 +113,17 @@ class UsersCog(commands.Cog, name="Users"):
 
             canonical_username = profile_data.username.strip()
             canonical_key = canonical_username.lower()
-            playing_count = None
-            if getattr(profile_data, "playing_count", None) is None:
+            collection_counts = {}
+            collections = ("played", "playing", "backlog", "wishlist")
+            missing_counts = {name for name in collections if getattr(profile_data, f"{name}_count", None) is None}
+            counts_method = getattr(self.bot.backloggd, "get_user_collection_counts", None)
+            if missing_counts and counts_method is not None:
+                try:
+                    collection_counts = await asyncio.wait_for(counts_method(canonical_username), timeout=5.0)
+                except Exception as error:
+                    logger.debug("Collection counts unavailable for %s: %s", canonical_username, type(error).__name__)
+            elif "playing" in missing_counts:
+                # SDK 0.2.3 predates the Games tab counters API.
                 try:
                     playing = await asyncio.wait_for(
                         self.bot.backloggd.get_user_playing(canonical_username), timeout=5.0,
@@ -122,7 +131,7 @@ class UsersCog(commands.Cog, name="Users"):
                     # This SDK call returns one page and does not prove empty
                     # or potentially truncated responses are complete.
                     if 0 < len(playing) < PLAYING_SINGLE_PAGE_LIMIT:
-                        playing_count = len(playing)
+                        collection_counts["playing"] = len(playing)
                 except Exception as error:
                     logger.debug("Playing count unavailable for %s: %s", canonical_username, type(error).__name__)
             sub_checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
@@ -173,7 +182,7 @@ class UsersCog(commands.Cog, name="Users"):
                 latest_review=latest_review,
                 fallback_avatar_url=fallback_avatar,
                 freshness_note=freshness_note,
-                playing_count=playing_count,
+                collection_counts=collection_counts,
             )
 
             extra_buttons = []
