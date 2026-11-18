@@ -301,7 +301,7 @@ _COLLECTION_STATUS_PRECEDENCE = {
     "wishlist": 1,
     "unknown": 0,
 }
-_PLAYING_SINGLE_PAGE_LIMIT = 70
+PLAYING_SINGLE_PAGE_LIMIT = 70
 
 
 def _entry_status_key(status: Any) -> str:
@@ -431,10 +431,10 @@ async def _fetch_complete_library(api: Any, username: str):
 
     collected = dict(zip(names, results))
     playing_entries = collected.get("playing", ())
-    if callable(get_playing) and len(playing_entries) >= _PLAYING_SINGLE_PAGE_LIMIT:
+    if callable(get_playing) and len(playing_entries) >= PLAYING_SINGLE_PAGE_LIMIT:
         raise RuntimeError(
             f"SDK get_user_playing returned {len(playing_entries)} entries "
-            f"(single-page limit {_PLAYING_SINGLE_PAGE_LIMIT}) without pagination confirmation; "
+            f"(single-page limit {PLAYING_SINGLE_PAGE_LIMIT}) without pagination confirmation; "
             "refusing to mark potentially partial library complete"
         )
 

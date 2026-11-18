@@ -19,6 +19,7 @@ from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_review_url, build_backloggd_user_url
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.services.freshness import ensure_profiles_fresh, format_profile_freshness_line
+from bot.services.library_sync import PLAYING_SINGLE_PAGE_LIMIT
 
 logger = logging.getLogger("backloggd.cogs.users")
 
@@ -112,6 +113,18 @@ class UsersCog(commands.Cog, name="Users"):
 
             canonical_username = profile_data.username.strip()
             canonical_key = canonical_username.lower()
+            playing_count = None
+            if getattr(profile_data, "playing_count", None) is None:
+                try:
+                    playing = await asyncio.wait_for(
+                        self.bot.backloggd.get_user_playing(canonical_username), timeout=5.0,
+                    )
+                    # This SDK call returns one page and does not prove empty
+                    # or potentially truncated responses are complete.
+                    if 0 < len(playing) < PLAYING_SINGLE_PAGE_LIMIT:
+                        playing_count = len(playing)
+                except Exception as error:
+                    logger.debug("Playing count unavailable for %s: %s", canonical_username, type(error).__name__)
             sub_checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
             subscribed = (
                 bool(await sub_checker(canonical_key))
@@ -160,6 +173,7 @@ class UsersCog(commands.Cog, name="Users"):
                 latest_review=latest_review,
                 fallback_avatar_url=fallback_avatar,
                 freshness_note=freshness_note,
+                playing_count=playing_count,
             )
 
             extra_buttons = []
