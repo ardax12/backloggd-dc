@@ -1115,34 +1115,38 @@ class FeedPipeline:
                 cleanup_launched = False
                 sent_message = None
 
-                async def _finalize_delivery_state(msg=None, *, release_unsent: bool = False) -> None:
+                async def _write_delivery_state(outcome: str, *, msg: Any = None) -> None:
                     nonlocal durable_finalized
+                    if outcome == "release":
+                        await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
+                        durable_finalized = True
+                        return
+                    if outcome == "sent" and msg is not None and getattr(msg, "id", None) is not None:
+                        await self.bot.db.store_feed_message(
+                            guild_id, profile_key, aliases, payload, msg.id, channel.id
+                        )
+                        durable_finalized = True
+                        for alias in aliases:
+                            saved[alias] = {
+                                "payload": payload,
+                                "message_id": msg.id,
+                                "channel_id": channel.id,
+                                "delivery_state": "sent",
+                            }
+                        return
+                    await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
+                    durable_finalized = True
+                    for alias in aliases:
+                        saved[alias] = {
+                            "payload": payload,
+                            "message_id": None,
+                            "channel_id": channel.id,
+                            "delivery_state": "unknown",
+                        }
+
+                async def _finalize_delivery_state(outcome: str, *, msg: Any = None) -> None:
                     try:
-                        if release_unsent:
-                            await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                        elif msg is not None and getattr(msg, "id", None) is not None:
-                            await self.bot.db.store_feed_message(
-                                guild_id, profile_key, aliases, payload, msg.id, channel.id
-                            )
-                            durable_finalized = True
-                            for alias in aliases:
-                                saved[alias] = {
-                                    "payload": payload,
-                                    "message_id": msg.id,
-                                    "channel_id": channel.id,
-                                    "delivery_state": "sent",
-                                }
-                        else:
-                            await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                            for alias in aliases:
-                                saved[alias] = {
-                                    "payload": payload,
-                                    "message_id": None,
-                                    "channel_id": channel.id,
-                                    "delivery_state": "unknown",
-                                }
+                        await _write_delivery_state(outcome, msg=msg)
                     except Exception:
                         logger.warning(
                             "Could not finalize delivery state for %s (%s) in guild %d; leaving intent recoverable",
@@ -1160,25 +1164,35 @@ class FeedPipeline:
                             recheck_recovery=not durable_finalized,
                         )
 
+                async def _shield_delivery_cleanup(outcome: str, *, msg: Any = None) -> None:
+                    nonlocal cleanup_launched
+                    cleanup_launched = True
+                    cleanup_task = self._track_delivery_cleanup(
+                        _finalize_delivery_state(outcome, msg=msg)
+                    )
+                    await asyncio.shield(cleanup_task)
+
+                async def _transition_delivery(outcome: str, *, msg: Any = None) -> None:
+                    try:
+                        await _write_delivery_state(outcome, msg=msg)
+                    except asyncio.CancelledError:
+                        await _shield_delivery_cleanup(outcome, msg=msg)
+                        raise
+
+                async def _mark_unknown_fallback(warning_msg: str, *warning_args: Any) -> None:
+                    try:
+                        await _transition_delivery("unknown")
+                    except Exception:
+                        logger.warning(warning_msg, *warning_args, exc_info=True)
+
                 try:
                     try:
                         sent_message = await channel.send(embed=embed, view=view)
                     except asyncio.CancelledError:
-                        cleanup_launched = True
-                        cleanup_task = self._track_delivery_cleanup(_finalize_delivery_state(None))
-                        await asyncio.shield(cleanup_task)
+                        await _shield_delivery_cleanup("unknown")
                         raise
                     except discord.RateLimited as error:
-                        try:
-                            await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                        except asyncio.CancelledError:
-                            cleanup_launched = True
-                            cleanup_task = self._track_delivery_cleanup(
-                                _finalize_delivery_state(None, release_unsent=True)
-                            )
-                            await asyncio.shield(cleanup_task)
-                            raise
+                        await _transition_delivery("release")
                         target_ok = False
                         self._last_publish_errors[(guild_id, profile_key)] = f"rate_limited:{error.retry_after:.2f}s"[:500]
                         logger.warning(
@@ -1192,19 +1206,7 @@ class FeedPipeline:
                     except discord.HTTPException as error:
                         status = getattr(error, "status", None)
                         is_client_rejection = isinstance(status, int) and 400 <= status < 500
-                        try:
-                            if is_client_rejection:
-                                await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
-                            else:
-                                await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                        except asyncio.CancelledError:
-                            cleanup_launched = True
-                            cleanup_task = self._track_delivery_cleanup(
-                                _finalize_delivery_state(None, release_unsent=is_client_rejection)
-                            )
-                            await asyncio.shield(cleanup_task)
-                            raise
+                        await _transition_delivery("release" if is_client_rejection else "unknown")
                         target_ok = False
                         self._last_publish_errors[(guild_id, profile_key)] = (
                             f"http_{status if status is not None else 'error'}: {error}"[:500]
@@ -1219,14 +1221,7 @@ class FeedPipeline:
                         )
                         return target_ok
                     except (aiohttp.ClientError, TimeoutError, ConnectionError) as error:
-                        try:
-                            await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                        except asyncio.CancelledError:
-                            cleanup_launched = True
-                            cleanup_task = self._track_delivery_cleanup(_finalize_delivery_state(None))
-                            await asyncio.shield(cleanup_task)
-                            raise
+                        await _transition_delivery("unknown")
                         target_ok = False
                         self._last_publish_errors[(guild_id, profile_key)] = f"{type(error).__name__}: {error}"[:500]
                         logger.warning(
@@ -1238,40 +1233,22 @@ class FeedPipeline:
                         )
                         return target_ok
                     except Exception:
-                        try:
-                            await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                        except Exception:
-                            logger.warning(
-                                "Could not mark delivery unknown after error sending %s in guild %d",
-                                event.activity_id,
-                                guild_id,
-                                exc_info=True,
-                            )
-                        raise
-                    message_id, old_channel = sent_message.id, channel.id
-                    try:
-                        await self.bot.db.store_feed_message(
-                            guild_id, profile_key, aliases, payload, message_id, old_channel
+                        await _mark_unknown_fallback(
+                            "Could not mark delivery unknown after error sending %s in guild %d",
+                            event.activity_id,
+                            guild_id,
                         )
-                        durable_finalized = True
-                    except asyncio.CancelledError:
-                        cleanup_launched = True
-                        cleanup_task = self._track_delivery_cleanup(_finalize_delivery_state(sent_message))
-                        await asyncio.shield(cleanup_task)
                         raise
+                    message_id = sent_message.id
+                    try:
+                        await _transition_delivery("sent", msg=sent_message)
                     except Exception:
-                        try:
-                            await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
-                            durable_finalized = True
-                        except Exception:
-                            logger.warning(
-                                "Could not record unknown state after post-send write error for message %s (%s) in guild %d",
-                                message_id,
-                                event.activity_id,
-                                guild_id,
-                                exc_info=True,
-                            )
+                        await _mark_unknown_fallback(
+                            "Could not record unknown state after post-send write error for message %s (%s) in guild %d",
+                            message_id,
+                            event.activity_id,
+                            guild_id,
+                        )
                         raise
                 finally:
                     if not cleanup_launched:
@@ -1282,14 +1259,6 @@ class FeedPipeline:
                             owner_token,
                             recheck_recovery=not durable_finalized,
                         )
-                saved_state = "sent" if message_id is not None else "baseline"
-                for alias in aliases:
-                    saved[alias] = {
-                        "payload": payload,
-                        "message_id": message_id,
-                        "channel_id": old_channel,
-                        "delivery_state": saved_state,
-                    }
                 if not record:
                     await asyncio.sleep(1)
                 return target_ok
