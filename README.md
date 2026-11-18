@@ -188,7 +188,7 @@ Database upgrades run automatically on startup (currently schema versions 1-9). 
 | Server commands cannot identify members | Enable Server Members Intent in the Developer Portal. |
 | A feed is quiet | Check `/feed status`, your server's `/feed on` preference, and the bot's channel permissions. Existing history is intentionally skipped. |
 | Comparisons or recommendations are empty | Wait for the initial library sync, check the shown cache age, or use `/refresh`. |
-| A library refresh fails with 70+ Playing games | Published `backloggd-py` 0.2.1 cannot confirm that collection is complete. The bot keeps the previous cache rather than replacing it with partial data. |
+| A library refresh fails with 70+ Playing games | The SDK only reads the first Playing page and cannot confirm that collection is complete. The bot keeps the previous cache rather than replacing it with partial data. |
 | Docker cannot write its database | Check volume placement and permissions for the container's non-root user. |
 
 ## Development
