@@ -3,7 +3,7 @@ from collections import Counter, defaultdict
 from dataclasses import replace
 from datetime import datetime
 import hashlib
-from bot.feed_models import FeedEvent
+from bot.feed_models import GROUPED_RATING_ID_PREFIX, FeedEvent
 
 VISIBLE_ACTIONS = {"playing", "completed", "rated", "reviewed", "replay"}
 
@@ -66,7 +66,9 @@ def merge_milestones(activities, logs):
     for event in activities:
         key = match_key(event)
         matches = log_groups.get(key, []) if key else []
-        linked = [log for log in logs if log.activity_id in event.event_ids]
+        linked = [
+            log for log in logs if log.activity_id in event.event_ids
+        ] if event.action_type in {"playing", "completed", "replay"} else []
         if len(linked) == 1 or (key is not None and len(activity_groups[key]) == 1 and len(matches) == 1):
             log = linked[0] if linked else matches[0]
             event = replace(event, played_date=log.played_date,
@@ -143,18 +145,36 @@ def link_backdated_milestones(merged, *, baseline_or_saved_ids=(), uncertain_jou
     return updated, uncertain_reasons
 
 
-def merge_ratings_and_reviews(merged):
+def merge_ratings_and_reviews(merged, *, baseline_ids=frozenset()):
     merged = list(merged)
-    # Review/rating prose can enrich a milestone only when an exact event
-    # timestamp or a numeric permalink ties them to the same action.
+    grouped_rating_counts = Counter(
+        (e.game_slug, calendar_date(e.occurred_at))
+        for e in merged if e.activity_id.startswith(GROUPED_RATING_ID_PREFIX)
+    )
     result = []
     for event in merged:
         if event.action_type in {"rated", "reviewed"}:
+            is_grouped_rating = event.activity_id.startswith(GROUPED_RATING_ID_PREFIX)
             matches = [e for e in merged if e.action_type in {"playing", "completed", "replay"}
                        and e.game_slug == event.game_slug
                        and ((e.reference and e.reference == event.reference)
                             or (e.occurred_at and e.occurred_at == event.occurred_at)
                             or event.activity_id in e.event_ids)]
+            if is_grouped_rating:
+                matches = [e for e in matches if e.activity_id not in baseline_ids]
+            if not matches and is_grouped_rating:
+                day = calendar_date(event.occurred_at)
+                if day and grouped_rating_counts[event.game_slug, day] == 1:
+                    matches = [
+                        e for e in merged
+                        if e.action_type in {"playing", "completed", "replay"}
+                        and e.game_slug == event.game_slug
+                        and e.activity_id not in baseline_ids
+                        and calendar_date(e.played_date) == day
+                        and (e.source == "journal" or any(alias.startswith("journal_") for alias in e.event_ids))
+                    ]
+                    if any(e.rating is not None and e.rating != event.rating for e in matches):
+                        matches = []
             if len(matches) == 1:
                 index = merged.index(matches[0])
                 combined = replace(matches[0], review_notes=event.review_notes or matches[0].review_notes,

@@ -628,6 +628,20 @@ class Database:
             for row in rows
         }
 
+    async def get_cached_profile_rating_evidence(self, profile_key: str, game_slugs: Iterable[str]) -> dict:
+        """Read just the named games and their library snapshot timestamp."""
+        result = {}
+        for chunk in _iter_sql_chunks(list(dict.fromkeys(game_slugs)), fixed_params=1):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT r.game_slug, r.rating, p.last_synced_at
+                    FROM profile_ratings AS r JOIN profiles AS p USING (profile_key)
+                    WHERE r.profile_key = ? AND r.game_slug IN ({placeholders})""",
+                [profile_key, *chunk],
+            )
+            result.update((row["game_slug"], (row["last_synced_at"], row["rating"])) for row in rows)
+        return result
+
     async def get_profile_stats(self, username: str) -> dict:
         """Fetch aggregate rating stats once for a Backloggd profile."""
         row = await self._fetchone("""
@@ -3877,6 +3891,20 @@ class Database:
             ))
         await self._execute_batch(statements)
         self._clear_feed_delivery_tokens(guild_id, normalized_key, aliases)
+
+    async def get_profile_activity_observations(
+        self, profile_key: str, source: str, keys: Iterable[str],
+    ) -> dict[str, str]:
+        result = {}
+        for chunk in _iter_sql_chunks(list(dict.fromkeys(keys)), fixed_params=2):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT observation_key, fingerprint FROM profile_activity_observations
+                    WHERE profile_key = ? AND source = ? AND observation_key IN ({placeholders})""",
+                [profile_key, source, *chunk],
+            )
+            result.update((row["observation_key"], row["fingerprint"]) for row in rows)
+        return result
 
     async def record_profile_activity_observations(
         self,

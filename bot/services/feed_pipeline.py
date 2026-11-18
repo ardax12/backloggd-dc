@@ -29,11 +29,12 @@ from bot.feed_decisions import (
     prepare_feed_candidates,
 )
 from bot.services.guild_membership import resolve_guild_member_ids
+from bot.services.grouped_ratings import resolve_grouped_ratings
 from bot.services.library_sync import parse_sync_timestamp
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url
-from bot.feed_models import FeedEvent
+from bot.feed_models import GROUPED_RATING_ID_PREFIX, FeedEvent
 
 logger = logging.getLogger("backloggd.services.feed_pipeline")
 
@@ -440,6 +441,11 @@ class FeedPipeline:
                 "had_prior_failure": had_prior_failure,
                 "observed_at": health_now,
             }
+            if any(getattr(entry, "grouped_games", ()) for entry in entries):
+                previous_poll_at = parse_utc_datetime(health["last_success_at"]) if health else None
+                parsed.extend(await resolve_grouped_ratings(
+                    self.bot, profile_key, username, entries, previous_poll_at, health_now,
+                ))
             await database.record_feed_source_success(
                 profile_key,
                 "activity",
@@ -813,7 +819,8 @@ class FeedPipeline:
         events = self._keep_old_posted_sessions_and_unlink_old_baselines(
             events, explicit_actions, saved, now
         )
-        events = merge_ratings_and_reviews(events)
+        baseline_ids = {event_id for event_id, row in saved.items() if row["delivery_state"] == "baseline"}
+        events = merge_ratings_and_reviews(events, baseline_ids=baseline_ids)
         events.sort(key=lambda e: e.occurred_at or calendar_date(e.played_date) or "")
         activity_history_sources: dict[str, FeedEvent] = {
             previous.activity_id: previous
@@ -953,7 +960,7 @@ class FeedPipeline:
                 if event.action_type == "rated" and old.get("rating") != event.rating:
                     previous_rating = old.get("rating")
                 event = replace(event, previous_rating=previous_rating)
-        elif event.action_type == "rated":
+        elif event.action_type == "rated" and not event.activity_id.startswith(GROUPED_RATING_ID_PREFIX):
             old_rating = self._previous_rating_from_history(
                 event,
                 activity_rating_history.get(event.game_slug, ()),

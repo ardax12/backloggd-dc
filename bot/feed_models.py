@@ -3,6 +3,8 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 from backloggd import ActivityEntry
 
+GROUPED_RATING_ID_PREFIX = "group_rating_"
+
 
 @dataclass(slots=True, frozen=True)
 class FeedEvent(ActivityEntry):
@@ -15,4 +17,8 @@ class FeedEvent(ActivityEntry):
 
     @classmethod
     def from_activity(cls, entry: ActivityEntry) -> "FeedEvent":
-        return entry if isinstance(entry, cls) else cls(**asdict(entry))
+        if isinstance(entry, cls):
+            return entry
+        fields = asdict(entry)
+        fields.pop("grouped_games", None)
+        return cls(**fields)
