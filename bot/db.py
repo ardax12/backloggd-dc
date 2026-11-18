@@ -15,7 +15,7 @@ import libsql_client
 
 from bot.config import DATABASE_PATH, LIBSQL_AUTH_TOKEN, LIBSQL_DATABASE_URL
 from bot.feed_policy import FEED_DECISION_PRIORITY, group_event_aliases
-from bot.db_adapter import execute_batch_statements, open_transaction
+from bot.db_adapter import execute_batch_statements, normalize_libsql_row, open_transaction
 
 logger = logging.getLogger("backloggd.db")
 
@@ -198,7 +198,7 @@ class Database:
         async with self._acquire_operation_lock():
             if self.is_turso:
                 rs = await self._client.execute(query, list(params))
-                return rs.rows[0] if rs.rows else None
+                return normalize_libsql_row(rs.rows[0]) if rs.rows else None
             async with self._conn.execute(query, params) as cursor:
                 return await cursor.fetchone()
 
@@ -207,7 +207,7 @@ class Database:
         async with self._acquire_operation_lock():
             if self.is_turso:
                 rs = await self._client.execute(query, list(params))
-                return list(rs.rows)
+                return [normalize_libsql_row(row) for row in rs.rows]
             async with self._conn.execute(query, params) as cursor:
                 return await cursor.fetchall()
 

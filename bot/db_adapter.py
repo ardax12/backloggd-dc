@@ -10,8 +10,14 @@ from urllib.parse import urljoin, urlsplit
 from libsql_client import LibsqlError
 from libsql_client.hrana.convert import _result_set_from_proto, _stmt_to_proto
 from libsql_client.http import HttpClient
+from libsql_client.result import Row
 
 logger = logging.getLogger('backloggd.db')
+
+
+def normalize_libsql_row(row: Any) -> Any:
+    """Expose real libSQL results as mappings for named-column consumers."""
+    return row.asdict() if isinstance(row, Row) else row
 
 
 class _HttpTransaction:
@@ -85,14 +91,14 @@ class TransactionAdapter:
     async def fetchone(self, query: str, params: Sequence[Any] = ()) -> Optional[Any]:
         if self._tx is not None:
             result = await self._tx.execute(query, list(params))
-            return result.rows[0] if result.rows else None
+            return normalize_libsql_row(result.rows[0]) if result.rows else None
         async with self._conn.execute(query, tuple(params)) as cursor:
             return await cursor.fetchone()
 
     async def fetchall(self, query: str, params: Sequence[Any] = ()) -> list[Any]:
         if self._tx is not None:
             result = await self._tx.execute(query, list(params))
-            return list(result.rows)
+            return [normalize_libsql_row(row) for row in result.rows]
         async with self._conn.execute(query, tuple(params)) as cursor:
             return list(await cursor.fetchall())
 
