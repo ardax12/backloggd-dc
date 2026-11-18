@@ -63,7 +63,7 @@ def format_status(status: str) -> str:
     if status_lower in ("unknown", "none", ""):
         return "Status unknown"
     mapping = {
-        "played": "In Played collection",
+        "played": "Played",
         "playing": "▶️ Playing",
         "backlog": "⏳ Backlog",
         "wishlist": "💖 Wishlist",
