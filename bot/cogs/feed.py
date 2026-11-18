@@ -170,6 +170,75 @@ class FeedCog(commands.Cog, name="Feed"):
             return "Active (incomplete coverage)"
         return "Active"
 
+    @staticmethod
+    def _status_row_value(row, key: str, default=None):
+        if isinstance(row, dict):
+            return row.get(key, default)
+        keys = row.keys() if hasattr(row, "keys") else ()
+        return row[key] if key in keys else default
+
+    @classmethod
+    def _describe_feed_status_lead(
+        cls,
+        *,
+        channel_id,
+        target_issue: str | None,
+        member_ids,
+        is_candidate: bool,
+        status: dict,
+    ) -> str:
+        if channel_id is None:
+            return "Ask a server admin to set a feed channel with `/setchannel`."
+        if target_issue:
+            return "Ask a server admin to check the channel and the bot's permissions."
+        if member_ids is None or status.get("pending_reconciliation"):
+            return "Discord hasn't confirmed participation yet. Check again after the next feed poll."
+        if not is_candidate:
+            return "Use `/feed on` to enroll your linked profile in this server."
+
+        health_rows = status.get("source_health") or []
+        if any(cls._status_row_value(row, "last_error") for row in health_rows):
+            return "Backloggd couldn't be checked. Check again after the next poll."
+
+        recipient_gap = status.get("recipient_gap")
+        has_attributed_recipient_gaps = bool(status.get("has_attributed_recipient_gaps"))
+
+        def _is_masked_shared_recipient_gap(row) -> bool:
+            if recipient_gap is not None or not has_attributed_recipient_gaps:
+                return False
+            return cls._status_row_value(row, "gap_reason") in {"unavailable_feed_target", "delivery_failure"}
+
+        has_legacy_recipient_gap = any(
+            not _is_masked_shared_recipient_gap(row)
+            and cls._status_row_value(row, "unresolved_gap_since") is not None
+            and cls._status_row_value(row, "gap_reason") in {"unavailable_feed_target", "delivery_failure"}
+            for row in health_rows
+        )
+        if recipient_gap is not None or has_legacy_recipient_gap:
+            return "Recent activity may be delayed in this server. Check the feed channel and try status again after the next poll."
+
+        initialized = set(status.get("initialized_sources") or ())
+        if not status.get("active") or not {"activity-display-v1", "journal-display-v1"}.issubset(initialized):
+            return "The feed is waiting for its first successful check. No action is needed."
+
+        has_incomplete_history = any(
+            not _is_masked_shared_recipient_gap(row)
+            and (
+                cls._status_row_value(row, "unresolved_gap_since") is not None
+                or cls._status_row_value(row, "gap_reason") is not None
+                or cls._status_row_value(row, "coverage") in {"limited", "unsupported"}
+            )
+            for row in health_rows
+        )
+        if has_incomplete_history:
+            return "Older activity may be missing because Backloggd only exposed part of its history."
+
+        deliveries = status.get("delivery_counts") or {}
+        if (deliveries.get("unknown") or 0) > 0:
+            return "Discord may already have posted some of this activity. Check the feed channel."
+
+        return "The feed is active. No action is needed."
+
     @app_commands.command(name="setchannel", description="Set the channel where automatic Backloggd playthrough logs are posted")
     @app_commands.describe(channel="The text channel for game log announcements")
     @app_commands.guild_only()
@@ -383,7 +452,17 @@ class FeedCog(commands.Cog, name="Feed"):
         else:
             source_summary = "None"
 
+        lead_sentence = self._describe_feed_status_lead(
+            channel_id=channel_id,
+            target_issue=target_issue,
+            member_ids=member_ids,
+            is_candidate=is_candidate,
+            status=status,
+        )
+
         desc_lines = [
+            lead_sentence,
+            "",
             f"**Profile:** [{escape_display_text(username)}]({build_backloggd_user_url(username)})",
             f"**Your participation:** {'On' if enabled else 'Off'}",
             f"**In this server's feed:** {'Yes' if is_candidate else 'No'} ({source_summary})",
@@ -419,7 +498,7 @@ class FeedCog(commands.Cog, name="Feed"):
 
         embed = discord.Embed(
             title="Server Feed Status",
-            description="\n".join(desc_lines),
+            description=clamp_escaped_text("\n".join(desc_lines), 4096),
             color=discord.Color.blurple(),
         )
 
