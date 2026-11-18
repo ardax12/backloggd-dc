@@ -5,8 +5,65 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import logging
 from typing import Any, AsyncIterator, Iterable, Optional, Sequence
+from urllib.parse import urljoin, urlsplit
+
+from libsql_client import LibsqlError
+from libsql_client.hrana.convert import _result_set_from_proto, _stmt_to_proto
+from libsql_client.http import HttpClient
 
 logger = logging.getLogger('backloggd.db')
+
+
+class _HttpTransaction:
+    """Keep an interactive transaction on one Hrana HTTP stream.
+
+    libsql-client 0.3.1 lacks HTTP transactions. Reuse its authenticated
+    transport and wire codecs while carrying the stream baton ourselves.
+    """
+
+    def __init__(self, client: HttpClient, url: str) -> None:
+        self._client = client
+        self._base_url = url
+        self._baton: str | None = None
+
+    async def _execute(self, sql: str, args: Sequence[Any] = (), *, finish: bool = False):
+        requests = [{"type": "execute", "stmt": _stmt_to_proto(sql, list(args))}]
+        if finish:
+            requests.append({"type": "close"})
+        response = await self._client._send(
+            "POST", urljoin(self._base_url.rstrip("/") + "/", "v3/pipeline"),
+            {"baton": self._baton, "requests": requests},
+        )
+        self._baton = response["baton"]
+        if base_url := response.get("base_url"):
+            location = urlsplit(base_url)
+            if (
+                location.scheme != urlsplit(self._base_url).scheme
+                or not location.hostname or location.username is not None
+            ):
+                self._baton = None
+                raise LibsqlError("Invalid transaction stream URL", "PROTOCOL_ERROR")
+            self._base_url = base_url
+        results = response["results"]
+        if len(results) != len(requests):
+            raise LibsqlError("Incomplete transaction pipeline response", "PROTOCOL_ERROR")
+        for result in results:
+            if result["type"] == "error":
+                error = result["error"]
+                raise LibsqlError(error["message"], error.get("code") or "UNKNOWN")
+        if not finish and not self._baton:
+            raise LibsqlError("Transaction stream closed before commit", "PROTOCOL_ERROR")
+        return _result_set_from_proto(results[0]["response"]["result"])
+
+    async def execute(self, sql: str, args: Sequence[Any] = ()):
+        return await self._execute(sql, args)
+
+    async def commit(self) -> None:
+        await self._execute("COMMIT", finish=True)
+
+    async def rollback(self) -> None:
+        if self._baton:
+            await self._execute("ROLLBACK", finish=True)
 
 
 class TransactionAdapter:
@@ -55,8 +112,12 @@ async def open_transaction(database: Any) -> AsyncIterator[TransactionAdapter]:
     """Acquire Database's non-reentrant operation lock once and wrap commit/rollback."""
     async with database._acquire_operation_lock():
         if database.is_turso:
-            tx = database._client.transaction()
+            client = database._client
+            is_http = isinstance(client, HttpClient)
+            tx = _HttpTransaction(client, database.turso_url) if is_http else client.transaction()
             try:
+                if is_http:
+                    await tx.execute("BEGIN IMMEDIATE")
                 yield TransactionAdapter(turso_tx=tx)
                 await tx.commit()
             except BaseException:
