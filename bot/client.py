@@ -1,12 +1,16 @@
 """Custom Discord Bot Client with lifecycle hooks and Backloggd integration."""
 
 import asyncio
+import logging
+import math
+from pathlib import Path
+import socket
+from typing import Optional
+
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-import logging
-from pathlib import Path
-from typing import Optional
 from backloggd import BackloggdClient
 from bot.command_errors import handle_app_command_error
 from bot.db import Database
@@ -17,8 +21,40 @@ from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.bot")
 
+_DEFAULT_COMMAND_SYNC_RETRY_DELAYS = (5.0, 15.0)
+_DEFAULT_COMMAND_SYNC_RETRY_BUDGET = 60.0
+
+
+def _retry_after_seconds(error: Exception) -> Optional[float]:
+    value = getattr(error, "retry_after", None)
+    if value is None:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None) or getattr(error, "headers", None) or {}
+        value = headers.get("Retry-After", headers.get("retry-after"))
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (ValueError, TypeError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _is_transient_command_sync_error(error: Exception) -> bool:
+    if isinstance(error, (discord.RateLimited, discord.DiscordServerError)):
+        return True
+    if isinstance(error, (discord.HTTPException, aiohttp.ClientResponseError)):
+        return error.status in (408, 429) or 500 <= error.status < 600
+    return isinstance(error, (aiohttp.ClientError, TimeoutError, ConnectionError, socket.gaierror))
+
+
 class BackloggdBot(commands.Bot):
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        command_sync_retry_delays: tuple[float, ...] = _DEFAULT_COMMAND_SYNC_RETRY_DELAYS,
+        command_sync_retry_budget: float = _DEFAULT_COMMAND_SYNC_RETRY_BUDGET,
+    ):
         intents = discord.Intents.default()
         intents.members = True          # Required for server-specific member queries
         intents.message_content = False  # Slash commands only; message content is unused
@@ -39,6 +75,10 @@ class BackloggdBot(commands.Bot):
         self.library_sync = LibrarySyncService(max_workers=2)
         self.guild_membership = GuildMembershipService()
         self._close_task: Optional[asyncio.Task] = None
+        self._command_sync_task: Optional[asyncio.Task] = None
+        self._closing: bool = False
+        self._command_sync_retry_delays = tuple(float(delay) for delay in command_sync_retry_delays)
+        self._command_sync_retry_budget = float(command_sync_retry_budget)
         self.tree.error(self.on_app_command_error)
 
     async def on_app_command_error(
@@ -47,6 +87,100 @@ class BackloggdBot(commands.Bot):
         error: app_commands.AppCommandError,
     ) -> None:
         await handle_app_command_error(interaction, error, log=logger)
+
+    async def _start_command_sync(self) -> None:
+        if self._closing or (self._command_sync_task is not None and not self._command_sync_task.done()):
+            return
+
+        sync_guild = discord.Object(id=DEV_GUILD_ID) if DEV_GUILD_ID else None
+        scope = f"dev guild {sync_guild.id}" if sync_guild else "global"
+        if not self.application_id:
+            logger.warning(
+                "Skipped slash command sync (%s): application_id is unavailable; registration stopped.",
+                scope,
+            )
+            return
+        await self._run_command_sync(sync_guild, scope)
+
+    async def _run_command_sync(
+        self,
+        sync_guild: Optional[discord.Object],
+        scope: str,
+        *,
+        attempt: int = 1,
+        delay: float = 0.0,
+        deadline: Optional[float] = None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        delays = self._command_sync_retry_delays
+        max_attempts = 1 + len(delays)
+        while not self._closing:
+            budget = asyncio.timeout_at(deadline)
+            try:
+                async with budget:
+                    if deadline is not None:
+                        await asyncio.sleep(delay)
+                        if self._closing:
+                            return
+                        if loop.time() >= deadline:
+                            raise TimeoutError("retry budget elapsed")
+                    elif sync_guild is not None:
+                        self.tree.copy_global_to(guild=sync_guild)
+                    sync_options = {"guild": sync_guild} if sync_guild is not None else {}
+                    synced = await self.tree.sync(**sync_options)
+            except asyncio.CancelledError:
+                logger.info("Slash command sync (%s) cancelled; registration stopped.", scope)
+                raise
+            except Exception as error:
+                if budget.expired() or (deadline is not None and loop.time() >= deadline):
+                    reason = "retry budget expired"
+                elif not _is_transient_command_sync_error(error):
+                    reason = "failed permanently"
+                elif attempt == max_attempts:
+                    reason = "retries exhausted"
+                else:
+                    if deadline is None:
+                        deadline = loop.time() + self._command_sync_retry_budget
+                    delay = max(delays[attempt - 1], _retry_after_seconds(error) or 0.0)
+                    if self._closing:
+                        return
+                    if delay < deadline - loop.time():
+                        logger.warning(
+                            "Slash command sync (%s) attempt %d/%d failed (%s); scheduling retry attempt %d/%d in %.2fs.",
+                            scope, attempt, max_attempts, error, attempt + 1, max_attempts, delay,
+                        )
+                        if attempt == 1:
+                            # Let startup proceed while the scheduled retries run.
+                            self._command_sync_task = asyncio.create_task(
+                                self._run_command_sync(sync_guild, scope, attempt=2, delay=delay, deadline=deadline)
+                            )
+                            return
+                        attempt += 1
+                        continue
+                    reason = f"retry skipped because {delay:.2f}s delay exceeds retry budget"
+
+                logger.error(
+                    "Slash command sync (%s) attempt %d/%d: %s (%s); registration stopped.",
+                    scope, attempt, max_attempts, reason, error,
+                )
+                return
+
+            logger.info(
+                "Synced %d slash commands (%s) on attempt %d/%d; registration complete.",
+                len(synced), scope, attempt, max_attempts,
+            )
+            return
+
+    async def _close_command_sync(self) -> None:
+        task = self._command_sync_task
+        if task is not None:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            # The bot's owned shutdown task already shields this drain from callers.
+            result, = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(result, Exception):
+                logger.debug("Command sync task raised during shutdown", exc_info=result)
+            self._command_sync_task = None
 
     async def setup_hook(self) -> None:
         """Called automatically before bot logs into Discord."""
@@ -72,30 +206,20 @@ class BackloggdBot(commands.Bot):
                 raise RuntimeError(f"Required extension {ext} failed to load") from e
 
         # 3. Slash Command Sync
-        try:
-            if self.application_id:
-                if DEV_GUILD_ID:
-                    guild = discord.Object(id=DEV_GUILD_ID)
-                    self.tree.copy_global_to(guild=guild)
-                    synced = await self.tree.sync(guild=guild)
-                    logger.info("Synced %d slash commands to Dev Guild ID: %d", len(synced), DEV_GUILD_ID)
-                else:
-                    synced = await self.tree.sync()
-                    logger.info("Globally synced %d slash commands", len(synced))
-            else:
-                logger.info("Application ID not set yet; slash commands will sync on bot startup.")
-        except Exception as e:
-            logger.warning("Could not sync slash commands in setup_hook: %s", e)
+        await self._start_command_sync()
 
     async def close(self) -> None:
-        """Idempotently drain cogs, shared services, SDK, DB, and Discord client."""
+        """Idempotently drain command sync, cogs, shared services, SDK, DB, and Discord client."""
+        self._closing = True
         if self._close_task is None:
             logger.info("Shutting down BackloggdBot...")
             discord_close = super().close
 
             async def _shutdown() -> None:
                 errors: list[Exception] = []
-                stages: list[tuple[str, object]] = []
+                stages: list[tuple[str, object]] = [
+                    ("command_sync", self._close_command_sync),
+                ]
                 for cog_name in ("Feed", "Stats", "Account", "Social"):
                     cog = self.get_cog(cog_name)
                     if cog is not None and callable(getattr(cog, "close", None)):
