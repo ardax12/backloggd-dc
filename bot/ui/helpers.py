@@ -61,9 +61,9 @@ def format_status(status: str) -> str:
     """Convert status enum/string into capitalized display with emoji."""
     status_lower = str(status).lower().strip()
     if status_lower in ("unknown", "none", ""):
-        return "🎮 Played"
+        return "Status unknown"
     mapping = {
-        "played": "🎮 Played",
+        "played": "In Played collection",
         "playing": "▶️ Playing",
         "backlog": "⏳ Backlog",
         "wishlist": "💖 Wishlist",

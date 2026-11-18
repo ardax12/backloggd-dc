@@ -112,7 +112,7 @@ def create_game_embed(
     else:
         embed.add_field(
             name=f"👥 {guild_name} Profile Ratings"[:256],
-            value="*No connected Backloggd profiles have rated or logged this game yet.*",
+            value="*No cached library entries for this game from connected Backloggd profiles.*",
             inline=False
         )
 
@@ -567,7 +567,7 @@ def create_all_ratings_embed(
     page: int = 1,
     per_page: int = 15
 ) -> discord.Embed:
-    """Construct a paginated embed showing each linked profile that logged/rated a game."""
+    """Construct a paginated embed showing linked profiles' rating and collection status."""
     total_ratings = len(server_ratings)
     total_pages = max(1, (total_ratings + per_page - 1) // per_page)
     current_page = max(1, min(page, total_pages))
@@ -579,7 +579,7 @@ def create_all_ratings_embed(
     embed = discord.Embed(
         title=f"👥 {game_title} — All {guild_name} Ratings"[:256],
         url=build_backloggd_game_url(game_slug),
-        description=f"Showing **{start_idx + 1}–{min(end_idx, total_ratings)}** of **{total_ratings}** profiles who logged this game:\n",
+        description=f"Showing **{start_idx + 1}–{min(end_idx, total_ratings)}** of **{total_ratings}** profiles with this game in their library:\n",
         color=COLOR_PRIMARY
     )
 

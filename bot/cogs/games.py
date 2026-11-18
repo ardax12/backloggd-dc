@@ -269,6 +269,30 @@ class GamesCog(commands.Cog, name="Games"):
                 require_subscribed=True,
             )
             server_ratings = await self.bot.db.get_server_ratings_for_game(guild_member_ids, game_data.slug)
+            missing_scores = {
+                row["profile_key"]: index
+                for index, row in enumerate(server_ratings)
+                if row["rating"] is None and row["status"] in {"played", "unknown"}
+            }
+            if missing_scores:
+                linked = await self.bot.db.get_linked_user(interaction.user.id)
+                if linked and linked["profile_key"] in missing_scores:
+                    index = missing_scores[linked["profile_key"]]
+                    row = server_ratings[index]
+                    try:
+                        rating = await asyncio.wait_for(
+                            self.bot.backloggd.get_user_game_rating(row["backloggd_username"], game_data.slug),
+                            timeout=4.0,
+                        )
+                    except Exception as error:
+                        logger.debug("Live game rating unavailable for %s: %s", game_data.slug, type(error).__name__)
+                    else:
+                        if rating is not None:
+                            server_ratings = list(server_ratings)
+                            server_ratings[index] = {**dict(row), "rating": rating}
+                            server_ratings.sort(key=lambda item: (
+                                item["rating"] is None, -(item["rating"] or 0), item["backloggd_username"],
+                            ))
 
             guild_name = interaction.guild.name if interaction.guild else "Server"
             embed = create_game_embed(
