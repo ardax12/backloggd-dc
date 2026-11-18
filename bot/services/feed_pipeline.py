@@ -29,7 +29,7 @@ from bot.feed_decisions import (
     prepare_feed_candidates,
 )
 from bot.services.guild_membership import resolve_guild_member_ids
-from bot.services.library_sync import parse_sync_timestamp, schedule_profile_refresh
+from bot.services.library_sync import parse_sync_timestamp
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url
@@ -312,7 +312,7 @@ class FeedPipeline:
         username: str,
         sources: dict[str, list[FeedEvent]],
     ) -> bool:
-        """Persist profile-level relevant fingerprints before per-guild feed filtering."""
+        """Persist profile-level relevant fingerprints and mark subscribed libraries stale without syncing."""
         if not sources:
             return False
         total_changed = 0
@@ -332,33 +332,17 @@ class FeedPipeline:
                     non_initial_changes = True
                 else:
                     initial_relevant_events.extend(relevant)
-        has_pending = (await self.bot.db.get_profile_refresh_pending_token(profile_key)) is not None
-        if total_changed > 0:
-            is_subscribed = await self.bot.db.is_profile_library_subscribed(profile_key)
-            if (
-                is_subscribed
-                and not has_pending
-                and not non_initial_changes
-                and await self._initial_observations_covered_by_sync(profile_key, initial_relevant_events)
-            ):
-                return False
-            if is_subscribed:
-                await self.bot.db.set_profile_refresh_pending(profile_key, uuid.uuid4().hex)
-        else:
-            if not has_pending:
-                return False
-            is_subscribed = await self.bot.db.is_profile_library_subscribed(profile_key)
-            if not is_subscribed:
-                await self.bot.db.clear_profile_refresh_pending(profile_key)
-                return False
-        await schedule_profile_refresh(
-            self.bot,
-            username,
-            dirty=total_changed > 0,
-            now=self.clock(),
-            require_subscribed=True,
-            subscribed=is_subscribed,
-        )
+        if total_changed == 0:
+            return False
+        is_subscribed = await self.bot.db.is_profile_library_subscribed(profile_key)
+        if not is_subscribed:
+            return False
+        if (
+            not non_initial_changes
+            and await self._initial_observations_covered_by_sync(profile_key, initial_relevant_events)
+        ):
+            return False
+        await self.bot.db.set_profile_refresh_pending(profile_key, uuid.uuid4().hex)
         return True
 
 
@@ -514,9 +498,48 @@ class FeedPipeline:
     async def _load_and_initialize_history(self, target, sources) -> FeedHistory:
         """Reconcile identities, establish atomic baselines, and restore unsent work."""
         guild_id, profile_key = target.guild_id, target.profile_key
-        rows = await self.bot.db.get_feed_messages(guild_id, profile_key)
-        saved = {row["event_id"]: row for row in rows}
         sources = {source: list(events) for source, events in sources.items()}
+        pending = await self.bot.db.get_pending_feed_observations(guild_id, profile_key)
+        pending_events: list[FeedEvent] = []
+        for row in pending:
+            data = json.loads(row["payload"])
+            data["event_ids"] = tuple(data.get("event_ids", ()))
+            data["session_labels"] = tuple(data.get("session_labels", ()))
+            pending_events.append(FeedEvent(**data))
+
+        seed_ids: list[str] = []
+        seed_games: list[str] = []
+        seed_refs: list[str] = []
+        for source_events in sources.values():
+            for event in source_events:
+                if event.activity_id:
+                    seed_ids.append(event.activity_id)
+                for eid in event.event_ids:
+                    if eid:
+                        seed_ids.append(eid)
+                if event.game_slug:
+                    seed_games.append(event.game_slug)
+                if event.reference:
+                    seed_refs.append(event.reference)
+        for event in pending_events:
+            if event.activity_id:
+                seed_ids.append(event.activity_id)
+            for eid in event.event_ids:
+                if eid:
+                    seed_ids.append(eid)
+            if event.game_slug:
+                seed_games.append(event.game_slug)
+            if event.reference:
+                seed_refs.append(event.reference)
+
+        rows = list(await self.bot.db.get_relevant_feed_messages(
+            guild_id,
+            profile_key,
+            event_ids=seed_ids,
+            game_slugs=seed_games,
+            references=seed_refs,
+        ))
+        saved = {row["event_id"]: row for row in rows}
         persisted_aliases, canonical_activity, canonical_journal, row_events_by_id = (
             self._parse_persisted_feed_history(rows)
         )
@@ -539,6 +562,7 @@ class FeedPipeline:
                     resolved_event_ids=resolved_event_ids,
                 )
         new_journal_baseline_ids = set()
+        newly_seeded_ids: set[str] = set()
         any_first_baseline = False
         for source, events in sources.items():
             # Empty successful sources are baselined too. A source absent from
@@ -576,19 +600,26 @@ class FeedPipeline:
                 any_first_baseline = True
                 if source == "journal":
                     new_journal_baseline_ids.update(ids)
+                for eid, payload in baseline_payloads.items():
+                    if eid and (not isinstance(eid, str) or eid.strip()) and eid not in saved:
+                        newly_seeded_ids.add(eid)
+                        row_dict = {
+                            "event_id": eid,
+                            "payload": payload,
+                            "message_id": None,
+                            "channel_id": None,
+                            "delivery_state": "baseline",
+                        }
+                        rows.append(row_dict)
+                        saved[eid] = row_dict
         if any_first_baseline:
-            # Refresh the lookup and canonical maps to include the baseline just written.
-            rows = await self.bot.db.get_feed_messages(guild_id, profile_key)
-            saved = {row["event_id"]: row for row in rows}
+            # Refresh the lookup and canonical maps from the working set with newly seeded rows.
             persisted_aliases, canonical_activity, canonical_journal, row_events_by_id = (
                 self._parse_persisted_feed_history(rows)
             )
-        pending = await self.bot.db.get_pending_feed_observations(guild_id, profile_key)
-        for row in pending:
-            data = json.loads(row["payload"])
-            data["event_ids"] = tuple(data.get("event_ids", ()))
-            data["session_labels"] = tuple(data.get("session_labels", ()))
-            event = FeedEvent(**data)
+        for event in pending_events:
+            if event.activity_id in newly_seeded_ids:
+                continue
             source_events = sources.setdefault(event.source, [])
             if all(candidate.activity_id != event.activity_id for candidate in source_events):
                 source_events.append(event)
@@ -807,8 +838,10 @@ class FeedPipeline:
 
         journal_rating_history: dict[str, list[tuple[datetime, float]]] = {}
         journal_rating_times_unknown: set[str] = set()
+        rated_game_slugs = {e.game_slug for e in events if e.action_type == "rated"}
         journal_rating_events = [
-            event for event in canonical_journal.values() if event.rating is not None
+            event for event in canonical_journal.values()
+            if event.rating is not None and event.game_slug in rated_game_slugs
         ]
         if journal_rating_events:
             journal_decisions = await self.bot.db.get_feed_event_decisions(
@@ -910,7 +943,12 @@ class FeedPipeline:
                     )
                 )
             else:
-                old = json.loads(record["payload"])
+                try:
+                    old = json.loads(record["payload"])
+                    if not isinstance(old, dict):
+                        old = {}
+                except (TypeError, ValueError):
+                    old = {}
                 previous_rating = old.get("previous_rating")
                 if event.action_type == "rated" and old.get("rating") != event.rating:
                     previous_rating = old.get("rating")
@@ -1350,18 +1388,32 @@ class FeedPipeline:
         row_bindings: list[tuple[str, tuple[str, str]]] = []
         row_events_by_id: dict[str, FeedEvent] = {}
         for row in rows:
-            data = json.loads(row["payload"])
-            data["event_ids"] = tuple(data.get("event_ids") or ())
-            data["session_labels"] = tuple(data.get("session_labels") or ())
-            event = FeedEvent(**data)
+            try:
+                data = json.loads(row["payload"])
+                if not isinstance(data, dict):
+                    continue
+                data["event_ids"] = tuple(data.get("event_ids") or ())
+                data["session_labels"] = tuple(data.get("session_labels") or ())
+                event = FeedEvent(**data)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping malformed persisted feed payload for event_id=%r",
+                    dict(row).get("event_id") if hasattr(row, "keys") else None,
+                )
+                continue
             row_id = cls._valid_alias(row["event_id"])
             if row_id:
                 row_events_by_id[row_id] = event
             canonical_key = (event.source, event.activity_id)
             state = dict(row).get("delivery_state")
+            message_id = row["message_id"]
+            # Like delivery, prefer the oldest saved message among competing
+            # sent aliases. The row ID breaks remaining ties across lookup batches.
             rank = (
-                0 if row["message_id"] is not None else 1,
+                0 if message_id is not None else 1,
                 0 if state in {"sent", "deleted", "pending", "unknown"} else 1,
+                message_id if message_id is not None else 0,
+                row_id or "",
             )
             group = canonical_groups.get(canonical_key)
             if group is None:
@@ -1379,7 +1431,7 @@ class FeedPipeline:
 
         canonical_events: dict[tuple[str, str], FeedEvent] = {}
         canonical_by_source: dict[str, dict[str, FeedEvent]] = {"activity": {}, "journal": {}}
-        alias_ranks: dict[str, tuple[int, int]] = {}
+        alias_ranks: dict[str, tuple[int, int, int, str]] = {}
         persisted_aliases: dict[str, FeedEvent] = {}
 
         for canonical_key, group in canonical_groups.items():

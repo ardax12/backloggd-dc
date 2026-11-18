@@ -508,41 +508,70 @@ class Database:
         return connections
 
     async def get_profile_sync_info(self, username: str) -> Optional[dict[str, Any]]:
-        """Return the profile's last complete sync time, sync health, and cached row count."""
+        """Return the profile's last complete sync time, sync health, cached count, and pending token."""
         row = await self._fetchone("""
             SELECT profiles.profile_key, profiles.display_username,
                    profiles.last_synced_at, profiles.last_sync_attempt_at,
                    profiles.last_sync_error,
-                   COUNT(profile_ratings.game_slug) AS game_count
+                   COUNT(profile_ratings.game_slug) AS game_count,
+                   pending.fingerprint AS pending_refresh_token
             FROM profiles
             LEFT JOIN profile_ratings ON profile_ratings.profile_key = profiles.profile_key
+            LEFT JOIN profile_activity_observations AS pending
+                   ON pending.profile_key = profiles.profile_key
+                  AND pending.source = ?
+                  AND pending.observation_key = ?
             WHERE profiles.profile_key = LOWER(TRIM(?))
             GROUP BY profiles.profile_key, profiles.display_username,
                      profiles.last_synced_at, profiles.last_sync_attempt_at,
-                     profiles.last_sync_error
-        """, (username.strip(),))
+                     profiles.last_sync_error, pending.fingerprint
+        """, (self._LIBRARY_SYNC_SOURCE, self._PENDING_REFRESH_KEY, username.strip()))
         return dict(row) if row is not None else None
 
     async def get_profiles_sync_info(self, profile_keys: Iterable[str]) -> dict[str, dict[str, Any]]:
         """Return sync freshness metadata keyed by normalized profile_key."""
         normalized = list(dict.fromkeys(key.strip().lower() for key in profile_keys if key and key.strip()))
         result: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(normalized):
+        for chunk in _iter_sql_chunks(normalized, fixed_params=2):
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._fetchall(f"""
                 SELECT profiles.profile_key, profiles.display_username,
                        profiles.last_synced_at, profiles.last_sync_attempt_at,
                        profiles.last_sync_error,
-                       COUNT(profile_ratings.game_slug) AS game_count
+                       COUNT(profile_ratings.game_slug) AS game_count,
+                       pending.fingerprint AS pending_refresh_token
                 FROM profiles
                 LEFT JOIN profile_ratings ON profile_ratings.profile_key = profiles.profile_key
+                LEFT JOIN profile_activity_observations AS pending
+                       ON pending.profile_key = profiles.profile_key
+                      AND pending.source = ?
+                      AND pending.observation_key = ?
                 WHERE profiles.profile_key IN ({placeholders})
                 GROUP BY profiles.profile_key, profiles.display_username,
                          profiles.last_synced_at, profiles.last_sync_attempt_at,
-                         profiles.last_sync_error
-            """, chunk)
+                         profiles.last_sync_error, pending.fingerprint
+            """, [self._LIBRARY_SYNC_SOURCE, self._PENDING_REFRESH_KEY, *chunk])
             for row in rows:
                 result[row["profile_key"]] = dict(row)
+        return result
+
+    async def get_profiles_refresh_pending_tokens(
+        self, profile_keys: Iterable[str],
+    ) -> dict[str, Optional[str]]:
+        """Return active pending refresh tokens keyed by normalized profile_key in bounded chunks."""
+        normalized = list(dict.fromkeys(key.strip().lower() for key in profile_keys if key and key.strip()))
+        result: dict[str, Optional[str]] = {key: None for key in normalized}
+        for chunk in _iter_sql_chunks(normalized, fixed_params=2):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT profile_key, fingerprint
+                    FROM profile_activity_observations
+                    WHERE source = ? AND observation_key = ?
+                      AND profile_key IN ({placeholders})""",
+                [self._LIBRARY_SYNC_SOURCE, self._PENDING_REFRESH_KEY, *chunk],
+            )
+            for row in rows:
+                result[row["profile_key"]] = row["fingerprint"]
         return result
 
     async def is_profile_library_subscribed(self, username: str) -> bool:
@@ -665,24 +694,29 @@ class Database:
         member_ids: List[int],
         exclude_profile_key: Optional[str] = None,
     ) -> List[dict[str, Any]]:
-        """Fetch distinct linked guild profiles with library sync timestamps and errors."""
+        """Fetch distinct linked guild profiles with library sync timestamps, errors, and pending tokens."""
         members = list(dict.fromkeys(int(value) for value in member_ids))
         if not members:
             return []
         excluded = exclude_profile_key.strip().lower() if exclude_profile_key and exclude_profile_key.strip() else None
         exclusion = " AND p.profile_key <> ?" if excluded else ""
-        fixed_params = 1 if excluded else 0
+        fixed_params = 3 if excluded else 2
         profiles: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(members, fixed_params=fixed_params):
             placeholders = ",".join("?" for _ in chunk)
-            params: list[Any] = list(chunk)
+            params: list[Any] = [self._LIBRARY_SYNC_SOURCE, self._PENDING_REFRESH_KEY, *chunk]
             if excluded:
                 params.append(excluded)
             query = f"""
                 SELECT DISTINCT p.profile_key, p.display_username, p.avatar_url,
-                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error
+                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error,
+                       pending.fingerprint AS pending_refresh_token
                 FROM linked_users AS u
                 JOIN profiles AS p ON p.profile_key = u.profile_key
+                LEFT JOIN profile_activity_observations AS pending
+                       ON pending.profile_key = p.profile_key
+                      AND pending.source = ?
+                      AND pending.observation_key = ?
                 WHERE u.discord_id IN ({placeholders}){exclusion}
                 ORDER BY p.profile_key
             """
@@ -2724,18 +2758,23 @@ class Database:
             }
         linked_discord_ids: set[int] = set()
         profiles: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(members):
+        for chunk in _iter_sql_chunks(members, fixed_params=2):
             placeholders = ",".join("?" for _ in chunk)
             query = f"""
                 SELECT u.discord_id,
                        p.profile_key, p.display_username, p.avatar_url,
-                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error
+                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error,
+                       pending.fingerprint AS pending_refresh_token
                 FROM linked_users AS u
                 JOIN profiles AS p ON p.profile_key = u.profile_key
+                LEFT JOIN profile_activity_observations AS pending
+                       ON pending.profile_key = p.profile_key
+                      AND pending.source = ?
+                      AND pending.observation_key = ?
                 WHERE u.discord_id IN ({placeholders})
                 ORDER BY p.profile_key, u.discord_id
             """
-            for row in await self._fetchall(query, chunk):
+            for row in await self._fetchall(query, [self._LIBRARY_SYNC_SOURCE, self._PENDING_REFRESH_KEY, *chunk]):
                 linked_discord_ids.add(int(row["discord_id"]))
                 key = row["profile_key"]
                 if key not in profiles:
@@ -2746,6 +2785,7 @@ class Database:
                         "last_synced_at": row["last_synced_at"],
                         "last_sync_attempt_at": row["last_sync_attempt_at"],
                         "last_sync_error": row["last_sync_error"],
+                        "pending_refresh_token": row["pending_refresh_token"],
                     }
         sorted_keys = sorted(profiles)
         return {
@@ -3476,6 +3516,171 @@ class Database:
                FROM profile_feed_messages WHERE guild_id = ? AND profile_key = ?""",
             (guild_id, profile_key),
         )
+
+    @staticmethod
+    def _iter_relevant_history_batches(
+        ids: list[str],
+        games: list[str],
+        refs: list[str],
+        *,
+        max_json_bytes: int = 32 * 1024,
+    ) -> Iterable[tuple[list[str], list[str], list[str]]]:
+        """Yield (ids, games, refs) batches keeping combined JSON parameter size bounded."""
+        batch_ids: list[str] = []
+        batch_games: list[str] = []
+        batch_refs: list[str] = []
+        current_bytes = 6  # three empty "[]" arrays
+
+        def _item_bytes(value: str) -> int:
+            raw = len(value.encode("utf-8"))
+            if any(ord(ch) < 32 or ord(ch) > 126 or ch in ('"', "\\") for ch in value):
+                return len(value) * 12 + 3
+            return raw + 3
+
+        for kind, items in (("id", ids), ("game", games), ("ref", refs)):
+            for item in items:
+                cost = _item_bytes(item)
+                if (batch_ids or batch_games or batch_refs) and current_bytes + cost > max_json_bytes:
+                    yield batch_ids, batch_games, batch_refs
+                    batch_ids, batch_games, batch_refs = [], [], []
+                    current_bytes = 6
+                if kind == "id":
+                    batch_ids.append(item)
+                elif kind == "game":
+                    batch_games.append(item)
+                else:
+                    batch_refs.append(item)
+                current_bytes += cost
+        if batch_ids or batch_games or batch_refs:
+            yield batch_ids, batch_games, batch_refs
+
+    async def get_relevant_feed_messages(
+        self,
+        guild_id: int,
+        profile_key: str,
+        *,
+        event_ids: Iterable[str] = (),
+        game_slugs: Iterable[str] = (),
+        references: Iterable[str] = (),
+    ) -> List[Any]:
+        """Fetch only archive rows relevant to incoming/pending IDs, aliases, games, and references.
+
+        Runs abandoned-pending recovery unconditionally before checking whether any
+        history seeds exist. SQL narrows by (guild_id, profile_key) via
+        idx_profile_feed_messages_lookup and evaluates guarded JSON predicates across
+        that profile's rows in SQL so only matching rows cross to Python.
+        """
+        await self._ensure_stale_pending_recovered()
+        normalized_key = profile_key.strip().lower()
+
+        frontier_ids = list(dict.fromkeys(
+            eid for eid in event_ids if isinstance(eid, str) and eid.strip()
+        ))
+        frontier_games = list(dict.fromkeys(
+            slug for slug in game_slugs if isinstance(slug, str) and slug.strip()
+        ))
+        frontier_refs = list(dict.fromkeys(
+            ref for ref in references if isinstance(ref, str) and ref.strip()
+        ))
+        if not (frontier_ids or frontier_games or frontier_refs):
+            return []
+
+        seen_ids: set[str] = set()
+        seen_games: set[str] = set()
+        seen_refs: set[str] = set()
+        rows_by_event_id: dict[str, Any] = {}
+
+        query = """
+            WITH target_ids(id) AS (SELECT value FROM json_each(?)),
+                 target_games(slug) AS (SELECT value FROM json_each(?)),
+                 target_refs(ref) AS (SELECT value FROM json_each(?))
+            SELECT event_id, payload, message_id, channel_id, delivery_state
+            FROM profile_feed_messages
+            WHERE guild_id = ? AND profile_key = ?
+              AND (
+                event_id IN (SELECT id FROM target_ids)
+                OR (
+                  json_valid(payload)
+                  AND json_type(payload) = 'object'
+                  AND (
+                    json_extract(payload, '$.activity_id') IN (SELECT id FROM target_ids)
+                    OR json_extract(payload, '$.game_slug') IN (SELECT slug FROM target_games)
+                    OR json_extract(payload, '$.reference') IN (SELECT ref FROM target_refs)
+                    OR (
+                      json_type(payload, '$.event_ids') = 'array'
+                      AND EXISTS (
+                        SELECT 1 FROM json_each(payload, '$.event_ids')
+                        WHERE value IN (SELECT id FROM target_ids)
+                      )
+                    )
+                  )
+                )
+              )
+        """
+
+        while frontier_ids or frontier_games or frontier_refs:
+            seen_ids.update(frontier_ids)
+            seen_games.update(frontier_games)
+            seen_refs.update(frontier_refs)
+
+            next_ids: list[str] = []
+            next_games: list[str] = []
+            next_refs: list[str] = []
+            queued_ids: set[str] = set()
+            queued_games: set[str] = set()
+            queued_refs: set[str] = set()
+
+            for batch_ids, batch_games, batch_refs in self._iter_relevant_history_batches(
+                frontier_ids, frontier_games, frontier_refs
+            ):
+                fetched = await self._fetchall(
+                    query,
+                    (
+                        json.dumps(batch_ids),
+                        json.dumps(batch_games),
+                        json.dumps(batch_refs),
+                        guild_id,
+                        normalized_key,
+                    ),
+                )
+                for row in fetched:
+                    eid = row["event_id"]
+                    if eid not in rows_by_event_id:
+                        rows_by_event_id[eid] = row
+                    if isinstance(eid, str) and eid.strip() and eid not in seen_ids and eid not in queued_ids:
+                        queued_ids.add(eid)
+                        next_ids.append(eid)
+                    raw_payload = row["payload"]
+                    try:
+                        data = json.loads(raw_payload)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    act_id = data.get("activity_id")
+                    if isinstance(act_id, str) and act_id.strip() and act_id not in seen_ids and act_id not in queued_ids:
+                        queued_ids.add(act_id)
+                        next_ids.append(act_id)
+                    raw_aliases = data.get("event_ids")
+                    if isinstance(raw_aliases, list):
+                        for alias in raw_aliases:
+                            if isinstance(alias, str) and alias.strip() and alias not in seen_ids and alias not in queued_ids:
+                                queued_ids.add(alias)
+                                next_ids.append(alias)
+                    slug = data.get("game_slug")
+                    if isinstance(slug, str) and slug.strip() and slug not in seen_games and slug not in queued_games:
+                        queued_games.add(slug)
+                        next_games.append(slug)
+                    ref = data.get("reference")
+                    if isinstance(ref, str) and ref.strip() and ref not in seen_refs and ref not in queued_refs:
+                        queued_refs.add(ref)
+                        next_refs.append(ref)
+
+            frontier_ids = next_ids
+            frontier_games = next_games
+            frontier_refs = next_refs
+
+        return list(rows_by_event_id.values())
 
     async def seed_feed_message(self, guild_id: int, profile_key: str, event_ids,
                                 payload: str):

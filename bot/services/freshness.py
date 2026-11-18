@@ -1,4 +1,4 @@
-"""Shared 1-hour library cache freshness evaluation, scheduling, and Discord disclosures."""
+"""Shared library cache freshness evaluation, scheduling, and Discord disclosures."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ class ProfileFreshness:
     stale: bool
     refreshing: bool
     failed_last: bool
+    dirty: bool = False
 
 
 def _ensure_utc(now: Optional[datetime]) -> datetime:
@@ -66,6 +67,7 @@ def evaluate_profile_freshness(
     synced_at = parse_sync_timestamp(_row_get(sync_info, "last_synced_at"))
     attempt_at = parse_sync_timestamp(_row_get(sync_info, "last_sync_attempt_at"))
     db_error = _row_get(sync_info, "last_sync_error")
+    dirty = bool(_row_get(sync_info, "pending_refresh_token"))
 
     svc_state = (
         library_sync.get_profile_state(normalized_key)
@@ -84,7 +86,7 @@ def evaluate_profile_freshness(
     last_error = svc_state.get("last_error") or (str(db_error) if db_failed_last and db_error else None)
 
     missing = synced_at is None
-    stale = missing or (current_now - synced_at).total_seconds() >= freshness_window_seconds
+    stale = missing or dirty or (current_now - synced_at).total_seconds() >= freshness_window_seconds
     return ProfileFreshness(
         profile_key=normalized_key,
         username=display_name,
@@ -95,6 +97,7 @@ def evaluate_profile_freshness(
         stale=stale,
         refreshing=refreshing,
         failed_last=failed_last,
+        dirty=dirty,
     )
 
 
@@ -111,20 +114,48 @@ def _has_sync_columns(row: Any) -> bool:
     )
 
 
+def _has_pending_token_field(row: Any) -> bool:
+    if row is None:
+        return False
+    if isinstance(row, dict):
+        return "pending_refresh_token" in row
+    if hasattr(row, "keys"):
+        return "pending_refresh_token" in row.keys()
+    return hasattr(row, "pending_refresh_token")
+
+
 async def _fetch_sync_info_map(db: Any, profiles: dict[str, tuple[str, Any]]) -> dict[str, Any]:
     if not profiles or db is None:
         return {}
     result: dict[str, Any] = {}
     missing_keys: list[str] = []
+    missing_token_keys: list[str] = []
     for key, (_, raw_row) in profiles.items():
         if _has_sync_columns(raw_row):
             result[key] = raw_row
+            if not _has_pending_token_field(raw_row):
+                missing_token_keys.append(key)
         else:
             missing_keys.append(key)
-    if not missing_keys:
-        return result
-
-    result.update(await db.get_profiles_sync_info(missing_keys))
+    if missing_keys:
+        result.update(await db.get_profiles_sync_info(missing_keys))
+    if missing_token_keys:
+        token_getter = getattr(db, "get_profiles_refresh_pending_tokens", None)
+        if callable(token_getter):
+            token_map = await token_getter(missing_token_keys)
+            for key in missing_token_keys:
+                raw_row = result[key]
+                merged = dict(raw_row) if hasattr(raw_row, "keys") else {
+                    "profile_key": getattr(raw_row, "profile_key", key),
+                    "display_username": getattr(raw_row, "display_username", None),
+                    "backloggd_username": getattr(raw_row, "backloggd_username", None),
+                    "last_synced_at": getattr(raw_row, "last_synced_at", None),
+                    "last_sync_attempt_at": getattr(raw_row, "last_sync_attempt_at", None),
+                    "last_sync_error": getattr(raw_row, "last_sync_error", None),
+                    "game_count": getattr(raw_row, "game_count", 0),
+                }
+                merged["pending_refresh_token"] = token_map.get(key)
+                result[key] = merged
     return result
 
 
@@ -190,6 +221,7 @@ async def ensure_profiles_fresh(
             await schedule_profile_refresh(
                 bot,
                 status.username,
+                bypass_freshness=status.dirty,
                 freshness_window_seconds=freshness_window_seconds,
                 now=current_now,
                 require_subscribed=require_subscribed,
@@ -233,7 +265,7 @@ def format_profile_freshness_line(
     elif status.failed_last:
         notes.append("last refresh failed (keeping cached data)" if not status.missing else "last refresh failed")
     elif status.stale and not status.missing:
-        notes.append("stale (>1h)")
+        notes.append("stale, pending update" if status.dirty else "stale (>1h)")
     if notes:
         parts.append(f"({', '.join(notes)})")
     return " ".join(parts)
@@ -245,6 +277,7 @@ def summarize_aggregate_freshness(statuses: Iterable[ProfileFreshness]) -> dict[
     synced_times = [s.synced_at for s in values if s.synced_at is not None]
     missing_count = sum(1 for s in values if s.missing)
     stale_count = sum(1 for s in values if s.stale and not s.missing)
+    dirty_count = sum(1 for s in values if s.dirty and not s.missing)
     fresh_count = sum(1 for s in values if not s.stale)
     refreshing_count = sum(1 for s in values if s.refreshing)
     failed_count = sum(1 for s in values if s.failed_last)
@@ -252,6 +285,7 @@ def summarize_aggregate_freshness(statuses: Iterable[ProfileFreshness]) -> dict[
         "total": len(values),
         "fresh": fresh_count,
         "stale": stale_count,
+        "dirty": dirty_count,
         "missing": missing_count,
         "refreshing": refreshing_count,
         "failed": failed_count,
@@ -265,9 +299,10 @@ def format_aggregate_freshness(summary: Optional[dict[str, Any]]) -> Optional[st
     total = summary["total"]
     oldest = summary.get("oldest_synced_at")
     oldest_text = format_discord_rel(oldest) if oldest is not None else "None synced yet"
+    stale_label = "stale" if summary.get("dirty") else "stale (>1h)"
     parts = [
         f"Oldest contributing sync: {oldest_text}",
-        f"Profiles: {total} ({summary['fresh']} fresh, {summary['stale']} stale (>1h), {summary['missing']} missing)",
+        f"Profiles: {total} ({summary['fresh']} fresh, {summary['stale']} {stale_label}, {summary['missing']} missing)",
     ]
     if summary.get("refreshing"):
         parts.append(f"Refreshing now: {summary['refreshing']}")

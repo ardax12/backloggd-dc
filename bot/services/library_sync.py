@@ -157,6 +157,7 @@ class LibrarySyncService:
         *,
         manual: bool = False,
         dirty: bool = False,
+        bypass_freshness: bool = False,
         freshness_window_seconds: Optional[float] = None,
     ) -> asyncio.Task:
         """Request a refresh, joining active work and coalescing dirty updates."""
@@ -170,6 +171,8 @@ class LibrarySyncService:
 
         if (
             not manual
+            and not dirty
+            and not bypass_freshness
             and freshness_window_seconds is not None
             and state.last_success_at is not None
             and self._clock() - state.last_success_at < freshness_window_seconds
@@ -483,6 +486,7 @@ async def schedule_profile_refresh(
     *,
     manual: bool = False,
     dirty: bool = False,
+    bypass_freshness: bool = False,
     freshness_window_seconds: Optional[float] = None,
     now=None,
     require_subscribed: bool = True,
@@ -509,5 +513,6 @@ async def schedule_profile_refresh(
         lambda: sync_profile_library(bot, username, synced_at=now),
         manual=manual,
         dirty=dirty,
+        bypass_freshness=bypass_freshness,
         freshness_window_seconds=freshness_window_seconds,
     )
