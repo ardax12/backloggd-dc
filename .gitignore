@@ -57,6 +57,7 @@ data/*.sqlite3
 Thumbs.db
 
 # Agent / Tooling temporary artifacts
+AGENTS.md
 .agents/
 .gemini/
 .cache/
@@ -65,3 +66,4 @@ graphify-out/
 
 # Tests
 tests/
+verify_all.py

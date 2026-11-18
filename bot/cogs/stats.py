@@ -14,6 +14,7 @@ from bot.services.guild_membership import (
 )
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.services.freshness import resolve_guild_aggregate_freshness
+from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.cogs.stats")
 
@@ -47,20 +48,9 @@ class StatsCog(commands.Cog, name="Stats"):
     async def close(self) -> None:
         """Stop count work and wait for all SDK workers to unwind."""
         self._closing = True
-        current = asyncio.current_task()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._drain_count_work())
-        drain_task = self._close_task
-        if drain_task is current:
-            return
-        cancelled: Optional[asyncio.CancelledError] = None
-        while not drain_task.done():
-            try:
-                await asyncio.shield(drain_task)
-            except asyncio.CancelledError as exc:
-                cancelled = exc
-        if cancelled is not None:
-            raise cancelled
+        await await_owned_task(self._close_task)
 
     async def _drain_count_work(self) -> None:
         current = asyncio.current_task()
@@ -178,23 +168,6 @@ class StatsCog(commands.Cog, name="Stats"):
             "logged_profiles_missing": len(profile_list) - counted,
         }
 
-    async def _resolve_stats_context(self, member_ids: List[int]) -> dict:
-        context_getter = getattr(self.bot.db, "get_guild_stats_context", None)
-        if context_getter is not None:
-            return await context_getter(member_ids)
-        profile_getter = (
-            getattr(self.bot.db, "get_guild_linked_profiles_with_sync_info", None)
-            or getattr(self.bot.db, "get_guild_linked_profiles", None)
-        )
-        if profile_getter is None:
-            return {"linked_members": None, "profile_keys": None, "profiles": []}
-        profiles = list(await profile_getter(member_ids))
-        return {
-            "linked_members": None,
-            "profile_keys": [row["profile_key"] for row in profiles],
-            "profiles": profiles,
-        }
-
     @app_commands.command(name="server-top", description="View server game rankings and specialty leaderboards")
     @app_commands.describe(mode="Choose leaderboard mode (e.g. Highest Rated, Most Polarizing, Shame List)")
     async def server_top(
@@ -213,7 +186,7 @@ class StatsCog(commands.Cog, name="Stats"):
             await send_private_followup(interaction, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, log=logger)
             return
         guild_name = interaction.guild.name
-        context = await self._resolve_stats_context(guild_member_ids)
+        context = await self.bot.db.get_guild_stats_context(guild_member_ids)
         profile_keys = context["profile_keys"]
         freshness_note = await resolve_guild_aggregate_freshness(
             self.bot,
@@ -231,47 +204,27 @@ class StatsCog(commands.Cog, name="Stats"):
         if mode == "Highest Rated":
             mode_key = "highest_rated"
             title = "⭐ Highest Rated Games"
-            helper = getattr(self.bot.db, "_get_server_top_rated_for_profiles", None)
-            if helper is not None and profile_keys is not None:
-                entries = await helper(profile_keys, limit=10, min_ratings=2)
-            else:
-                entries = await self.bot.db.get_server_top_rated(guild_member_ids, limit=10, min_ratings=2)
+            entries = await self.bot.db.get_server_top_rated_for_profiles(profile_keys, limit=10, min_ratings=2)
 
         elif mode == "Most Played":
             mode_key = "most_played"
             title = "🎮 Most Played Games"
-            helper = getattr(self.bot.db, "_get_server_most_played_for_profiles", None)
-            if helper is not None and profile_keys is not None:
-                entries = await helper(profile_keys, limit=10)
-            else:
-                entries = await self.bot.db.get_server_most_played(guild_member_ids, limit=10)
+            entries = await self.bot.db.get_server_most_played_for_profiles(profile_keys, limit=10)
 
         elif mode == "Most Polarizing":
             mode_key = "polarizing"
             title = "🔥 Most Polarizing / Divisive Games"
-            helper = getattr(self.bot.db, "_get_server_polarizing_for_profiles", None)
-            if helper is not None and profile_keys is not None:
-                entries = await helper(profile_keys, limit=10, min_ratings=2)
-            else:
-                entries = await self.bot.db.get_server_polarizing(guild_member_ids, limit=10, min_ratings=2)
+            entries = await self.bot.db.get_server_polarizing_for_profiles(profile_keys, limit=10, min_ratings=2)
 
         elif mode == "Hidden Gems":
             mode_key = "hidden_gems"
             title = "💎 Hidden Gems (Server Rating 4.5+)"
-            helper = getattr(self.bot.db, "_get_server_hidden_gems_for_profiles", None)
-            if helper is not None and profile_keys is not None:
-                entries = await helper(profile_keys, limit=10)
-            else:
-                entries = await self.bot.db.get_server_hidden_gems(guild_member_ids, limit=10)
+            entries = await self.bot.db.get_server_hidden_gems_for_profiles(profile_keys, limit=10)
 
         elif mode == "Server Backlog Shame List":
             mode_key = "shame_list"
             title = "🪦 Server Backlog Shame List (Most Unplayed)"
-            helper = getattr(self.bot.db, "_get_server_shame_list_for_profiles", None)
-            if helper is not None and profile_keys is not None:
-                entries = await helper(profile_keys, limit=10)
-            else:
-                entries = await self.bot.db.get_server_shame_list(guild_member_ids, limit=10)
+            entries = await self.bot.db.get_server_shame_list_for_profiles(profile_keys, limit=10)
 
         embed = create_server_top_embed(
             title=title,
@@ -295,7 +248,7 @@ class StatsCog(commands.Cog, name="Stats"):
         if guild_member_ids is None:
             await send_private_followup(interaction, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, log=logger)
             return
-        context = await self._resolve_stats_context(guild_member_ids)
+        context = await self.bot.db.get_guild_stats_context(guild_member_ids)
         freshness_note = await resolve_guild_aggregate_freshness(
             self.bot,
             guild_member_ids,
@@ -304,19 +257,11 @@ class StatsCog(commands.Cog, name="Stats"):
             profiles_are_linked=True,
             require_subscribed=True,
         )
-        stats_helper = getattr(self.bot.db, "_get_server_stats_for_profiles", None)
-        if (
-            stats_helper is not None
-            and context["profile_keys"] is not None
-            and context["linked_members"] is not None
-        ):
-            stats = await stats_helper(
-                context["profile_keys"],
-                linked_members=context["linked_members"],
-                include_library_row_counts=False,
-            )
-        else:
-            stats = await self.bot.db.get_server_stats(guild_member_ids)
+        stats = await self.bot.db.get_server_stats_for_profiles(
+            context["profile_keys"],
+            linked_members=context["linked_members"],
+            include_library_row_counts=False,
+        )
         # Cached library rows include wishlist/backlog entries and can have
         # viewer-specific statuses. The displayed total comes from profile tabs.
         stats.update(await self._played_tab_counts(guild_member_ids, profiles=context["profiles"]))

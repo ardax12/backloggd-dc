@@ -1,9 +1,41 @@
 """Conservative first-discovery policy for activity feed announcements."""
 
 from datetime import date, datetime, timezone
+from collections.abc import Iterable
 
 
 SESSION_ACTIONS = {"playing", "completed", "replay"}
+
+FEED_DECISION_PRIORITY = {
+    "suppressed_pre_activation": 0,
+    "suppressed_old": 1,
+    "held_ambiguous": 2,
+    "held_future": 3,
+    "held_uncertain": 4,
+    "baseline": 5,
+    "eligible": 6,
+}
+
+
+def group_event_aliases(alias_groups: Iterable[Iterable[str]]) -> list[list[str]]:
+    """Group overlapping aliases transitively, retaining first-seen group order."""
+    parents = {}
+
+    def root(key):
+        parents.setdefault(key, key)
+        while parents[key] != key:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
+
+    for aliases in alias_groups:
+        group = [eid for eid in aliases if eid]
+        for eid in group:
+            parents[root(eid)] = root(group[0])
+    groups = {}
+    for eid in parents:
+        groups.setdefault(root(eid), []).append(eid)
+    return list(groups.values())
 
 
 def parse_utc_datetime(value: str | datetime | None) -> datetime | None:

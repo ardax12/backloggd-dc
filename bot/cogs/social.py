@@ -37,6 +37,7 @@ from bot.services.freshness import (
     format_profile_freshness_line,
     summarize_aggregate_freshness,
 )
+from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.cogs.social")
 
@@ -78,9 +79,8 @@ class SocialCog(commands.Cog, name="Social"):
         self.live_fetch_concurrency = max(1, int(live_fetch_concurrency))
         self.live_fetch_timeout = float(live_fetch_timeout)
         self._live_library_semaphore = asyncio.Semaphore(self.live_fetch_concurrency)
-        self._live_library_tasks: Dict[str, asyncio.Task] = {}
-        self._live_library_waiters: Dict[str, int] = {}
         self._live_library_generations: Dict[str, _LiveFetchGeneration] = {}
+        # Retired generations may still be unwinding after their last waiter leaves.
         self._tracked_live_tasks: set[asyncio.Task] = set()
         self._closing: bool = False
         self._draining_task: Optional[asyncio.Task] = None
@@ -91,45 +91,28 @@ class SocialCog(commands.Cog, name="Social"):
         current = asyncio.current_task()
         draining = self._draining_task
         if draining is not None and not draining.done():
-            if draining is not current:
-                cancelled: Optional[asyncio.CancelledError] = None
-                while not draining.done():
-                    try:
-                        await asyncio.shield(draining)
-                    except asyncio.CancelledError as exc:
-                        cancelled = exc
-                if cancelled is not None:
-                    raise cancelled
+            await await_owned_task(draining)
             return
 
         async def _drain() -> None:
             drain_task = asyncio.current_task()
             while True:
                 pending = [
-                    task
-                    for task in list(self._tracked_live_tasks)
+                    task for task in list(self._tracked_live_tasks)
                     if not task.done() and task is not current and task is not drain_task
                 ]
                 if not pending:
                     break
                 for task in pending:
-                    task.cancel()
+                    if not task.cancelling():
+                        task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
             self._live_library_generations.clear()
-            self._live_library_tasks.clear()
-            self._live_library_waiters.clear()
 
         draining = asyncio.create_task(_drain())
         self._draining_task = draining
-        cancelled: Optional[asyncio.CancelledError] = None
         try:
-            while not draining.done():
-                try:
-                    await asyncio.shield(draining)
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-            if cancelled is not None:
-                raise cancelled
+            await await_owned_task(draining)
         finally:
             if self._draining_task is draining and draining.done():
                 self._draining_task = None
@@ -207,29 +190,22 @@ class SocialCog(commands.Cog, name="Social"):
             task = asyncio.create_task(self._fetch_live_library_snapshot(username))
             gen = _LiveFetchGeneration(profile_key=profile_key, task=task, waiters=0)
             self._live_library_generations[profile_key] = gen
-            self._live_library_tasks[profile_key] = task
             self._tracked_live_tasks.add(task)
             task.add_done_callback(self._tracked_live_tasks.discard)
 
             def _cleanup_live_task(
                 completed: asyncio.Task,
-                key: str = profile_key,
                 owned_gen: _LiveFetchGeneration = gen,
             ) -> None:
+                key = owned_gen.profile_key
                 if self._live_library_generations.get(key) is owned_gen:
                     self._live_library_generations.pop(key, None)
-                    self._live_library_tasks.pop(key, None)
-                    self._live_library_waiters.pop(key, None)
-                elif self._live_library_tasks.get(key) is completed:
-                    self._live_library_tasks.pop(key, None)
                 if not completed.cancelled():
                     completed.exception()
 
             task.add_done_callback(_cleanup_live_task)
 
         gen.waiters += 1
-        if self._live_library_generations.get(profile_key) is gen:
-            self._live_library_waiters[profile_key] = gen.waiters
         try:
             return await asyncio.wait_for(
                 asyncio.shield(gen.task),
@@ -241,12 +217,8 @@ class SocialCog(commands.Cog, name="Social"):
             if gen.waiters <= 0 or self._closing:
                 if is_current:
                     self._live_library_generations.pop(profile_key, None)
-                    self._live_library_tasks.pop(profile_key, None)
-                    self._live_library_waiters.pop(profile_key, None)
                 if not gen.task.done():
                     gen.task.cancel()
-            elif is_current:
-                self._live_library_waiters[profile_key] = gen.waiters
 
     @app_commands.command(name="compare", description="Compare video game tastes and ratings between two Backloggd users")
     @app_commands.describe(

@@ -124,25 +124,7 @@ async def _fetch_sync_info_map(db: Any, profiles: dict[str, tuple[str, Any]]) ->
     if not missing_keys:
         return result
 
-    batch_getter = getattr(db, "get_profiles_sync_info", None)
-    if batch_getter is not None:
-        fetched = await batch_getter(missing_keys)
-        if isinstance(fetched, dict):
-            result.update(fetched)
-            return result
-    single_getter = getattr(db, "get_profile_sync_info", None)
-    for key in missing_keys:
-        display_name, raw_row = profiles[key]
-        if raw_row is not None and (
-            _row_get(raw_row, "last_synced_at") is not None
-            or _row_get(raw_row, "last_sync_attempt_at") is not None
-            or _row_get(raw_row, "last_sync_error") is not None
-        ):
-            result[key] = raw_row
-        elif single_getter is not None:
-            info = await single_getter(display_name)
-            if info is not None:
-                result[key] = info
+    result.update(await db.get_profiles_sync_info(missing_keys))
     return result
 
 
@@ -194,15 +176,12 @@ async def ensure_profiles_fresh(
     stale_keys = [key for key, status in statuses.items() if status.stale]
     subscription_evidence: dict[str, bool] = {}
     if service is not None and require_subscribed and subscribed is None and stale_keys:
-        subscription_getter = getattr(db, "get_profiles_library_subscription_map", None)
-        if callable(subscription_getter):
-            fetched_subscriptions = await subscription_getter(stale_keys)
-            if isinstance(fetched_subscriptions, dict):
-                subscription_evidence = {
-                    key: bool(fetched_subscriptions[key])
-                    for key in stale_keys
-                    if key in fetched_subscriptions
-                }
+        fetched_subscriptions = await db.get_profiles_library_subscription_map(stale_keys)
+        subscription_evidence = {
+            key: bool(fetched_subscriptions[key])
+            for key in stale_keys
+            if key in fetched_subscriptions
+        }
 
     for key, (name, _) in deduped.items():
         status = statuses[key]
@@ -329,13 +308,7 @@ async def resolve_guild_aggregate_freshness(
         db = getattr(bot, "db", None)
         if db is None:
             return None
-        profile_getter = (
-            getattr(db, "get_guild_linked_profiles_with_sync_info", None)
-            or getattr(db, "get_guild_linked_profiles", None)
-        )
-        if profile_getter is None:
-            return None
-        profile_list = list(await profile_getter(list(member_ids)))
+        profile_list = await db.get_guild_linked_profiles_with_sync_info(list(member_ids))
     else:
         profile_list = list(profiles)
 

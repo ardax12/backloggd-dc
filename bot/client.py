@@ -13,6 +13,7 @@ from bot.db import Database
 from bot.config import DATABASE_PATH, DEV_GUILD_ID
 from bot.services.guild_membership import GuildMembershipService
 from bot.services.library_sync import LibrarySyncService
+from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.bot")
 
@@ -88,7 +89,6 @@ class BackloggdBot(commands.Bot):
 
     async def close(self) -> None:
         """Idempotently drain cogs, shared services, SDK, DB, and Discord client."""
-        current = asyncio.current_task()
         if self._close_task is None:
             logger.info("Shutting down BackloggdBot...")
             discord_close = super().close
@@ -124,27 +124,14 @@ class BackloggdBot(commands.Bot):
 
             self._close_task = asyncio.create_task(_shutdown())
 
-        close_task = self._close_task
-        if close_task is current:
-            return
-        cancelled: Optional[asyncio.CancelledError] = None
-        while not close_task.done():
-            try:
-                await asyncio.shield(close_task)
-            except asyncio.CancelledError as exc:
-                cancelled = exc
-        if cancelled is not None:
-            if not close_task.cancelled():
-                close_task.exception()
-            raise cancelled
-        return close_task.result()
+        await await_owned_task(self._close_task)
 
     async def on_ready(self) -> None:
         """Triggered when connection is established and cache is ready."""
         logger.info("Logged in as %s (ID: %d)", self.user.name, self.user.id)
         feed_cog = self.get_cog("Feed")
         if feed_cog:
-            await feed_cog.reconcile_legacy_enrollments()
+            await feed_cog.pipeline.reconcile_legacy_enrollments()
         activity = discord.Activity(
             type=discord.ActivityType.watching,
             name="games on Backloggd | /game"

@@ -447,28 +447,19 @@ async def sync_profile_library(
     bot,
     username: str,
     *,
-    discord_id: int = 0,
     synced_at=None,
 ) -> Optional[int]:
     """Fetch and atomically replace a linked profile's cached library."""
     profile_key = username.strip().lower()
     try:
-        pending_getter = getattr(bot.db, "get_profile_refresh_pending_token", None)
-        pending_token = await pending_getter(profile_key) if pending_getter is not None else None
+        pending_token = await bot.db.get_profile_refresh_pending_token(profile_key)
         library = await _fetch_complete_library(bot.backloggd, username)
-        replacer = getattr(bot.db, "replace_profile_library", None)
-        if replacer is not None:
-            kwargs = {"require_linked": True}
-            if synced_at is not None:
-                kwargs["synced_at"] = synced_at
-            if pending_token is not None:
-                kwargs["clear_pending_token"] = pending_token
-            replaced = await replacer(username, library, **kwargs)
-        else:
-            replace_kwargs = {}
-            if pending_token is not None:
-                replace_kwargs["clear_pending_token"] = pending_token
-            replaced = await bot.db.replace_user_library(discord_id, username, library, **replace_kwargs)
+        kwargs = {"require_linked": True}
+        if synced_at is not None:
+            kwargs["synced_at"] = synced_at
+        if pending_token is not None:
+            kwargs["clear_pending_token"] = pending_token
+        replaced = await bot.db.replace_profile_library(username, library, **kwargs)
         if not replaced:
             logger.info("Discarded stale library sync for %s", username)
             return None
@@ -478,13 +469,11 @@ async def sync_profile_library(
         raise
     except Exception as error:
         logger.error("Error syncing library for %s: %s", username, error, exc_info=True)
-        recorder = getattr(bot.db, "record_profile_sync_failure", None)
-        if recorder is not None:
-            try:
-                kwargs = {"attempted_at": synced_at} if synced_at is not None else {}
-                await recorder(username, str(error), **kwargs)
-            except Exception:
-                logger.warning("Could not persist library sync failure for %s", username, exc_info=True)
+        try:
+            kwargs = {"attempted_at": synced_at} if synced_at is not None else {}
+            await bot.db.record_profile_sync_failure(username, str(error), **kwargs)
+        except Exception:
+            logger.warning("Could not persist library sync failure for %s", username, exc_info=True)
         return None
 
 

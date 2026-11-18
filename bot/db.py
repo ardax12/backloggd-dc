@@ -14,6 +14,7 @@ import aiosqlite
 import libsql_client
 
 from bot.config import DATABASE_PATH, LIBSQL_AUTH_TOKEN, LIBSQL_DATABASE_URL
+from bot.feed_policy import FEED_DECISION_PRIORITY, group_event_aliases
 from bot.db_adapter import execute_batch_statements, open_transaction
 
 logger = logging.getLogger("backloggd.db")
@@ -506,9 +507,9 @@ class Database:
         connections.sort(key=lambda row: row["discord_id"])
         return connections
 
-    async def get_profile_sync_info(self, username: str) -> Optional[Any]:
+    async def get_profile_sync_info(self, username: str) -> Optional[dict[str, Any]]:
         """Return the profile's last complete sync time, sync health, and cached row count."""
-        return await self._fetchone("""
+        row = await self._fetchone("""
             SELECT profiles.profile_key, profiles.display_username,
                    profiles.last_synced_at, profiles.last_sync_attempt_at,
                    profiles.last_sync_error,
@@ -520,11 +521,12 @@ class Database:
                      profiles.last_synced_at, profiles.last_sync_attempt_at,
                      profiles.last_sync_error
         """, (username.strip(),))
+        return dict(row) if row is not None else None
 
-    async def get_profiles_sync_info(self, profile_keys: Iterable[str]) -> dict[str, Any]:
+    async def get_profiles_sync_info(self, profile_keys: Iterable[str]) -> dict[str, dict[str, Any]]:
         """Return sync freshness metadata keyed by normalized profile_key."""
         normalized = list(dict.fromkeys(key.strip().lower() for key in profile_keys if key and key.strip()))
-        result: dict[str, Any] = {}
+        result: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(normalized):
             placeholders = ",".join("?" for _ in chunk)
             rows = await self._fetchall(f"""
@@ -540,7 +542,7 @@ class Database:
                          profiles.last_sync_error
             """, chunk)
             for row in rows:
-                result[row["profile_key"]] = row
+                result[row["profile_key"]] = dict(row)
         return result
 
     async def is_profile_library_subscribed(self, username: str) -> bool:
@@ -633,7 +635,7 @@ class Database:
         self,
         member_ids: List[int],
         exclude_profile_key: Optional[str] = None,
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
         """Fetch distinct linked profiles present among the supplied guild members."""
         members = list(dict.fromkeys(int(value) for value in member_ids))
         if not members:
@@ -641,7 +643,7 @@ class Database:
         excluded = exclude_profile_key.strip().lower() if exclude_profile_key and exclude_profile_key.strip() else None
         exclusion = " AND p.profile_key <> ?" if excluded else ""
         fixed_params = 1 if excluded else 0
-        profiles: dict[str, Any] = {}
+        profiles: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(members, fixed_params=fixed_params):
             placeholders = ",".join("?" for _ in chunk)
             params: list[Any] = list(chunk)
@@ -655,14 +657,14 @@ class Database:
                 ORDER BY p.profile_key
             """
             for row in await self._fetchall(query, params):
-                profiles[row["profile_key"]] = row
+                profiles[row["profile_key"]] = dict(row)
         return [profiles[key] for key in sorted(profiles)]
 
     async def get_guild_linked_profiles_with_sync_info(
         self,
         member_ids: List[int],
         exclude_profile_key: Optional[str] = None,
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
         """Fetch distinct linked guild profiles with library sync timestamps and errors."""
         members = list(dict.fromkeys(int(value) for value in member_ids))
         if not members:
@@ -670,7 +672,7 @@ class Database:
         excluded = exclude_profile_key.strip().lower() if exclude_profile_key and exclude_profile_key.strip() else None
         exclusion = " AND p.profile_key <> ?" if excluded else ""
         fixed_params = 1 if excluded else 0
-        profiles: dict[str, Any] = {}
+        profiles: dict[str, dict[str, Any]] = {}
         for chunk in _iter_sql_chunks(members, fixed_params=fixed_params):
             placeholders = ",".join("?" for _ in chunk)
             params: list[Any] = list(chunk)
@@ -685,7 +687,7 @@ class Database:
                 ORDER BY p.profile_key
             """
             for row in await self._fetchall(query, params):
-                profiles[row["profile_key"]] = row
+                profiles[row["profile_key"]] = dict(row)
         return [profiles[key] for key in sorted(profiles)]
 
     async def set_guild_feed_preference(
@@ -1479,24 +1481,6 @@ class Database:
         statuses = await self.get_guild_feed_statuses(guild_id, [normalized])
         return statuses[normalized]
 
-    async def get_feed_message_delivery_counts(self, guild_id: int, profile_key: str) -> dict[str, int]:
-        rows = await self._fetchall(
-            """SELECT delivery_state, COUNT(*) AS count FROM profile_feed_messages
-               WHERE guild_id = ? AND profile_key = ?
-               GROUP BY delivery_state""",
-            (guild_id, profile_key.strip().lower()),
-        )
-        return {row["delivery_state"]: row["count"] for row in rows}
-
-    async def get_profile_feed_source_health(self, profile_key: str) -> List[Any]:
-        return await self._fetchall(
-            """SELECT source, attempts, successes, last_attempt_at, last_success_at,
-                      coverage, pages_read, last_continuous_boundary_event_id,
-                      last_continuous_boundary_at, unresolved_gap_since,
-                      unresolved_gap_until, gap_reason, last_error
-               FROM profile_feed_source_health WHERE profile_key = ? ORDER BY source""",
-            (profile_key.strip().lower(),),
-        )
 
     async def get_profile_feed_source(self, profile_key: str, source: str) -> Optional[Any]:
         return await self._fetchone(
@@ -1947,16 +1931,6 @@ class Database:
             (decision, reason, event_date, payload, guild_id, profile_key.strip().lower(), event_id, *valid_from),
         )
 
-    _FEED_DECISION_PRIORITY = {
-        "suppressed_pre_activation": 0,
-        "suppressed_old": 1,
-        "held_ambiguous": 2,
-        "held_future": 3,
-        "held_uncertain": 4,
-        "baseline": 5,
-        "eligible": 6,
-    }
-
     async def persist_feed_event_decisions(
         self,
         guild_id: int,
@@ -2000,25 +1974,15 @@ class Database:
 
         # Merge overlapping identities so a strict concurrent decision applies
         # to every alias in the connected event group in the same transaction.
-        parents = {}
-        def root(key):
-            parents.setdefault(key, key)
-            while parents[key] != key:
-                parents[key] = parents[parents[key]]
-                key = parents[key]
-            return key
-        for aliases in alias_groups:
-            group = [eid for eid in aliases if eid]
-            for eid in group:
-                parents[root(eid)] = root(group[0])
-        groups = {}
-        for eid in parents:
-            groups.setdefault(root(eid), []).append(eid)
-        all_ids = list(dict.fromkeys([*insert_map, *revision_map, *parents]))
+        groups = group_event_aliases(alias_groups)
+        all_ids = list(dict.fromkeys([
+            *insert_map, *revision_map,
+            *(eid for group in groups for eid in group),
+        ]))
         if not all_ids:
             return {}
 
-        priority = self._FEED_DECISION_PRIORITY
+        priority = FEED_DECISION_PRIORITY
         async with self._transaction() as tx:
             current_rows: dict[str, Any] = {}
             for chunk in _iter_sql_chunks(all_ids, fixed_params=2):
@@ -2032,7 +1996,7 @@ class Database:
                 for row in rows:
                     current_rows[row["event_id"]] = row
 
-            for group in groups.values():
+            for group in groups:
                 candidates = []
                 for eid in group:
                     if eid in revision_map and eid in current_rows and current_rows[eid]["decision"] in revision_map[eid]["allowed_from"]:
@@ -2795,9 +2759,10 @@ class Database:
         profiles = await self.get_guild_linked_profiles(guild_member_ids)
         return [row["profile_key"] for row in profiles]
 
-    async def _get_server_top_rated_for_profiles(
+    async def get_server_top_rated_for_profiles(
         self, profile_keys: List[str], limit: int = 10, min_ratings: int = 2
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
+        """Query distinct canonical profile keys; return plain result dictionaries."""
         if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
@@ -2841,16 +2806,17 @@ class Database:
         results.sort(key=lambda row: (-row["avg_rating"], -row["rating_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
+    async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[dict[str, Any]]:
         """Get top games by average rating among distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        return await self._get_server_top_rated_for_profiles(profile_keys, limit=limit, min_ratings=min_ratings)
+        return await self.get_server_top_rated_for_profiles(profile_keys, limit=limit, min_ratings=min_ratings)
 
-    async def _get_server_most_played_for_profiles(
+    async def get_server_most_played_for_profiles(
         self, profile_keys: List[str], limit: int = 10
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
+        """Query distinct canonical profile keys; return plain result dictionaries."""
         if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
@@ -2904,16 +2870,17 @@ class Database:
         )
         return results[:limit]
 
-    async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
+    async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[dict[str, Any]]:
         """Get most completed games by distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        return await self._get_server_most_played_for_profiles(profile_keys, limit=limit)
+        return await self.get_server_most_played_for_profiles(profile_keys, limit=limit)
 
-    async def _get_server_shame_list_for_profiles(
+    async def get_server_shame_list_for_profiles(
         self, profile_keys: List[str], limit: int = 10
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
+        """Query distinct canonical profile keys; return plain result dictionaries."""
         if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
@@ -2943,16 +2910,17 @@ class Database:
         results.sort(key=lambda row: (-row["backlog_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
+    async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[dict[str, Any]]:
         """Get games most frequently sitting unplayed in linked profiles' backlogs."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        return await self._get_server_shame_list_for_profiles(profile_keys, limit=limit)
+        return await self.get_server_shame_list_for_profiles(profile_keys, limit=limit)
 
-    async def _get_server_polarizing_for_profiles(
+    async def get_server_polarizing_for_profiles(
         self, profile_keys: List[str], limit: int = 10, min_ratings: int = 2
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
+        """Query distinct canonical profile keys; return plain result dictionaries."""
         if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
@@ -3008,16 +2976,17 @@ class Database:
         results.sort(key=lambda row: (-row["rating_delta"], -row["rating_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[Any]:
+    async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[dict[str, Any]]:
         """Get games with the highest rating disparity (max - min) among distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        return await self._get_server_polarizing_for_profiles(profile_keys, limit=limit, min_ratings=min_ratings)
+        return await self.get_server_polarizing_for_profiles(profile_keys, limit=limit, min_ratings=min_ratings)
 
-    async def _get_server_hidden_gems_for_profiles(
+    async def get_server_hidden_gems_for_profiles(
         self, profile_keys: List[str], limit: int = 10
-    ) -> List[Any]:
+    ) -> List[dict[str, Any]]:
+        """Query distinct canonical profile keys; return plain result dictionaries."""
         if not profile_keys or limit <= 0:
             return []
         aggregates: dict[str, dict[str, Any]] = {}
@@ -3063,20 +3032,21 @@ class Database:
         results.sort(key=lambda row: (-row["avg_rating"], row["rating_count"], row["slug"]))
         return results[:limit]
 
-    async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[Any]:
+    async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[dict[str, Any]]:
         """Get high-scoring games (>= 4.5) rated by only 1 or 2 distinct linked profiles."""
         if not guild_member_ids or limit <= 0:
             return []
         profile_keys = await self._get_guild_linked_profile_keys(guild_member_ids)
-        return await self._get_server_hidden_gems_for_profiles(profile_keys, limit=limit)
+        return await self.get_server_hidden_gems_for_profiles(profile_keys, limit=limit)
 
-    async def _get_server_stats_for_profiles(
+    async def get_server_stats_for_profiles(
         self,
         profile_keys: List[str],
         *,
         linked_members: int,
         include_library_row_counts: bool = True,
     ) -> dict:
+        """Query distinct canonical profile keys; return plain result dictionaries."""
         profile_count = len(profile_keys)
         if not profile_keys:
             result = {
@@ -3170,7 +3140,7 @@ class Database:
             }
 
         context = await self.get_guild_stats_context(guild_member_ids)
-        return await self._get_server_stats_for_profiles(
+        return await self.get_server_stats_for_profiles(
             context["profile_keys"],
             linked_members=context["linked_members"],
             include_library_row_counts=True,

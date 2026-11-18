@@ -22,76 +22,51 @@ from bot.services.library_sync import (
 )
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, clean_image_url
+from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.cogs.account")
 
 class AccountCog(commands.Cog, name="Account"):
     def __init__(self, bot):
         self.bot = bot
-        shared_sync = getattr(bot, "library_sync", None)
-        if shared_sync is not None:
-            self.library_sync = shared_sync
-            self._owns_library_sync = False
-        else:
-            self.library_sync = LibrarySyncService()
-            self._owns_library_sync = True
+        self.library_sync: LibrarySyncService = bot.library_sync
         self._status_tasks: set[asyncio.Task] = set()
         self._closing: bool = False
         self._draining_task: Optional[asyncio.Task] = None
 
     async def close(self) -> None:
-        """Idempotently stop account background work and drain owned resources."""
+        """Stop and drain account-owned status edits; the bot owns library syncs."""
         self._closing = True
         caller_task = asyncio.current_task()
         draining = self._draining_task
         if draining is not None and not draining.done():
-            if caller_task is not draining:
-                cancelled: Optional[asyncio.CancelledError] = None
-                while not draining.done():
-                    try:
-                        await asyncio.shield(draining)
-                    except asyncio.CancelledError as exc:
-                        cancelled = exc
-                if cancelled is not None:
-                    raise cancelled
+            await await_owned_task(draining)
             return
 
         async def _drain() -> None:
             current = asyncio.current_task()
-            try:
-                if self._owns_library_sync and hasattr(self.library_sync, "close"):
-                    await self.library_sync.close()
-            finally:
-                while True:
-                    pending = [
-                        task
-                        for task in list(self._status_tasks)
-                        if not task.done() and task is not current and task is not caller_task
-                    ]
-                    if not pending:
-                        break
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                self._status_tasks.clear()
+            while True:
+                pending = [
+                    task for task in list(self._status_tasks)
+                    if not task.done() and task is not current and task is not caller_task
+                ]
+                if not pending:
+                    break
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._status_tasks.clear()
 
         draining = asyncio.create_task(_drain())
         self._draining_task = draining
-        cancelled: Optional[asyncio.CancelledError] = None
         try:
-            while not draining.done():
-                try:
-                    await asyncio.shield(draining)
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-            if cancelled is not None:
-                raise cancelled
+            await await_owned_task(draining)
         finally:
             if self._draining_task is draining and draining.done():
                 self._draining_task = None
 
     async def cog_unload(self) -> None:
-        """Drain status-edit tasks and owned fallback coordinator when unloaded."""
+        """Drain account-owned status-edit tasks when unloaded."""
         await self.close()
 
     def _on_status_task_done(self, task: asyncio.Task, username: str) -> None:
@@ -207,7 +182,7 @@ class AccountCog(commands.Cog, name="Account"):
 
     async def _sync_user_library(self, discord_id: int, username: str) -> Optional[int]:
         """Fetch and atomically replace the linked profile's cached library."""
-        return await sync_profile_library(self.bot, username, discord_id=discord_id)
+        return await sync_profile_library(self.bot, username)
 
     async def _build_same_profile_link_notice(
         self, interaction: discord.Interaction, linked_name: str
