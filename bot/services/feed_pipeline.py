@@ -1393,15 +1393,15 @@ class FeedPipeline:
             )
             group = canonical_groups.get(canonical_key)
             if group is None:
-                group = {"event": event, "rank": rank, "aliases": []}
+                group = {"event": event, "rank": rank, "aliases": set()}
                 canonical_groups[canonical_key] = group
             elif rank < group["rank"]:
                 group["event"] = event
                 group["rank"] = rank
             for raw_alias in (row["event_id"], event.activity_id, *event.event_ids):
                 alias = cls._valid_alias(raw_alias)
-                if alias and alias not in group["aliases"]:
-                    group["aliases"].append(alias)
+                if alias:
+                    group["aliases"].add(alias)
             if row_id:
                 row_bindings.append((row_id, canonical_key))
 
@@ -1412,7 +1412,13 @@ class FeedPipeline:
 
         for canonical_key, group in canonical_groups.items():
             event = group["event"]
-            aliases = tuple(group["aliases"]) or (event.activity_id,)
+            # Keep the saved payload's alias order and append other known aliases
+            # deterministically so archive lookup order cannot change the event.
+            saved_order = tuple(dict.fromkeys(
+                alias for alias in event.event_ids if cls._valid_alias(alias)
+            ))
+            aliases = (*saved_order, *sorted(group["aliases"].difference(saved_order)))
+            aliases = aliases or (event.activity_id,)
             canonical = replace(event, event_ids=aliases)
             canonical_events[canonical_key] = canonical
             if canonical.source in canonical_by_source:
