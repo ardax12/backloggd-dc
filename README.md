@@ -160,13 +160,13 @@ Use the connection URL and access token supplied by your database host. The endp
 
 **Back up before updating the bot.** For SQLite, stop the bot cleanly and copy the database together with any matching `-wal` and `-shm` files. With Docker, back up the database inside the mounted volume. For a remote database, use your host's snapshot or export tools.
 
-Database upgrades run automatically on startup (currently schema versions 1-9). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
+Database upgrades run automatically on startup (currently schema versions 1-10). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
 
 ## How updates and announcements work
 
 **Library updates:** Commands use cached libraries and show their age. Libraries older than an hour or marked stale by feed activity are refreshed in the background when used; `/refresh` requests an update directly. If an update fails, the previous library stays available.
 
-**Server totals:** Games Logged adds the Played-tab totals of distinct linked profiles currently in the server. A game owned by two different profiles contributes twice; two Discord accounts linked to the same profile contribute once. Missing totals are marked unavailable or partial.
+**Server totals:** Games Logged adds the Played-tab totals of distinct linked profiles currently in the server. A game owned by two different profiles contributes twice; two Discord accounts linked to the same profile contribute once. Authoritative Played-tab totals observed by `/profile` or `/server-stats` are cached per profile with an observation timestamp for up to one hour; missing, stale, or partial totals are disclosed.
 
 **Feed setup:** The first successful activity and journal checks establish a starting point silently. The bot checks journal page 1 every five minutes, including at setup and after an outage. Backdated entries, edits, or missed entries that stay on later pages may go unnoticed.
 

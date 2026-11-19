@@ -478,6 +478,7 @@ def create_server_stats_embed(
         inline=True,
     )
     missing_counts = stats.get("logged_profiles_missing", 0)
+    stale_counts = stats.get("logged_profiles_stale", 0)
     if missing_counts:
         logged_value = (
             f"At least **{stats['total_logged']}** games"
@@ -485,6 +486,12 @@ def create_server_stats_embed(
         )
         noun = "profile count" if missing_counts == 1 else "profile counts"
         logged_value += f"\n{missing_counts} {noun} unavailable"
+        if stale_counts:
+            stale_noun = "profile count" if stale_counts == 1 else "profile counts"
+            logged_value += f"\n{stale_counts} {stale_noun} stale (>1h)"
+    elif stale_counts:
+        noun = "profile count" if stale_counts == 1 else "profile counts"
+        logged_value = f"**{stats['total_logged']}** games\n{stale_counts} {noun} stale (>1h)"
     else:
         logged_value = f"**{stats['total_logged']}** games"
     embed.add_field(name="📚 Games Logged", value=logged_value, inline=True)

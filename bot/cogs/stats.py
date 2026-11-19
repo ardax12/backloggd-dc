@@ -14,7 +14,12 @@ from bot.services.guild_membership import (
     resolve_guild_member_ids,
 )
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
-from bot.services.freshness import resolve_guild_aggregate_freshness
+from bot.services.freshness import (
+    FRESHNESS_WINDOW_SECONDS,
+    resolve_guild_aggregate_freshness,
+    valid_played_count,
+)
+from bot.services.library_sync import parse_sync_timestamp
 from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.cogs.stats")
@@ -50,10 +55,12 @@ class StatsCog(commands.Cog, name="Stats"):
         clock=None,
         played_count_timeout: float = 15.0,
         profile_count_concurrency: int = 2,
+        played_count_freshness_seconds: float = FRESHNESS_WINDOW_SECONDS,
     ):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.played_count_timeout = max(0.0, float(played_count_timeout))
+        self.played_count_freshness_seconds = max(0.0, float(played_count_freshness_seconds))
         self.profile_count_concurrency = max(1, int(profile_count_concurrency))
         self._profile_count_slots = asyncio.Semaphore(self.profile_count_concurrency)
         self._closing = False
@@ -113,6 +120,21 @@ class StatsCog(commands.Cog, name="Stats"):
             if operation is not None:
                 self._active_count_operations.discard(operation)
 
+    async def _fetch_authoritative_played_count(self, username: str) -> Optional[int]:
+        # The SDK's cached profile has no observation timestamp.
+        public_profile = await self.bot.backloggd.get_user_profile(username, force_refresh=True)
+        if public_profile is None:
+            return None
+        count = valid_played_count(getattr(public_profile, "played_count", None))
+        if count is not None:
+            return count
+        counts_method = getattr(self.bot.backloggd, "get_user_collection_counts", None)
+        if callable(counts_method):
+            collection_counts = await counts_method(username)
+            if isinstance(collection_counts, dict):
+                return valid_played_count(collection_counts.get("played"))
+        return None
+
     async def _run_played_tab_counts(
         self,
         member_ids: List[int],
@@ -120,19 +142,57 @@ class StatsCog(commands.Cog, name="Stats"):
         profiles: Optional[Sequence[dict]] = None,
         timeout: Optional[float] = None,
     ) -> dict:
-        """Sum public profile Played-tab totals with a bounded worker pool and deadline."""
+        """Sum public profile Played-tab totals, reusing fresh stored observations."""
         if profiles is None:
             profiles = await self.bot.db.get_guild_linked_profiles(member_ids)
-        profile_list = list(profiles)
-        if not profile_list:
+        deduped_profiles: list[tuple[str, dict]] = []
+        seen_keys: set[str] = set()
+        for row in profiles:
+            username = row["display_username"]
+            profile_key = str(row.get("profile_key") or username).strip().lower()
+            if not profile_key or profile_key in seen_keys:
+                continue
+            seen_keys.add(profile_key)
+            deduped_profiles.append((profile_key, row))
+
+        if not deduped_profiles:
             return {
                 "total_logged": 0,
                 "logged_profiles_counted": 0,
                 "logged_profiles_missing": 0,
+                "logged_profiles_stale": 0,
+            }
+
+        current_now = parse_sync_timestamp(self.clock()) or datetime.now(timezone.utc)
+        results: dict[str, int] = {}
+        stale_candidates: dict[str, int] = {}
+        fetch_targets: list[tuple[str, str]] = []
+
+        for profile_key, row in deduped_profiles:
+            username = row["display_username"]
+            stored_count = valid_played_count(row.get("played_count"))
+            observed_at = parse_sync_timestamp(row.get("played_count_observed_at"))
+            if (
+                stored_count is not None
+                and observed_at is not None
+                and (current_now - observed_at).total_seconds() < self.played_count_freshness_seconds
+            ):
+                results[profile_key] = stored_count
+            else:
+                if stored_count is not None:
+                    stale_candidates[profile_key] = stored_count
+                fetch_targets.append((profile_key, username))
+
+        if not fetch_targets:
+            return {
+                "total_logged": sum(results.values()),
+                "logged_profiles_counted": len(results),
+                "logged_profiles_missing": 0,
+                "logged_profiles_stale": 0,
             }
 
         deadline = self.played_count_timeout if timeout is None else max(0.0, float(timeout))
-        results: dict[int, int] = {}
+        newly_observed: dict[str, int] = {}
         next_idx = 0
         stop_pulling = False
 
@@ -140,24 +200,24 @@ class StatsCog(commands.Cog, name="Stats"):
             nonlocal next_idx
             while not stop_pulling:
                 idx = next_idx
-                if idx >= len(profile_list):
+                if idx >= len(fetch_targets):
                     return
                 next_idx += 1
-                username = profile_list[idx]["display_username"]
+                profile_key, username = fetch_targets[idx]
                 try:
                     async with self._profile_count_slots:
                         if stop_pulling:
                             return
-                        public_profile = await self.bot.backloggd.get_user_profile(username)
-                    count = getattr(public_profile, "played_count", None)
-                    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-                        results[idx] = count
+                        count = await self._fetch_authoritative_played_count(username)
+                    if count is not None:
+                        results[profile_key] = count
+                        newly_observed[profile_key] = count
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
                     logger.warning("Could not read Played-tab count for %s: %s", username, type(error).__name__)
 
-        worker_count = min(self.profile_count_concurrency, len(profile_list))
+        worker_count = min(self.profile_count_concurrency, len(fetch_targets))
         workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
         self._profile_count_workers.update(workers)
         for task in workers:
@@ -177,11 +237,25 @@ class StatsCog(commands.Cog, name="Stats"):
             await asyncio.gather(*workers, return_exceptions=True)
             raise
 
+        updater = getattr(self.bot.db, "update_profiles_played_counts", None)
+        if newly_observed and callable(updater):
+            try:
+                await updater(newly_observed.items(), observed_at=current_now)
+            except Exception:
+                logger.warning("Could not persist Played-tab counts", exc_info=True)
+
+        stale_used = 0
+        for profile_key, stale_value in stale_candidates.items():
+            if profile_key not in results:
+                results[profile_key] = stale_value
+                stale_used += 1
+
         counted = len(results)
         return {
             "total_logged": sum(results.values()),
             "logged_profiles_counted": counted,
-            "logged_profiles_missing": len(profile_list) - counted,
+            "logged_profiles_missing": len(deduped_profiles) - counted,
+            "logged_profiles_stale": stale_used,
         }
 
     async def _load_server_top_embed(

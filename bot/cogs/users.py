@@ -18,7 +18,11 @@ from bot.ui.embeds import create_profile_embed
 from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_review_url, build_backloggd_user_url
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
-from bot.services.freshness import ensure_profiles_fresh, format_profile_freshness_line
+from bot.services.freshness import (
+    ensure_profiles_fresh,
+    format_profile_freshness_line,
+    valid_played_count,
+)
 from bot.services.library_sync import PLAYING_SINGLE_PAGE_LIMIT
 
 logger = logging.getLogger("backloggd.cogs.users")
@@ -27,6 +31,15 @@ class UsersCog(commands.Cog, name="Users"):
     def __init__(self, bot, *, clock=None):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    async def _load_profile(self, username: str):
+        sdk = self.bot.backloggd
+        cached = sdk.cache.get_profile(username)
+        if cached is not None:
+            # The SDK does not expose when this cached profile was fetched.
+            return cached, None
+        profile = await sdk.get_user_profile(username, force_refresh=True)
+        return profile, self.clock()
 
     @app_commands.command(name="profile", description="View a Backloggd user's profile, library stats, and favorite games")
     @app_commands.describe(user="Optional: Mention a server member or provide a Backloggd username (defaults to you)")
@@ -72,13 +85,13 @@ class UsersCog(commands.Cog, name="Users"):
         safe_target = escape_display_text(target_username)
         try:
             # Fetch profile, recent journal, and latest reviews concurrently
-            profile_task = self.bot.backloggd.get_user_profile(target_username)
+            profile_task = self._load_profile(target_username)
             journal_task = self.bot.backloggd.get_user_journal(target_username, max_pages=1)
             reviews_task = self.bot.backloggd.get_user_reviews(target_username, max_pages=1)
 
             results = await asyncio.gather(profile_task, journal_task, reviews_task, return_exceptions=True)
             profile_error = results[0] if isinstance(results[0], Exception) else None
-            profile_data = results[0] if profile_error is None else None
+            profile_data, profile_observed_at = results[0] if profile_error is None else (None, None)
             journal_entries = results[1] if not isinstance(results[1], Exception) and isinstance(results[1], list) else []
             user_reviews = results[2] if not isinstance(results[2], Exception) and isinstance(results[2], list) else []
 
@@ -114,12 +127,14 @@ class UsersCog(commands.Cog, name="Users"):
             canonical_username = profile_data.username.strip()
             canonical_key = canonical_username.lower()
             collection_counts = {}
+            counts_observed_at = None
             collections = ("played", "playing", "backlog", "wishlist")
             missing_counts = {name for name in collections if getattr(profile_data, f"{name}_count", None) is None}
             counts_method = getattr(self.bot.backloggd, "get_user_collection_counts", None)
             if missing_counts and counts_method is not None:
                 try:
                     collection_counts = await asyncio.wait_for(counts_method(canonical_username), timeout=5.0)
+                    counts_observed_at = self.clock()
                 except Exception as error:
                     logger.debug("Collection counts unavailable for %s: %s", canonical_username, type(error).__name__)
             elif "playing" in missing_counts:
@@ -134,6 +149,29 @@ class UsersCog(commands.Cog, name="Users"):
                         collection_counts["playing"] = len(playing)
                 except Exception as error:
                     logger.debug("Playing count unavailable for %s: %s", canonical_username, type(error).__name__)
+            played_observed_at = profile_observed_at
+            authoritative_played = None
+            if played_observed_at is not None:
+                authoritative_played = valid_played_count(getattr(profile_data, "played_count", None))
+            if authoritative_played is None and counts_observed_at is not None and isinstance(collection_counts, dict):
+                authoritative_played = valid_played_count(collection_counts.get("played"))
+                played_observed_at = counts_observed_at
+            if authoritative_played is not None:
+                played_updater = getattr(self.bot.db, "update_profile_played_count", None)
+                if callable(played_updater):
+                    try:
+                        await played_updater(
+                            canonical_key,
+                            authoritative_played,
+                            observed_at=played_observed_at,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not persist Played-tab count for %s",
+                            canonical_username,
+                            exc_info=True,
+                        )
+
             sub_checker = getattr(self.bot.db, "is_profile_library_subscribed", None)
             subscribed = (
                 bool(await sub_checker(canonical_key))

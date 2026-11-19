@@ -16,6 +16,13 @@ from bot.services.library_sync import (
 FRESHNESS_WINDOW_SECONDS = 3600
 
 
+def valid_played_count(value: Any) -> Optional[int]:
+    """Return non-negative integer Played-tab count or None for missing/invalid values."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileFreshness:
     profile_key: str

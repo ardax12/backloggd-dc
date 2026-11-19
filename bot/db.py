@@ -2723,6 +2723,65 @@ class Database:
                 (error_text, profile_key),
             )
 
+    async def update_profile_played_count(
+        self,
+        username: str,
+        played_count: int,
+        *,
+        observed_at: Optional[Any] = None,
+    ) -> bool:
+        """Persist an authoritative Played-tab count for a known profile."""
+        if not isinstance(played_count, int) or isinstance(played_count, bool) or played_count < 0:
+            return False
+        profile_key = str(username or "").strip().lower()
+        if not profile_key:
+            return False
+        updated = await self.update_profiles_played_counts(
+            [(profile_key, played_count)],
+            observed_at=observed_at,
+        )
+        return updated > 0
+
+    async def update_profiles_played_counts(
+        self,
+        counts: Iterable[tuple[str, int]],
+        *,
+        observed_at: Optional[Any] = None,
+    ) -> int:
+        """Persist authoritative Played-tab counts for known profiles atomically."""
+        valid_updates: dict[str, int] = {}
+        for raw_key, raw_count in counts:
+            key = str(raw_key or "").strip().lower()
+            if not key:
+                continue
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0:
+                valid_updates[key] = raw_count
+        if not valid_updates:
+            return 0
+
+        observed_sql = self._now_utc_sql_timestamp(observed_at)
+        rows = [(count, observed_sql, key) for key, count in valid_updates.items()]
+        sql = """UPDATE profiles
+                 SET played_count = ?, played_count_observed_at = ?
+                 WHERE profile_key = ?"""
+        if self.is_turso:
+            total_updated = 0
+            for batch in _iter_bounded_row_batches(
+                rows,
+                params_per_row=3,
+                fixed_params=0,
+                fixed_sql_bytes=128,
+            ):
+                results = await self._execute_batch_results([(sql, row) for row in batch])
+                total_updated += sum(getattr(rs, "rows_affected", 0) or 0 for rs in results)
+            return total_updated
+
+        async with self._transaction() as tx:
+            total_updated = 0
+            for row in rows:
+                total_updated += await tx.execute(sql, row)
+            return total_updated
+
     async def get_multi_profile_ratings_dict(
         self,
         profile_keys: List[str],
@@ -2778,6 +2837,7 @@ class Database:
                 SELECT u.discord_id,
                        p.profile_key, p.display_username, p.avatar_url,
                        p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error,
+                       p.played_count, p.played_count_observed_at,
                        pending.fingerprint AS pending_refresh_token
                 FROM linked_users AS u
                 JOIN profiles AS p ON p.profile_key = u.profile_key
@@ -2799,6 +2859,8 @@ class Database:
                         "last_synced_at": row["last_synced_at"],
                         "last_sync_attempt_at": row["last_sync_attempt_at"],
                         "last_sync_error": row["last_sync_error"],
+                        "played_count": row["played_count"],
+                        "played_count_observed_at": row["played_count_observed_at"],
                         "pending_refresh_token": row["pending_refresh_token"],
                     }
         sorted_keys = sorted(profiles)

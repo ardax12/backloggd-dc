@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+import re
 from typing import Any
 
 
@@ -383,6 +384,18 @@ async def _migrate_guild_recipient_gaps(execute: Execute, fetchone: FetchOne) ->
     )
 
 
+async def _migrate_profile_played_count_cache(execute: Execute, fetchone: FetchOne) -> None:
+    """Add nullable persisted Played-tab total and observation timestamp to profiles."""
+    profile_row = await fetchone(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'profiles'", ()
+    )
+    profile_sql = (profile_row["sql"] or "") if profile_row else ""
+    if not re.search(r"\bplayed_count\b", profile_sql):
+        await execute("ALTER TABLE profiles ADD COLUMN played_count INTEGER", ())
+    if not re.search(r"\bplayed_count_observed_at\b", profile_sql):
+        await execute("ALTER TABLE profiles ADD COLUMN played_count_observed_at TIMESTAMP", ())
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -422,3 +435,6 @@ async def run_migrations(database) -> None:
         if version < 9:
             await _migrate_guild_recipient_gaps(tx.execute, tx.fetchone)
             await tx.execute("INSERT INTO schema_migrations (version) VALUES (9)")
+        if version < 10:
+            await _migrate_profile_played_count_cache(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (10)")
