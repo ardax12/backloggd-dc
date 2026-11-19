@@ -5,7 +5,8 @@ import logging
 import math
 from pathlib import Path
 import socket
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 import aiohttp
 import discord
@@ -23,6 +24,7 @@ logger = logging.getLogger("backloggd.bot")
 
 _DEFAULT_COMMAND_SYNC_RETRY_DELAYS = (5.0, 15.0)
 _DEFAULT_COMMAND_SYNC_RETRY_BUDGET = 60.0
+_RECONNECT_GRACE_SECONDS = 60.0
 
 
 def _retry_after_seconds(error: Exception) -> Optional[float]:
@@ -54,6 +56,7 @@ class BackloggdBot(commands.Bot):
         *,
         command_sync_retry_delays: tuple[float, ...] = _DEFAULT_COMMAND_SYNC_RETRY_DELAYS,
         command_sync_retry_budget: float = _DEFAULT_COMMAND_SYNC_RETRY_BUDGET,
+        monotonic_clock: Optional[Callable[[], float]] = None,
     ):
         intents = discord.Intents.default()
         intents.members = True          # Required for server-specific member queries
@@ -77,6 +80,10 @@ class BackloggdBot(commands.Bot):
         self._close_task: Optional[asyncio.Task] = None
         self._command_sync_task: Optional[asyncio.Task] = None
         self._closing: bool = False
+        self._has_been_ready: bool = False
+        self._disconnected_since: Optional[float] = None
+        self._monotonic_clock: Callable[[], float] = monotonic_clock or time.monotonic
+        self._reconnect_grace_seconds: float = _RECONNECT_GRACE_SECONDS
         self._command_sync_retry_delays = tuple(float(delay) for delay in command_sync_retry_delays)
         self._command_sync_retry_budget = float(command_sync_retry_budget)
         self.tree.error(self.on_app_command_error)
@@ -250,8 +257,25 @@ class BackloggdBot(commands.Bot):
 
         await await_owned_task(self._close_task)
 
+    def get_readiness_status(self) -> tuple[int, str, bool]:
+        """Return (http_status, state_name, ready) from local bot and DB state."""
+        if self._closing or self.is_closed():
+            return 503, "stopping", False
+        if not self._has_been_ready:
+            return 503, "starting", False
+        if not getattr(self.db, "is_connected", False):
+            return 503, "unavailable", False
+        if self._disconnected_since is not None:
+            elapsed = max(0.0, self._monotonic_clock() - self._disconnected_since)
+            if elapsed < self._reconnect_grace_seconds:
+                return 200, "reconnecting", False
+            return 503, "unavailable", False
+        return 200, "online", True
+
     async def on_ready(self) -> None:
         """Triggered when connection is established and cache is ready."""
+        self._has_been_ready = True
+        self._disconnected_since = None
         logger.info("Logged in as %s (ID: %d)", self.user.name, self.user.id)
         feed_cog = self.get_cog("Feed")
         if feed_cog:
@@ -261,3 +285,12 @@ class BackloggdBot(commands.Bot):
             name="games on Backloggd | /game"
         )
         await self.change_presence(activity=activity)
+
+    async def on_disconnect(self) -> None:
+        """Record first disconnect time after initial readiness for reconnect grace tracking."""
+        if self._has_been_ready and self._disconnected_since is None:
+            self._disconnected_since = self._monotonic_clock()
+
+    async def on_resumed(self) -> None:
+        """Restore readiness when an existing Discord session resumes."""
+        self._disconnected_since = None

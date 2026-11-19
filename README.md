@@ -129,7 +129,10 @@ For a test server, optionally set `DEV_GUILD_ID` to that server's ID. Otherwise 
 python main.py
 ```
 
-Keep this process running. If your host provides a numeric `PORT` environment variable, the bot also serves health checks at `/` and `/health`. It still needs a persistent background process to stay connected to Discord.
+Keep this process running. If your host provides a numeric `PORT` environment variable, the bot serves HTTP checks at `/` and `/health`. It still needs a persistent background process to stay connected to Discord.
+
+- `/` is a lightweight process liveness check (`200` while the HTTP server is up), for hosts that restart only when the process stops responding.
+- `/health` reports local bot readiness (`ready`, `status`, `service`, and `revision` when `APP_REVISION` or `RENDER_GIT_COMMIT` is set). A `200` response confirms that initial Discord startup completed and the database client is open (returning `reconnecting` with `ready: false` during a 60-second Discord reconnect grace window), and `503` reports `starting`, `unavailable`, or `stopping`. Remote database reachability and slash-command registration have separate failure and recovery paths. If a host configures `/health` as its restart probe, extended Discord outages can cause restarts.
 
 ## Run with Docker
 

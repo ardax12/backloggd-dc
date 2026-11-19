@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any, Optional
 from aiohttp import web
 from bot.client import BackloggdBot
 from bot.config import DISCORD_TOKEN
@@ -16,21 +17,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backloggd.main")
 
-async def handle_health_check(request: web.Request) -> web.Response:
-    """Simple HTTP health check endpoint for hosting platforms."""
-    return web.json_response({"status": "online", "service": "backloggd-discord-bot"})
+SERVICE_NAME = "backloggd-discord-bot"
+BOT_APP_KEY: web.AppKey[Optional[Any]] = web.AppKey("bot")
 
-async def start_health_server(port: int) -> web.AppRunner:
-    """Start a lightweight HTTP server on the designated cloud port."""
+
+def get_deployed_revision() -> Optional[str]:
+    """Return the deployed commit revision from build/platform configuration if set."""
+    for env_var in ("APP_REVISION", "RENDER_GIT_COMMIT"):
+        value = os.getenv(env_var, "").strip()
+        if value:
+            return value
+    return None
+
+
+async def handle_liveness_check(request: web.Request) -> web.Response:
+    """Lightweight HTTP liveness endpoint for hosting platforms."""
+    return web.json_response({"status": "online", "service": SERVICE_NAME})
+
+
+async def handle_health_check(request: web.Request) -> web.Response:
+    """State-aware readiness endpoint derived from local bot and database state."""
+    bot = request.app.get(BOT_APP_KEY)
+    if bot is None:
+        http_status, status_name, ready = 503, "starting", False
+    else:
+        http_status, status_name, ready = bot.get_readiness_status()
+
+    payload: dict[str, Any] = {
+        "status": status_name,
+        "ready": ready,
+        "service": SERVICE_NAME,
+    }
+    revision = get_deployed_revision()
+    if revision is not None:
+        payload["revision"] = revision
+    return web.json_response(payload, status=http_status)
+
+
+def create_health_app(bot: Optional[Any] = None) -> web.Application:
+    """Build the aiohttp application exposing liveness (/) and readiness (/health)."""
     app = web.Application()
-    app.router.add_get("/", handle_health_check)
+    app[BOT_APP_KEY] = bot
+    app.router.add_get("/", handle_liveness_check)
     app.router.add_get("/health", handle_health_check)
+    return app
+
+
+async def start_health_server(port: int, *, bot: Optional[Any] = None) -> web.AppRunner:
+    """Start a lightweight HTTP server on the designated cloud port."""
+    app = create_health_app(bot=bot)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    try:
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+    except BaseException:
+        await runner.cleanup()
+        raise
     logger.info("Health check server listening on http://0.0.0.0:%d", port)
     return runner
+
 
 async def main():
     if not DISCORD_TOKEN or DISCORD_TOKEN == "your_bot_token_here":
@@ -47,15 +93,14 @@ async def main():
         )
         sys.exit(1)
 
-    # Hosting platforms can request a health server through PORT.
-    runner = None
-    port_env = os.getenv("PORT")
-    if port_env and port_env.isdigit():
-        runner = await start_health_server(int(port_env))
-
     bot = BackloggdBot()
+    runner = None
     try:
         async with bot:
+            # Hosting platforms can request a health server through PORT.
+            port_env = os.getenv("PORT")
+            if port_env and port_env.isdigit():
+                runner = await start_health_server(int(port_env), bot=bot)
             await bot.start(DISCORD_TOKEN)
     finally:
         if runner:
