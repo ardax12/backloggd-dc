@@ -364,6 +364,8 @@ def create_roulette_embed(
     game: Any,
     remaining_backlog: int,
     freshness_note: Optional[str] = None,
+    *,
+    pool: Optional[str] = None,
 ) -> discord.Embed:
     """Construct embed for /roulette unplayed-library pick."""
     raw_title = _read_field(game, "title", "Unknown Game")
@@ -389,8 +391,11 @@ def create_roulette_embed(
     if community_rating:
         stars = rating_to_stars(community_rating)
         desc_lines.append(f"{stars} **{community_rating:.1f}** / 5.0")
-    
-    desc_lines.append(f"\n🎯 **Your Mission:** Pick one of these unrated games to play! ({remaining_backlog} games still waiting)")
+
+    pool_suffix = f" in {pool}" if pool in ("Backlog", "Wishlist") else ""
+    desc_lines.append(
+        f"\n🎯 **Your Mission:** Pick one of these unrated games to play! ({remaining_backlog} games still waiting{pool_suffix})"
+    )
     embed.description = clamp_escaped_text("\n".join(desc_lines), 4096)
     if freshness_note:
         embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)

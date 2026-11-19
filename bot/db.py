@@ -2444,19 +2444,31 @@ class Database:
         )
         return rows
 
-    async def get_user_backlog(self, discord_id: int) -> List[Any]:
-        """Retrieve unrated backlog and wishlist games for a user."""
-        query = """
+    _ROULETTE_POOL_STATUSES = {
+        "both": ("backlog", "wishlist"),
+        "backlog": ("backlog",),
+        "wishlist": ("wishlist",),
+    }
+
+    async def get_user_backlog(self, discord_id: int, pool: str = "both") -> List[Any]:
+        """Retrieve unrated backlog and/or wishlist games for a user."""
+        if not isinstance(pool, str):
+            raise ValueError(f"Unsupported roulette pool: {pool!r}")
+        statuses = self._ROULETTE_POOL_STATUSES.get(pool.strip().lower())
+        if statuses is None:
+            raise ValueError(f"Unsupported roulette pool: {pool!r}")
+        placeholders = ", ".join("?" for _ in statuses)
+        query = f"""
             SELECT g.slug, g.title, g.cover_url, g.release_year, g.community_rating, r.rating, r.is_liked
             FROM profile_ratings r
             JOIN cached_games g ON r.game_slug = g.slug
             WHERE r.profile_key = (
                 SELECT profile_key FROM linked_users WHERE discord_id = ?
             )
-              AND r.status IN ('backlog', 'wishlist')
+              AND r.status IN ({placeholders})
               AND r.rating IS NULL;
         """
-        return await self._fetchall(query, (discord_id,))
+        return await self._fetchall(query, (discord_id, *statuses))
 
     _LIBRARY_SYNC_SOURCE = "__library_sync__"
     _PENDING_REFRESH_KEY = "__pending_refresh__"

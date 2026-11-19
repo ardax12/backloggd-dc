@@ -34,7 +34,7 @@ Multiple members may connect the same public Backloggd profile. The bot counts t
 | `/profile [user]` | Show your profile or another public Backloggd profile. |
 | `/compare` | Compare two profiles' ratings and shared favorites. |
 | `/taste-twins` | Find the server members whose game tastes are closest to yours. |
-| `/roulette [member]` | Pick an unrated game from a linked member's backlog or wishlist. |
+| `/roulette [member] [pool]` | Pick an unrated game from a linked member's backlog, wishlist, or both (e.g. `/roulette pool:Backlog`). |
 | `/recommend [member]` | Find games you might enjoy, or suggest your favorites to a member. |
 | `/server-top` | Browse highest-rated, most-played, polarizing, hidden-gem, and backlog rankings. |
 | `/server-stats` | See community totals and how recently the libraries were updated. |

@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 import logging
 import random
-from typing import Optional
+from typing import Literal, Optional
 from backloggd.analytics import calculate_similarity_raw
 from bot.ui.embeds import create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
@@ -39,6 +39,15 @@ from bot.services.freshness import (
 
 logger = logging.getLogger("backloggd.cogs.discovery")
 
+RoulettePool = Literal["Both", "Backlog", "Wishlist"]
+
+_ROULETTE_POOLS: dict[str, tuple[str, str, str]] = {
+    "both": ("both", "Both", "`Backlog` or `Wishlist`"),
+    "backlog": ("backlog", "Backlog", "`Backlog`"),
+    "wishlist": ("wishlist", "Wishlist", "`Wishlist`"),
+}
+
+
 class DiscoveryCog(commands.Cog, name="Discovery"):
     def __init__(self, bot, *, clock=None):
         self.bot = bot
@@ -57,8 +66,21 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
     # =========================================================================
 
     @app_commands.command(name="roulette", description="Pick an unrated game from your Backlog or Wishlist")
-    @app_commands.describe(user="Optional: Server member to spin the roulette for (defaults to you)")
-    async def roulette(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    @app_commands.describe(
+        user="Optional: Server member to spin the roulette for (defaults to you)",
+        pool="Optional: Choose Backlog, Wishlist, or Both (defaults to Both)",
+    )
+    async def roulette(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        pool: RoulettePool = "Both",
+    ):
+        pool_spec = _ROULETTE_POOLS.get(pool.strip().lower()) if isinstance(pool, str) else None
+        if pool_spec is None:
+            raise ValueError(f"Unsupported roulette pool: {pool!r}")
+        pool_key, pool_label, pool_empty_label = pool_spec
+
         await defer_interaction(interaction)
 
         target_discord_id = user.id if user else interaction.user.id
@@ -83,7 +105,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         )
         status = statuses.get(profile_key)
 
-        backlog_games = await self.bot.db.get_user_backlog(target_discord_id)
+        backlog_games = await self.bot.db.get_user_backlog(target_discord_id, pool=pool_key)
 
         if not backlog_games:
             if status is not None and status.missing:
@@ -96,7 +118,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             safe_username = escape_display_text(username)
             await send_private_followup(
                 interaction,
-                f"ℹ️ **{safe_username}** has no unrated games in `Backlog` or `Wishlist` in the local cache. Try `/refresh` to sync your latest library.",
+                f"ℹ️ **{safe_username}** has no unrated games in {pool_empty_label} in the local cache. Try `/refresh` to sync your latest library.",
                 log=logger,
             )
             return
@@ -119,7 +141,11 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                     new_choice = random.choice(backlog_games)
                     next_generation = generation + 1
                     new_embed = create_roulette_embed(
-                        username, new_choice, remaining, freshness_note=freshness_note
+                        username,
+                        new_choice,
+                        remaining,
+                        freshness_note=freshness_note,
+                        pool=pool_label,
                     )
                     new_view = _build_roulette_view(new_choice, generation=next_generation)
                     previous_view = active_state["view"]
@@ -149,7 +175,11 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             return built_view
 
         embed = create_roulette_embed(
-            username, chosen_game, remaining, freshness_note=freshness_note
+            username,
+            chosen_game,
+            remaining,
+            freshness_note=freshness_note,
+            pool=pool_label,
         )
         view = _build_roulette_view(chosen_game, generation=0)
         active_state["view"] = view
