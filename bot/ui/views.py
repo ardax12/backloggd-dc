@@ -11,7 +11,8 @@ from bot.command_errors import (
     handle_component_error,
     send_private_followup,
 )
-from bot.ui.helpers import truncate_button_label
+from bot.input_validation import escape_display_text
+from bot.ui.helpers import clamp_escaped_text, truncate_button_label
 
 logger = logging.getLogger("backloggd.ui.views")
 
@@ -140,6 +141,144 @@ class GameCardView(ExpiringView):
             )
             view_all_btn.callback = on_view_all
             self.add_item(view_all_btn)
+
+
+class GamePickerView(ExpiringView):
+    """Private, author-only select menu for disambiguating /game search results."""
+
+    def __init__(
+        self,
+        author_id: int,
+        candidates: Sequence[tuple[str, str, Optional[str]]],
+        on_select: Callable[[discord.Interaction, str], Coroutine[Any, Any, bool]],
+        *,
+        timeout: float = 180,
+    ):
+        if not candidates or len(candidates) > 5:
+            raise ValueError("GamePickerView requires between 1 and 5 candidates")
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.on_select = on_select
+        self._accepted = False
+        self._slug_by_value: dict[str, str] = {}
+        self._label_by_value: dict[str, str] = {}
+
+        select_options: list[discord.SelectOption] = []
+        for index, (slug, label, description) in enumerate(candidates):
+            option_value = str(index)
+            clean_label = truncate_button_label(label or slug, max_length=100) or str(index + 1)
+            clean_desc = truncate_button_label(description, max_length=100) if description else None
+            self._slug_by_value[option_value] = slug
+            self._label_by_value[option_value] = clean_label
+            select_options.append(
+                discord.SelectOption(
+                    label=clean_label,
+                    value=option_value,
+                    description=clean_desc or None,
+                )
+            )
+
+        self.select = discord.ui.Select(
+            placeholder="Choose a game...",
+            min_values=1,
+            max_values=1,
+            options=select_options,
+        )
+        self.select.callback = self._handle_select
+        self.add_item(self.select)
+
+    async def on_timeout(self):
+        if self._accepted:
+            return
+        await super().on_timeout()
+
+    async def _retire_picker_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        selected_label: Optional[str],
+    ) -> None:
+        edit_original = getattr(interaction, "edit_original_response", None)
+        if not callable(edit_original):
+            return
+        edit_kwargs: dict[str, Any] = {"view": self}
+        if selected_label is not None:
+            edit_kwargs["content"] = clamp_escaped_text(
+                f"✅ Selected **{escape_display_text(selected_label)}**.",
+                2000,
+            )
+        try:
+            await edit_original(**edit_kwargs)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.debug(
+                "Ignoring expected Discord error retiring game picker message",
+                exc_info=True,
+            )
+
+    async def _handle_select(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who ran `/game` can choose from this menu.",
+                ephemeral=True,
+            )
+            return
+
+        if self._accepted:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "ℹ️ A game has already been selected from this menu.",
+                    ephemeral=True,
+                )
+            return
+
+        if self._retired or self.is_finished():
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "⏳ This game picker has expired. Please run `/game` again.",
+                    ephemeral=True,
+                )
+            return
+
+        values = list(self.select.values)
+        if not values and isinstance(getattr(interaction, "data", None), dict):
+            raw_values = interaction.data.get("values")
+            if isinstance(raw_values, list):
+                values = [str(v) for v in raw_values]
+
+        if len(values) != 1 or values[0] not in self._slug_by_value:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Invalid game selection. Please choose an option from the menu.",
+                    ephemeral=True,
+                )
+            return
+
+        selected_value = values[0]
+        slug = self._slug_by_value[selected_value]
+        selected_label = self._label_by_value[selected_value]
+
+        # Claim single-shot selection before the first await so concurrent clicks
+        # cannot both pass and trigger duplicate game loads.
+        self._accepted = True
+        self.select.disabled = True
+        try:
+            await defer_interaction(interaction)
+            rendered = await self.on_select(interaction, slug)
+        except Exception:
+            self.retire()
+            is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+            if callable(is_done) and is_done():
+                await self._retire_picker_message(interaction, selected_label=None)
+            raise
+        except BaseException:
+            self.retire()
+            raise
+        else:
+            self.retire()
+            await self._retire_picker_message(
+                interaction,
+                selected_label=selected_label if rendered else None,
+            )
 
 
 class RatingsView(ExpiringView):

@@ -1,7 +1,7 @@
 """GamesCog: Handles /game with live Discord autocomplete and server score shelf."""
 
 import asyncio
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
@@ -12,8 +12,8 @@ import logging
 from typing import List, Optional
 from uuid import uuid4
 from bot.ui.embeds import create_game_embed, create_all_ratings_embed
-from bot.ui.views import LinkButtonView, GameCardView, RatingsView
-from bot.ui.helpers import build_backloggd_game_url, clamp_escaped_text
+from bot.ui.views import LinkButtonView, GameCardView, GamePickerView, RatingsView
+from bot.ui.helpers import build_backloggd_game_url, clamp_escaped_text, truncate_button_label
 from bot.input_validation import escape_display_text
 from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
@@ -35,6 +35,7 @@ _MAX_FALLBACK_SLUGS = 500
 _FALLBACK_TTL_SECONDS = 1800.0
 _DEFAULT_AUTOCOMPLETE_TIMEOUT_SECONDS = 2.0
 _MAX_DISPLAY_EXCERPT_LEN = 120
+_MAX_PICKER_CANDIDATES = 5
 
 
 def _format_display_excerpt(value: str, *, max_raw_len: int = _MAX_DISPLAY_EXCERPT_LEN) -> str:
@@ -43,6 +44,53 @@ def _format_display_excerpt(value: str, *, max_raw_len: int = _MAX_DISPLAY_EXCER
     if len(collapsed) > max_raw_len:
         collapsed = collapsed[: max(1, max_raw_len - 3)].rstrip() + "..."
     return escape_display_text(collapsed)
+
+
+def _format_picker_label(title: Optional[str], release_year: Optional[int], slug: str) -> str:
+    """Format a Discord SelectOption label <= 100 chars, preserving release year when present."""
+    clean_title = " ".join(str(title).split()) if title is not None else ""
+    if not clean_title:
+        clean_title = slug
+    suffix = f" ({release_year})" if release_year else ""
+    max_title_len = _DISCORD_CHOICE_LIMIT - len(suffix)
+    if len(clean_title) > max_title_len:
+        if max_title_len > 3:
+            clean_title = clean_title[: max_title_len - 3].rstrip() + "..."
+        else:
+            clean_title = clean_title[: max(0, max_title_len)]
+    return f"{clean_title}{suffix}"[:_DISCORD_CHOICE_LIMIT]
+
+
+def _build_picker_candidates(search_results) -> list[tuple[str, str, Optional[str]]]:
+    """Deduplicate search results by slug and prepare up to five bounded picker options."""
+    distinct: list[tuple[str, str]] = []
+    seen_slugs: set[str] = set()
+    for item in search_results:
+        raw_slug = getattr(item, "slug", None)
+        slug = raw_slug.strip() if isinstance(raw_slug, str) else ""
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        label = _format_picker_label(
+            getattr(item, "title", None),
+            getattr(item, "release_year", None),
+            slug,
+        )
+        distinct.append((slug, label))
+        if len(distinct) >= _MAX_PICKER_CANDIDATES:
+            break
+
+    label_counts = Counter(label for _, label in distinct)
+    return [
+        (
+            slug,
+            label,
+            truncate_button_label(slug, max_length=_DISCORD_CHOICE_LIMIT)
+            if label_counts[label] > 1
+            else None,
+        )
+        for slug, label in distinct
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,9 +204,12 @@ class GamesCog(commands.Cog, name="Games"):
     @app_commands.describe(title="Type game title to search with live autocomplete")
     @app_commands.autocomplete(title=game_autocomplete)
     async def game(self, interaction: discord.Interaction, title: str):
-        await defer_interaction(interaction)
-
         query = title.strip()
+        # A free-text search can end in a private selection menu.
+        await defer_interaction(
+            interaction, ephemeral=not query.startswith((_SLUG_TAG_PREFIX, _FALLBACK_TAG_PREFIX)),
+        )
+
         try:
             slug = None
             if query.startswith(_SLUG_TAG_PREFIX):
@@ -193,7 +244,8 @@ class GamesCog(commands.Cog, name="Games"):
                     return
             else:
                 search_results = await self.bot.backloggd.search_games(query)
-                if not search_results:
+                candidates = _build_picker_candidates(search_results or [])
+                if not candidates:
                     safe_query = _format_display_excerpt(query)
                     await send_private_followup(
                         interaction,
@@ -204,119 +256,28 @@ class GamesCog(commands.Cog, name="Games"):
                         log=logger,
                     )
                     return
-                if len(search_results) > 1:
+                if len(candidates) > 1:
                     safe_query = _format_display_excerpt(query)
-                    candidates = [
-                        _format_display_excerpt(
-                            f"{game.title} ({game.release_year})"
-                            if getattr(game, "release_year", None)
-                            else game.title
-                        )
-                        for game in search_results[:5]
-                    ]
-                    options = "; ".join(candidates)
-                    suffix = ". Select the game from the autocomplete list and run `/game` again."
-                    prefix = f"I found several games matching **{safe_query}**: "
-                    max_opts_len = 2000 - len(prefix) - len(suffix)
-                    if len(options) > max_opts_len:
-                        options = clamp_escaped_text(options, max(3, max_opts_len))
-                    await send_private_followup(
+                    picker_view = GamePickerView(
+                        author_id=interaction.user.id,
+                        candidates=candidates,
+                        on_select=self._load_and_render_game,
+                    )
+                    sent = await send_private_followup(
                         interaction,
-                        clamp_escaped_text(f"{prefix}{options}{suffix}", 2000),
+                        clamp_escaped_text(
+                            f"I found several games matching **{safe_query}**. Choose one from the menu below:",
+                            2000,
+                        ),
+                        view=picker_view,
                         log=logger,
                     )
+                    if not sent:
+                        picker_view.retire()
                     return
-                slug = search_results[0].slug
+                slug = candidates[0][0]
 
-            game_data = await self.bot.backloggd.get_game(slug)
-            if not game_data:
-                safe_slug = _format_display_excerpt(slug)
-                await send_private_followup(
-                    interaction,
-                    clamp_escaped_text(
-                        f"❌ Could not retrieve details for game: **{safe_slug}**.",
-                        2000,
-                    ),
-                    log=logger,
-                )
-                return
-
-            # Cache the game metadata in SQLite
-            await self.bot.db.upsert_game(
-                slug=game_data.slug,
-                title=game_data.title,
-                cover_url=game_data.cover_url,
-                release_year=game_data.release_year,
-                community_rating=game_data.community_rating
-            )
-
-            # Retrieve scores from server members who linked their Backloggd account
-            if interaction.guild:
-                guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
-                if guild_member_ids is None:
-                    await send_private_followup(
-                        interaction,
-                        GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-                        log=logger,
-                    )
-                    return
-            else:
-                guild_member_ids = [interaction.user.id]
-            freshness_note = await resolve_guild_aggregate_freshness(
-                self.bot,
-                guild_member_ids,
-                now=self.clock(),
-                require_subscribed=True,
-            )
-            server_ratings = await self.bot.db.get_server_ratings_for_game(guild_member_ids, game_data.slug)
-            missing_scores = {
-                row["profile_key"]: index
-                for index, row in enumerate(server_ratings)
-                if row["rating"] is None and row["status"] in {"played", "unknown"}
-            }
-            if missing_scores:
-                linked = await self.bot.db.get_linked_user(interaction.user.id)
-                if linked and linked["profile_key"] in missing_scores:
-                    index = missing_scores[linked["profile_key"]]
-                    row = server_ratings[index]
-                    try:
-                        rating = await asyncio.wait_for(
-                            self.bot.backloggd.get_user_game_rating(row["backloggd_username"], game_data.slug),
-                            timeout=4.0,
-                        )
-                    except Exception as error:
-                        logger.debug("Live game rating unavailable for %s: %s", game_data.slug, type(error).__name__)
-                    else:
-                        if rating is not None:
-                            server_ratings = list(server_ratings)
-                            server_ratings[index] = {**dict(row), "rating": rating}
-                            server_ratings.sort(key=lambda item: (
-                                item["rating"] is None, -(item["rating"] or 0), item["backloggd_username"],
-                            ))
-
-            guild_name = interaction.guild.name if interaction.guild else "Server"
-            embed = create_game_embed(
-                game_data,
-                server_ratings,
-                guild_name=guild_name,
-                freshness_note=freshness_note,
-            )
-            game_url = build_backloggd_game_url(game_data.slug)
-
-            async def on_view_all(btn_interaction: discord.Interaction):
-                ratings_view = RatingsView(game_data.title, game_data.slug, guild_name, server_ratings)
-                await btn_interaction.response.send_message(
-                    embed=ratings_view.embed(), view=ratings_view, ephemeral=True
-                )
-                ratings_view.message = await btn_interaction.original_response()
-
-            view = GameCardView(
-                game_url=game_url,
-                total_ratings=len(server_ratings),
-                on_view_all=on_view_all if len(server_ratings) > 12 else None
-            )
-
-            view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
+            await self._load_and_render_game(interaction, slug)
 
         except Exception as e:
             logger.error("Error looking up game '%s': %s", title, e, exc_info=True)
@@ -329,6 +290,99 @@ class GamesCog(commands.Cog, name="Games"):
                 ),
                 log=logger,
             )
+
+    async def _load_and_render_game(self, interaction: discord.Interaction, slug: str) -> bool:
+        """Load game details, resolve server ratings and freshness, and post the public card."""
+        game_data = await self.bot.backloggd.get_game(slug)
+        if not game_data:
+            safe_slug = _format_display_excerpt(slug)
+            await send_private_followup(
+                interaction,
+                clamp_escaped_text(
+                    f"❌ Could not retrieve details for game: **{safe_slug}**.",
+                    2000,
+                ),
+                log=logger,
+            )
+            return False
+
+        # Cache the game metadata in SQLite
+        await self.bot.db.upsert_game(
+            slug=game_data.slug,
+            title=game_data.title,
+            cover_url=game_data.cover_url,
+            release_year=game_data.release_year,
+            community_rating=game_data.community_rating,
+        )
+
+        # Retrieve scores from server members who linked their Backloggd account
+        if interaction.guild:
+            guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
+            if guild_member_ids is None:
+                await send_private_followup(
+                    interaction,
+                    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+                    log=logger,
+                )
+                return False
+        else:
+            guild_member_ids = [interaction.user.id]
+        freshness_note = await resolve_guild_aggregate_freshness(
+            self.bot,
+            guild_member_ids,
+            now=self.clock(),
+            require_subscribed=True,
+        )
+        server_ratings = await self.bot.db.get_server_ratings_for_game(guild_member_ids, game_data.slug)
+        missing_scores = {
+            row["profile_key"]: index
+            for index, row in enumerate(server_ratings)
+            if row["rating"] is None and row["status"] in {"played", "unknown"}
+        }
+        if missing_scores:
+            linked = await self.bot.db.get_linked_user(interaction.user.id)
+            if linked and linked["profile_key"] in missing_scores:
+                index = missing_scores[linked["profile_key"]]
+                row = server_ratings[index]
+                try:
+                    rating = await asyncio.wait_for(
+                        self.bot.backloggd.get_user_game_rating(row["backloggd_username"], game_data.slug),
+                        timeout=4.0,
+                    )
+                except Exception as error:
+                    logger.debug("Live game rating unavailable for %s: %s", game_data.slug, type(error).__name__)
+                else:
+                    if rating is not None:
+                        server_ratings = list(server_ratings)
+                        server_ratings[index] = {**dict(row), "rating": rating}
+                        server_ratings.sort(key=lambda item: (
+                            item["rating"] is None, -(item["rating"] or 0), item["backloggd_username"],
+                        ))
+
+        guild_name = interaction.guild.name if interaction.guild else "Server"
+        embed = create_game_embed(
+            game_data,
+            server_ratings,
+            guild_name=guild_name,
+            freshness_note=freshness_note,
+        )
+        game_url = build_backloggd_game_url(game_data.slug)
+
+        async def on_view_all(btn_interaction: discord.Interaction):
+            ratings_view = RatingsView(game_data.title, game_data.slug, guild_name, server_ratings)
+            await btn_interaction.response.send_message(
+                embed=ratings_view.embed(), view=ratings_view, ephemeral=True
+            )
+            ratings_view.message = await btn_interaction.original_response()
+
+        view = GameCardView(
+            game_url=game_url,
+            total_ratings=len(server_ratings),
+            on_view_all=on_view_all if len(server_ratings) > 12 else None,
+        )
+
+        view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
+        return True
 
 async def setup(bot):
     await bot.add_cog(GamesCog(bot))

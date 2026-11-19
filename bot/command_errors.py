@@ -79,8 +79,19 @@ def _is_unresolved_public_defer(interaction) -> bool:
 
 async def send_public_followup(interaction, *args, **kwargs):
     """Send a public followup/result and mark @original resolved."""
+    state = _get_defer_state(interaction)
+    private_defer = state is not None and state["ephemeral"] and not state["original_resolved"]
+    if private_defer:
+        # Resolve the private loading response before sending a separate public card.
+        await interaction.edit_original_response(content="Posting the result in the channel.")
+        mark_original_response_resolved(interaction)
     result = await interaction.followup.send(*args, **kwargs)
     mark_original_response_resolved(interaction)
+    if private_defer:
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            logger.debug("Could not remove private loading response after public followup", exc_info=True)
     return result
 
 
@@ -109,6 +120,7 @@ async def send_private_followup(
     message: str | None = None,
     *,
     embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
     allowed_mentions: discord.AllowedMentions | None = None,
     log: logging.Logger | None = None,
 ) -> bool:
@@ -122,6 +134,8 @@ async def send_private_followup(
     send_kwargs: dict = {"ephemeral": True, "allowed_mentions": mentions}
     if embed is not None:
         send_kwargs["embed"] = embed
+    if view is not None:
+        send_kwargs["view"] = view
 
     response = getattr(interaction, "response", None)
     is_done_fn = getattr(response, "is_done", None)
@@ -131,6 +145,13 @@ async def send_private_followup(
         try:
             await response.send_message(*send_args, **send_kwargs)
             mark_original_response_resolved(interaction)
+            if view is not None and getattr(view, "message", None) is None:
+                original_response = getattr(interaction, "original_response", None)
+                if callable(original_response):
+                    try:
+                        view.message = await original_response()
+                    except discord.HTTPException:
+                        pass
             return True
         except discord.InteractionResponded:
             responded = True
@@ -172,8 +193,13 @@ async def send_private_followup(
             return False
 
     try:
-        await interaction.followup.send(*send_args, **send_kwargs)
+        followup_kwargs = dict(send_kwargs)
+        if view is not None:
+            followup_kwargs["wait"] = True
+        sent_message = await interaction.followup.send(*send_args, **followup_kwargs)
         mark_original_response_resolved(interaction)
+        if view is not None and getattr(view, "message", None) is None:
+            view.message = sent_message
     except discord.HTTPException as send_error:
         target_logger.warning(
             "Failed to send error reply for command %r: %s",
