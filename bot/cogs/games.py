@@ -369,7 +369,9 @@ class GamesCog(commands.Cog, name="Games"):
         game_url = build_backloggd_game_url(game_data.slug)
 
         async def on_view_all(btn_interaction: discord.Interaction):
-            ratings_view = RatingsView(game_data.title, game_data.slug, guild_name, server_ratings)
+            ratings_view = RatingsView(
+                game_data.title, game_data.slug, guild_name, server_ratings, freshness_note=freshness_note,
+            )
             await btn_interaction.response.send_message(
                 embed=ratings_view.embed(), view=ratings_view, ephemeral=True
             )

@@ -9,7 +9,7 @@ import logging
 import random
 from typing import Literal, Optional
 from backloggd.analytics import calculate_similarity_raw
-from bot.ui.embeds import create_roulette_embed
+from bot.ui.embeds import append_freshness_note, create_roulette_embed
 from bot.ui.views import RouletteView, LinkButtonView
 from bot.ui.helpers import (
     build_backloggd_game_url,
@@ -367,14 +367,12 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                     inline=False
                 )
 
-            freshness_lines = [format_profile_freshness_line(caller_status, label=f"**{safe_caller}**")]
+            freshness_lines = [format_profile_freshness_line(caller_status, label=safe_caller)]
             if friend_link and friend_key:
                 freshness_lines.append(
-                    format_profile_freshness_line(statuses.get(friend_key), label=f"**{safe_friend}**")
+                    format_profile_freshness_line(statuses.get(friend_key), label=safe_friend)
                 )
-            freshness_text = "\n".join(line for line in freshness_lines if line)
-            if freshness_text:
-                embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_text, 1024), inline=False)
+            append_freshness_note(embed, " · ".join(line for line in freshness_lines if line))
 
             embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot"[:2048])
             await send_public_followup(interaction, embed=embed)
@@ -605,8 +603,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         contributing = ([caller_status] if caller_status is not None else []) + list(other_statuses.values())
         freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
-        if freshness_note:
-            embed.add_field(name="⏱ Cache Freshness", value=clamp_escaped_text(freshness_note, 1024), inline=False)
+        append_freshness_note(embed, freshness_note)
 
         embed.set_footer(text="Diverse recommendations curated across your server taste matches")
         await send_public_followup(interaction, embed=embed)

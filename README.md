@@ -167,7 +167,7 @@ Database upgrades run automatically on startup (currently schema versions 1-11).
 
 ## How updates and announcements work
 
-**Library updates:** Commands use cached libraries and show their age. Libraries older than an hour or marked stale by feed activity are refreshed in the background when used; `/refresh` requests an update directly. If an update fails, the previous library stays available.
+**Library updates:** Results that use library data include a short line showing when it was last updated. Libraries older than an hour or marked stale by feed activity are refreshed in the background when used; `/refresh` requests an update directly. If an update fails, the previous library stays available.
 
 **Server totals:** Games Logged adds the Played-tab totals of distinct linked profiles currently in the server. A game owned by two different profiles contributes twice; two Discord accounts linked to the same profile contribute once. Authoritative Played-tab totals observed by `/profile` or `/server-stats` are cached per profile with an observation timestamp for up to one hour; missing, stale, or partial totals are disclosed.
 

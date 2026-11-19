@@ -400,9 +400,9 @@ class SocialCog(commands.Cog, name="Social"):
             shared_loves.sort(key=lambda x: (-x["avg"], x["title"]))
             disagreements.sort(key=lambda x: (-x["delta"], x["title"]))
 
-            line1 = format_profile_freshness_line(s1, label=f"**{safe_u1}**", unlinked_live=not sub1)
-            line2 = format_profile_freshness_line(s2, label=f"**{safe_u2}**", unlinked_live=not sub2)
-            freshness_note = "\n".join(line for line in (line1, line2) if line) or None
+            line1 = format_profile_freshness_line(s1, label=safe_u1, unlinked_live=not sub1)
+            line2 = format_profile_freshness_line(s2, label=safe_u2, unlinked_live=not sub2)
+            freshness_note = " · ".join(line for line in (line1, line2) if line) or None
 
             embed = create_compare_embed(
                 user1=u1_name,
@@ -744,9 +744,9 @@ class SocialCog(commands.Cog, name="Social"):
 
                     c_loves.sort(key=lambda x: (-x["avg"], x["title"]))
                     c_dis.sort(key=lambda x: (-x["delta"], x["title"]))
-                    l1 = format_profile_freshness_line(target_status, label=f"**{safe_target}**", unlinked_live=not target_subscribed)
-                    l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=f"**{escape_display_text(top_twin_name)}**")
-                    duel_freshness = "\n".join(line for line in (l1, l2) if line) or None
+                    l1 = format_profile_freshness_line(target_status, label=safe_target, unlinked_live=not target_subscribed)
+                    l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=escape_display_text(top_twin_name))
+                    duel_freshness = " · ".join(line for line in (l1, l2) if line) or None
                     comp_embed = create_compare_embed(
                         user1=target_username,
                         user2=top_twin_name,

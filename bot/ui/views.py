@@ -284,12 +284,15 @@ class GamePickerView(ExpiringView):
 class RatingsView(ExpiringView):
     """Navigate the private ratings response without rerunning a game search."""
 
-    def __init__(self, game_title: str, game_slug: str, guild_name: str, ratings: list):
+    def __init__(
+        self, game_title: str, game_slug: str, guild_name: str, ratings: list, *, freshness_note: str | None = None
+    ):
         super().__init__()
         self.game_title = game_title
         self.game_slug = game_slug
         self.guild_name = guild_name
         self.ratings = ratings
+        self.freshness_note = freshness_note
         self.page = 1
         self.total_pages = max(1, (len(ratings) + 14) // 15)
         self._nav_lock = asyncio.Lock()
@@ -298,7 +301,8 @@ class RatingsView(ExpiringView):
     def embed(self):
         from bot.ui.embeds import create_all_ratings_embed
         return create_all_ratings_embed(
-            self.game_title, self.game_slug, self.guild_name, self.ratings, page=self.page
+            self.game_title, self.game_slug, self.guild_name, self.ratings,
+            page=self.page, freshness_note=self.freshness_note,
         )
 
     def _update_buttons(self):

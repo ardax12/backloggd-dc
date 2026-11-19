@@ -192,14 +192,11 @@ class UsersCog(commands.Cog, name="Users"):
                 avg_rating = stats.get("average_rating")
                 rated_count = stats.get("rated_count")
 
-            freshness_note = None
             has_cached_stats = bool(stats and (stats.get("rated_count", 0) > 0 or stats.get("total_games", 0) > 0))
             if status is not None and (has_cached_stats or subscribed or status.synced_at is not None):
-                freshness_note = format_profile_freshness_line(status, label="Stats cache")
-                if status.missing and subscribed and not has_cached_stats:
-                    freshness_note = f"{freshness_note} — library data is being fetched"
-            elif status is not None:
-                freshness_note = "Overview fetched live from Backloggd (no cached library snapshot)"
+                freshness_note = format_profile_freshness_line(status, label="Library stats")
+            else:
+                freshness_note = "No synced library stats yet"
 
             latest_review = user_reviews[0] if user_reviews else None
 

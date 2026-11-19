@@ -258,24 +258,22 @@ def format_discord_rel(dt: Optional[datetime]) -> str:
 def format_profile_freshness_line(
     status: Optional[ProfileFreshness],
     *,
-    label: str = "Library cache",
+    label: str = "Library",
     unlinked_live: bool = False,
 ) -> Optional[str]:
     if status is None:
         return None
     if unlinked_live and status.missing and not status.refreshing and not status.failed_last:
-        return f"{label}: Fetched live from Backloggd"
-    parts = [f"{label}: {format_discord_rel(status.synced_at)}"]
-    notes = []
+        return f"{label} fetched live"
+    age = f"updated {format_discord_rel(status.synced_at)}" if status.synced_at else "not synced yet"
+    line = f"{label} {age}"
     if status.refreshing:
-        notes.append("refreshing in background")
-    elif status.failed_last:
-        notes.append("last refresh failed (keeping cached data)" if not status.missing else "last refresh failed")
-    elif status.stale and not status.missing:
-        notes.append("stale, pending update" if status.dirty else "stale (>1h)")
-    if notes:
-        parts.append(f"({', '.join(notes)})")
-    return " ".join(parts)
+        return f"{line} (updating)"
+    if status.failed_last:
+        return f"{line} (last update failed)"
+    if status.stale and not status.missing:
+        return f"{line} (update pending)" if status.dirty else f"{line} (out of date)"
+    return line
 
 
 def summarize_aggregate_freshness(statuses: Iterable[ProfileFreshness]) -> dict[str, Any]:
@@ -305,16 +303,21 @@ def format_aggregate_freshness(summary: Optional[dict[str, Any]]) -> Optional[st
         return None
     total = summary["total"]
     oldest = summary.get("oldest_synced_at")
-    oldest_text = format_discord_rel(oldest) if oldest is not None else "None synced yet"
-    stale_label = "stale" if summary.get("dirty") else "stale (>1h)"
-    parts = [
-        f"Oldest contributing sync: {oldest_text}",
-        f"Profiles: {total} ({summary['fresh']} fresh, {summary['stale']} {stale_label}, {summary['missing']} missing)",
-    ]
-    if summary.get("refreshing"):
-        parts.append(f"Refreshing now: {summary['refreshing']}")
-    if summary.get("failed"):
-        parts.append(f"Last refresh failed: {summary['failed']}")
+    library = "library" if total == 1 else "libraries"
+    updated = (
+        f"{'updated' if total == 1 else 'oldest update'} {format_discord_rel(oldest)}"
+        if oldest is not None
+        else "no updates yet"
+    )
+    parts = [f"{total} {library} · {updated}"]
+    for key, label in (
+        ("stale", "out of date"),
+        ("missing", "missing"),
+        ("refreshing", "updating"),
+        ("failed", "failed to update"),
+    ):
+        if n := summary.get(key):
+            parts.append(f"{n} {label}")
     return " · ".join(parts)
 
 
@@ -355,7 +358,7 @@ async def resolve_guild_aggregate_freshness(
         profile_list = list(profiles)
 
     if not profile_list:
-        return "No linked Backloggd profiles in cache yet."
+        return "No linked Backloggd profiles"
 
     statuses = await ensure_profiles_fresh(
         bot,
