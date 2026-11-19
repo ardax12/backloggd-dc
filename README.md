@@ -160,7 +160,7 @@ Use the connection URL and access token supplied by your database host. The endp
 
 **Back up before updating the bot.** For SQLite, stop the bot cleanly and copy the database together with any matching `-wal` and `-shm` files. With Docker, back up the database inside the mounted volume. For a remote database, use your host's snapshot or export tools.
 
-Database upgrades run automatically on startup (currently schema versions 1-10). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
+Database upgrades run automatically on startup (currently schema versions 1-11). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
 
 ## How updates and announcements work
 

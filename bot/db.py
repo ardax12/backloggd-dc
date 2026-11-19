@@ -3642,9 +3642,10 @@ class Database:
         """Fetch only archive rows relevant to incoming/pending IDs, aliases, games, and references.
 
         Runs abandoned-pending recovery unconditionally before checking whether any
-        history seeds exist. SQL narrows by (guild_id, profile_key) via
-        idx_profile_feed_messages_lookup and evaluates guarded JSON predicates across
-        that profile's rows in SQL so only matching rows cross to Python.
+        history seeds exist. Decomposes the lookup into five indexed UNION branches
+        over (guild_id, profile_key) using the PK, guarded scalar expression indexes
+        (activity_id, game_slug, reference), and profile_feed_message_aliases before
+        fetching matched rows via CROSS JOIN on the primary key.
         """
         await self._ensure_stale_pending_recovered()
         normalized_key = profile_key.strip().lower()
@@ -3669,29 +3670,49 @@ class Database:
         query = """
             WITH target_ids(id) AS (SELECT value FROM json_each(?)),
                  target_games(slug) AS (SELECT value FROM json_each(?)),
-                 target_refs(ref) AS (SELECT value FROM json_each(?))
-            SELECT event_id, payload, message_id, channel_id, delivery_state
-            FROM profile_feed_messages
-            WHERE guild_id = ? AND profile_key = ?
-              AND (
-                event_id IN (SELECT id FROM target_ids)
-                OR (
-                  json_valid(payload)
-                  AND json_type(payload) = 'object'
-                  AND (
-                    json_extract(payload, '$.activity_id') IN (SELECT id FROM target_ids)
-                    OR json_extract(payload, '$.game_slug') IN (SELECT slug FROM target_games)
-                    OR json_extract(payload, '$.reference') IN (SELECT ref FROM target_refs)
-                    OR (
-                      json_type(payload, '$.event_ids') = 'array'
-                      AND EXISTS (
-                        SELECT 1 FROM json_each(payload, '$.event_ids')
-                        WHERE value IN (SELECT id FROM target_ids)
-                      )
-                    )
-                  )
-                )
-              )
+                 target_refs(ref) AS (SELECT value FROM json_each(?)),
+                 matched_keys(event_id) AS (
+                     SELECT event_id
+                     FROM profile_feed_messages
+                     WHERE guild_id = ? AND profile_key = ?
+                       AND event_id IN (SELECT id FROM target_ids)
+                     UNION
+                     SELECT event_id
+                     FROM profile_feed_messages
+                     WHERE guild_id = ? AND profile_key = ?
+                       AND (CASE WHEN json_valid(payload)
+                                      AND json_type(payload) = 'object'
+                                      AND json_type(payload, '$.activity_id') = 'text'
+                                 THEN json_extract(payload, '$.activity_id') END)
+                           IN (SELECT id FROM target_ids)
+                     UNION
+                     SELECT event_id
+                     FROM profile_feed_messages
+                     WHERE guild_id = ? AND profile_key = ?
+                       AND (CASE WHEN json_valid(payload)
+                                      AND json_type(payload) = 'object'
+                                      AND json_type(payload, '$.game_slug') = 'text'
+                                 THEN json_extract(payload, '$.game_slug') END)
+                           IN (SELECT slug FROM target_games)
+                     UNION
+                     SELECT event_id
+                     FROM profile_feed_messages
+                     WHERE guild_id = ? AND profile_key = ?
+                       AND (CASE WHEN json_valid(payload)
+                                      AND json_type(payload) = 'object'
+                                      AND json_type(payload, '$.reference') = 'text'
+                                 THEN json_extract(payload, '$.reference') END)
+                           IN (SELECT ref FROM target_refs)
+                     UNION
+                     SELECT alias.event_id
+                     FROM profile_feed_message_aliases AS alias
+                     WHERE alias.guild_id = ? AND alias.profile_key = ?
+                       AND alias.alias_id IN (SELECT id FROM target_ids)
+                 )
+            SELECT m.event_id, m.payload, m.message_id, m.channel_id, m.delivery_state
+            FROM matched_keys AS k
+            CROSS JOIN profile_feed_messages AS m
+              ON m.guild_id = ? AND m.profile_key = ? AND m.event_id = k.event_id
         """
 
         while frontier_ids or frontier_games or frontier_refs:
@@ -3715,6 +3736,16 @@ class Database:
                         json.dumps(batch_ids),
                         json.dumps(batch_games),
                         json.dumps(batch_refs),
+                        guild_id,
+                        normalized_key,
+                        guild_id,
+                        normalized_key,
+                        guild_id,
+                        normalized_key,
+                        guild_id,
+                        normalized_key,
+                        guild_id,
+                        normalized_key,
                         guild_id,
                         normalized_key,
                     ),

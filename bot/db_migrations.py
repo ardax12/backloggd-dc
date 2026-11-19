@@ -396,6 +396,144 @@ async def _migrate_profile_played_count_cache(execute: Execute, fetchone: FetchO
         await execute("ALTER TABLE profiles ADD COLUMN played_count_observed_at TIMESTAMP", ())
 
 
+async def _migrate_profile_feed_history_indexes(execute: Execute, fetchone: FetchOne) -> None:
+    """Add guarded scalar expression indexes and reverse alias table for archive lookups."""
+    await execute(
+        """CREATE INDEX IF NOT EXISTS idx_profile_feed_messages_activity_id
+           ON profile_feed_messages (
+               guild_id,
+               profile_key,
+               (CASE WHEN json_valid(payload)
+                          AND json_type(payload) = 'object'
+                          AND json_type(payload, '$.activity_id') = 'text'
+                     THEN json_extract(payload, '$.activity_id') END)
+           )""",
+        (),
+    )
+    await execute(
+        """CREATE INDEX IF NOT EXISTS idx_profile_feed_messages_game_slug
+           ON profile_feed_messages (
+               guild_id,
+               profile_key,
+               (CASE WHEN json_valid(payload)
+                          AND json_type(payload) = 'object'
+                          AND json_type(payload, '$.game_slug') = 'text'
+                     THEN json_extract(payload, '$.game_slug') END)
+           )""",
+        (),
+    )
+    await execute(
+        """CREATE INDEX IF NOT EXISTS idx_profile_feed_messages_reference
+           ON profile_feed_messages (
+               guild_id,
+               profile_key,
+               (CASE WHEN json_valid(payload)
+                          AND json_type(payload) = 'object'
+                          AND json_type(payload, '$.reference') = 'text'
+                     THEN json_extract(payload, '$.reference') END)
+           )""",
+        (),
+    )
+    await execute(
+        """CREATE TABLE IF NOT EXISTS profile_feed_message_aliases (
+               guild_id INTEGER NOT NULL,
+               profile_key TEXT NOT NULL,
+               alias_id TEXT NOT NULL,
+               event_id TEXT NOT NULL,
+               PRIMARY KEY (guild_id, profile_key, alias_id, event_id)
+           )""",
+        (),
+    )
+    await execute(
+        """CREATE INDEX IF NOT EXISTS idx_profile_feed_message_aliases_event
+           ON profile_feed_message_aliases (guild_id, profile_key, event_id)""",
+        (),
+    )
+    await execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_profile_feed_messages_aliases_ai
+           AFTER INSERT ON profile_feed_messages
+           WHEN json_valid(NEW.payload)
+                AND json_type(NEW.payload) = 'object'
+                AND json_type(NEW.payload, '$.event_ids') = 'array'
+           BEGIN
+               INSERT OR IGNORE INTO profile_feed_message_aliases
+                   (guild_id, profile_key, alias_id, event_id)
+               SELECT NEW.guild_id, NEW.profile_key, je.value, NEW.event_id
+               FROM json_each(NEW.payload, '$.event_ids') AS je
+               WHERE je.type = 'text' AND TRIM(je.value) != '';
+           END""",
+        (),
+    )
+    await execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_profile_feed_messages_aliases_au
+           AFTER UPDATE OF payload ON profile_feed_messages
+           BEGIN
+               DELETE FROM profile_feed_message_aliases
+               WHERE guild_id = OLD.guild_id
+                 AND profile_key = OLD.profile_key
+                 AND event_id = OLD.event_id;
+               INSERT OR IGNORE INTO profile_feed_message_aliases
+                   (guild_id, profile_key, alias_id, event_id)
+               SELECT DISTINCT NEW.guild_id, NEW.profile_key, je.value, NEW.event_id
+               FROM json_each(
+                   CASE WHEN json_valid(NEW.payload)
+                             AND json_type(NEW.payload) = 'object'
+                             AND json_type(NEW.payload, '$.event_ids') = 'array'
+                        THEN NEW.payload ELSE '{}' END,
+                   '$.event_ids'
+               ) AS je
+               WHERE je.type = 'text' AND TRIM(je.value) != '';
+           END""",
+        (),
+    )
+    await execute(
+        """CREATE TRIGGER IF NOT EXISTS trg_profile_feed_messages_aliases_ad
+           AFTER DELETE ON profile_feed_messages
+           BEGIN
+               DELETE FROM profile_feed_message_aliases
+               WHERE guild_id = OLD.guild_id
+                 AND profile_key = OLD.profile_key
+                 AND event_id = OLD.event_id;
+           END""",
+        (),
+    )
+
+    last_rowid = 0
+    batch_size = 500
+    while True:
+        bound_row = await fetchone(
+            """SELECT MAX(rowid) AS max_rowid
+               FROM (
+                   SELECT rowid FROM profile_feed_messages
+                   WHERE rowid > ?
+                   ORDER BY rowid ASC
+                   LIMIT ?
+               )""",
+            (last_rowid, batch_size),
+        )
+        max_rowid = bound_row["max_rowid"] if bound_row else None
+        if max_rowid is None:
+            break
+        await execute(
+            """INSERT OR IGNORE INTO profile_feed_message_aliases
+                   (guild_id, profile_key, alias_id, event_id)
+               SELECT m.guild_id, m.profile_key, je.value, m.event_id
+               FROM profile_feed_messages AS m
+               JOIN json_each(
+                   CASE WHEN json_valid(m.payload)
+                             AND json_type(m.payload) = 'object'
+                             AND json_type(m.payload, '$.event_ids') = 'array'
+                        THEN m.payload ELSE '{}' END,
+                   '$.event_ids'
+               ) AS je
+               WHERE m.rowid > ? AND m.rowid <= ?
+                 AND je.type = 'text'
+                 AND TRIM(je.value) != ''""",
+            (last_rowid, int(max_rowid)),
+        )
+        last_rowid = int(max_rowid)
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -438,3 +576,6 @@ async def run_migrations(database) -> None:
         if version < 10:
             await _migrate_profile_played_count_cache(tx.execute, tx.fetchone)
             await tx.execute("INSERT INTO schema_migrations (version) VALUES (10)")
+        if version < 11:
+            await _migrate_profile_feed_history_indexes(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (11)")
