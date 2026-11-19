@@ -1,26 +1,28 @@
 """GamesCog: Handles /game with live Discord autocomplete and server score shelf."""
 
 import asyncio
+import logging
+import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import time
+from typing import List, Optional
+from uuid import uuid4
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-import logging
-from typing import List, Optional
-from uuid import uuid4
-from bot.ui.embeds import create_game_embed, create_all_ratings_embed
-from bot.ui.views import LinkButtonView, GameCardView, GamePickerView, RatingsView
-from bot.ui.helpers import build_backloggd_game_url, clamp_escaped_text, truncate_button_label
+
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.input_validation import escape_display_text
+from bot.services.freshness import resolve_guild_aggregate_freshness
 from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
-from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
-from bot.services.freshness import resolve_guild_aggregate_freshness
+from bot.ui.embeds import create_game_embed
+from bot.ui.helpers import build_backloggd_game_url, clamp_escaped_text, truncate_button_label
+from bot.ui.views import GameCardView, GamePickerView, RatingsView
 
 logger = logging.getLogger("backloggd.cogs.games")
 
@@ -31,6 +33,7 @@ _SLUG_TAG_PREFIX = "slug:"
 _FALLBACK_TAG_PREFIX = "slugref:"
 _MAX_INLINE_SLUG_LEN = _DISCORD_CHOICE_LIMIT - len(_SLUG_TAG_PREFIX)
 _MAX_AUTOCOMPLETE_CACHE = 500
+_AUTOCOMPLETE_CACHE_TTL_SECONDS = 21600.0  # 6 hours
 _MAX_FALLBACK_SLUGS = 500
 _FALLBACK_TTL_SECONDS = 1800.0
 _DEFAULT_AUTOCOMPLETE_TIMEOUT_SECONDS = 2.0
@@ -100,6 +103,12 @@ class _FallbackEntry:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _AutocompleteCacheEntry:
+    choices: List[app_commands.Choice[str]]
+    created_at: float
+
+
 class GamesCog(commands.Cog, name="Games"):
     def __init__(
         self,
@@ -108,17 +117,21 @@ class GamesCog(commands.Cog, name="Games"):
         clock=None,
         monotonic_clock=None,
         fallback_ttl_seconds: float = _FALLBACK_TTL_SECONDS,
+        autocomplete_cache_ttl_seconds: float = _AUTOCOMPLETE_CACHE_TTL_SECONDS,
         autocomplete_timeout_seconds: float = _DEFAULT_AUTOCOMPLETE_TIMEOUT_SECONDS,
     ):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic_clock or time.monotonic
         self._fallback_ttl_seconds = float(fallback_ttl_seconds)
+        self._autocomplete_cache_ttl_seconds = float(autocomplete_cache_ttl_seconds)
+        if self._autocomplete_cache_ttl_seconds <= 0:
+            raise ValueError("autocomplete_cache_ttl_seconds must be positive")
         self._autocomplete_timeout_seconds = float(autocomplete_timeout_seconds)
         if self._autocomplete_timeout_seconds <= 0:
             raise ValueError("autocomplete_timeout_seconds must be positive")
         # Bounded caches kept independent so query-cache pruning never wipes fallback tokens.
-        self._autocomplete_cache: OrderedDict[str, List[app_commands.Choice[str]]] = OrderedDict()
+        self._autocomplete_cache: OrderedDict[str, _AutocompleteCacheEntry] = OrderedDict()
         self._fallback_entries: OrderedDict[str, _FallbackEntry] = OrderedDict()
 
     def _prune_expired_fallbacks(self, now: float) -> Optional[dict[str, str]]:
@@ -128,6 +141,14 @@ class GamesCog(commands.Cog, name="Games"):
                 self._fallback_entries.pop(token, None)
                 expired_queries[token] = entry.query
         return expired_queries
+
+    def _prune_expired_autocomplete_entries(self, now: float) -> None:
+        for key, entry in list(self._autocomplete_cache.items()):
+            if (
+                isinstance(entry, _AutocompleteCacheEntry)
+                and now - entry.created_at > self._autocomplete_cache_ttl_seconds
+            ):
+                self._autocomplete_cache.pop(key, None)
 
     def _register_fallback_slug(self, slug: str, query: str) -> str:
         now = self._monotonic()
@@ -149,20 +170,28 @@ class GamesCog(commands.Cog, name="Games"):
             return []
 
         cache_key = clean_query.lower()
-        self._prune_expired_fallbacks(self._monotonic())
+        now = self._monotonic()
+        self._prune_expired_fallbacks(now)
         if cache_key in self._autocomplete_cache:
-            cached = self._autocomplete_cache[cache_key]
-            if all(
+            cached_entry = self._autocomplete_cache[cache_key]
+            if isinstance(cached_entry, _AutocompleteCacheEntry):
+                is_expired = now - cached_entry.created_at > self._autocomplete_cache_ttl_seconds
+                cached_choices = cached_entry.choices
+            else:
+                is_expired = False
+                cached_choices = cached_entry
+
+            if not is_expired and all(
                 not choice.value.startswith(_FALLBACK_TAG_PREFIX)
                 or choice.value in self._fallback_entries
-                for choice in cached
+                for choice in cached_choices
             ):
                 if isinstance(self._autocomplete_cache, OrderedDict):
                     self._autocomplete_cache.move_to_end(cache_key)
-                return cached
-            # TTL and capacity eviction can invalidate choices while the query
-            # remains cached. A repeat query must offer resolvable selections.
-            self._autocomplete_cache.pop(cache_key)
+                return cached_choices
+            # Query TTL or fallback eviction can invalidate choices while the query
+            # remains cached. A repeat query must refresh resolvable selections.
+            self._autocomplete_cache.pop(cache_key, None)
 
         try:
             results = await asyncio.wait_for(
@@ -180,12 +209,17 @@ class GamesCog(commands.Cog, name="Games"):
                     value = self._register_fallback_slug(g.slug, clean_query)
                 choices.append(app_commands.Choice(name=name, value=value))
 
+            store_now = self._monotonic()
+            self._prune_expired_autocomplete_entries(store_now)
             while len(self._autocomplete_cache) >= _MAX_AUTOCOMPLETE_CACHE:
                 if isinstance(self._autocomplete_cache, OrderedDict):
                     self._autocomplete_cache.popitem(last=False)
                 else:
                     self._autocomplete_cache.pop(next(iter(self._autocomplete_cache)))
-            self._autocomplete_cache[cache_key] = choices
+            self._autocomplete_cache[cache_key] = _AutocompleteCacheEntry(
+                choices=choices,
+                created_at=store_now,
+            )
             return choices
         except asyncio.CancelledError:
             raise

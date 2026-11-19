@@ -1,8 +1,9 @@
 """Normalize journal milestones and select announcements without collection noise."""
+import hashlib
 from collections import Counter, defaultdict
 from dataclasses import replace
 from datetime import datetime
-import hashlib
+
 from bot.feed_models import GROUPED_RATING_ID_PREFIX, FeedEvent
 
 VISIBLE_ACTIONS = {"playing", "completed", "rated", "reviewed", "replay"}

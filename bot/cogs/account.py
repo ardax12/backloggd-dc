@@ -1,17 +1,28 @@
 """AccountCog: Handles /link, /unlink, and /refresh with background library sync."""
 
+import asyncio
+import logging
+from typing import Optional
+
 import discord
+from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
 from discord import app_commands
 from discord.ext import commands
-import logging
-import asyncio
-from typing import Optional
-from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
-from bot.config import COLOR_PRIMARY, COLOR_PLAYED, COLOR_ERROR
+
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.config import COLOR_ERROR, COLOR_PLAYED, COLOR_PRIMARY
 from bot.input_validation import (
     InvalidUsernameError,
     escape_display_text,
     normalize_backloggd_username,
+)
+from bot.services.cooldowns import (
+    COOLDOWN_SPECS,
+    CooldownCommandName,
+    GuildCooldownService,
+    get_cooldown_spec,
+    guild_cooldown,
+    is_server_moderator,
 )
 from bot.services.guild_membership import get_membership_service
 from bot.services.library_sync import (
@@ -20,50 +31,49 @@ from bot.services.library_sync import (
     seed_profile_sync_state,
     sync_profile_library,
 )
-from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.services.task_lifecycle import TaskDrainGroup
 from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, clean_image_url
-from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.cogs.account")
 
 class AccountCog(commands.Cog, name="Account"):
+    cooldown = app_commands.Group(
+        name="cooldown",
+        description="View or adjust per-command cooldowns for this server",
+        guild_only=True,
+    )
+
     def __init__(self, bot):
         self.bot = bot
         self.library_sync: LibrarySyncService = bot.library_sync
-        self._status_tasks: set[asyncio.Task] = set()
-        self._closing: bool = False
-        self._draining_task: Optional[asyncio.Task] = None
+        self._fallback_cooldowns: Optional[GuildCooldownService] = None
+        self._drain_group = TaskDrainGroup()
+        self._status_tasks: set[asyncio.Task] = self._drain_group.tasks
+
+    @property
+    def _closing(self) -> bool:
+        return self._drain_group.closing
+
+    @_closing.setter
+    def _closing(self, value: bool) -> None:
+        self._drain_group.closing = bool(value)
+
+    def _cooldown_service(self) -> GuildCooldownService:
+        service = getattr(self.bot, "cooldowns", None)
+        if isinstance(service, GuildCooldownService):
+            return service
+        if self._fallback_cooldowns is None:
+            self._fallback_cooldowns = GuildCooldownService(
+                db_provider=lambda: getattr(self.bot, "db", None)
+            )
+        return self._fallback_cooldowns
 
     async def close(self) -> None:
         """Stop and drain account-owned status edits; the bot owns library syncs."""
-        self._closing = True
-        caller_task = asyncio.current_task()
-        draining = self._draining_task
-        if draining is not None and not draining.done():
-            await await_owned_task(draining)
-            return
-
-        async def _drain() -> None:
-            current = asyncio.current_task()
-            while True:
-                pending = [
-                    task for task in list(self._status_tasks)
-                    if not task.done() and task is not current and task is not caller_task
-                ]
-                if not pending:
-                    break
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-            self._status_tasks.clear()
-
-        draining = asyncio.create_task(_drain())
-        self._draining_task = draining
-        try:
-            await await_owned_task(draining)
-        finally:
-            if self._draining_task is draining and draining.done():
-                self._draining_task = None
+        await self._drain_group.close(
+            task_source=lambda: self._status_tasks,
+            clear_tasks=True,
+        )
 
     async def cog_unload(self) -> None:
         """Drain account-owned status-edit tasks when unloaded."""
@@ -374,6 +384,7 @@ class AccountCog(commands.Cog, name="Account"):
 
     @app_commands.command(name="refresh", description="Refresh your Backloggd library and ratings")
     @app_commands.describe(user="Optional: Server member whose linked library to refresh (defaults to you)")
+    @guild_cooldown("refresh")
     async def refresh(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
         await defer_interaction(interaction)
 
@@ -426,6 +437,108 @@ class AccountCog(commands.Cog, name="Account"):
             status_message=status_message,
             manual=True,
         )
+
+    @cooldown.command(name="view", description="View command cooldowns configured for this server")
+    @is_server_moderator()
+    async def cooldown_view(self, interaction: discord.Interaction):
+        if interaction.guild_id is None:
+            await send_private_followup(interaction, "This command can only be used in a server.", log=logger)
+            return
+        await defer_interaction(interaction, ephemeral=True)
+        service = self._cooldown_service()
+        effective = await service.get_all_guild_cooldowns(interaction.guild_id, db=self.bot.db)
+        overrides = await service.get_guild_overrides(interaction.guild_id, db=self.bot.db)
+
+        lines = []
+        for name, spec in COOLDOWN_SPECS.items():
+            current = effective[name]
+            tag = "custom" if name in overrides else "default"
+            lines.append(
+                f"`/{name}`: **{current}s** ({tag} · default {spec.default_seconds}s · "
+                f"range {spec.min_seconds}–{spec.max_seconds}s · {spec.scope_label})"
+            )
+
+        embed = discord.Embed(
+            title="⏱️ Server Command Cooldowns",
+            description="\n".join(lines),
+            color=COLOR_PRIMARY,
+        )
+        embed.set_footer(text="Use /cooldown set <command> <seconds> or /cooldown reset [command].")
+        await send_private_followup(interaction, embed=embed, log=logger)
+
+    @cooldown.command(name="set", description="Set a custom cooldown duration (in seconds) for a command in this server")
+    @app_commands.describe(
+        command="The command whose cooldown you want to change",
+        seconds="Cooldown duration in seconds (within allowed command bounds)",
+    )
+    @is_server_moderator()
+    async def cooldown_set(
+        self,
+        interaction: discord.Interaction,
+        command: CooldownCommandName,
+        seconds: app_commands.Range[int, 5, 3600],
+    ):
+        if interaction.guild_id is None:
+            await send_private_followup(interaction, "This command can only be used in a server.", log=logger)
+            return
+        await defer_interaction(interaction, ephemeral=True)
+        service = self._cooldown_service()
+        try:
+            updated = await service.set_cooldown(
+                interaction.guild_id, command, seconds, db=self.bot.db
+            )
+        except ValueError as err:
+            await send_private_followup(interaction, f"❌ {err}", log=logger)
+            return
+
+        spec = get_cooldown_spec(command)
+        await send_private_followup(
+            interaction,
+            f"✅ Set `/{spec.command_name}` cooldown to **{updated}s** "
+            f"({spec.scope_label}; default: {spec.default_seconds}s) for this server.",
+            log=logger,
+        )
+
+    @cooldown.command(name="reset", description="Reset one or all server command cooldowns back to defaults")
+    @app_commands.describe(command="Optional command to reset (leave empty to reset all commands)")
+    @is_server_moderator()
+    async def cooldown_reset(
+        self,
+        interaction: discord.Interaction,
+        command: Optional[CooldownCommandName] = None,
+    ):
+        if interaction.guild_id is None:
+            await send_private_followup(interaction, "This command can only be used in a server.", log=logger)
+            return
+        await defer_interaction(interaction, ephemeral=True)
+        service = self._cooldown_service()
+        try:
+            removed = await service.reset_cooldown(
+                interaction.guild_id, command, db=self.bot.db
+            )
+        except ValueError as err:
+            await send_private_followup(interaction, f"❌ {err}", log=logger)
+            return
+
+        if command is not None:
+            spec = get_cooldown_spec(command)
+            if removed:
+                msg = (
+                    f"✅ Reset `/{spec.command_name}` cooldown to default "
+                    f"(**{spec.default_seconds}s**, {spec.scope_label})."
+                )
+            else:
+                msg = (
+                    f"ℹ️ `/{spec.command_name}` is already using its default cooldown "
+                    f"(**{spec.default_seconds}s**, {spec.scope_label})."
+                )
+        else:
+            if removed:
+                msg = f"✅ Reset {removed} custom cooldown override(s) in this server back to defaults."
+            else:
+                msg = "ℹ️ All commands in this server are already using their default cooldowns."
+
+        await send_private_followup(interaction, msg, log=logger)
 
 async def setup(bot):
     await bot.add_cog(AccountCog(bot))

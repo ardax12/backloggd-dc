@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, is_dataclass, replace
 import logging
 import time
+from dataclasses import dataclass, is_dataclass, replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
@@ -35,7 +36,6 @@ class _ProfileState:
 
 def parse_sync_timestamp(value) -> Optional[datetime]:
     """Parse a DB SQLite/ISO UTC timestamp into a timezone-aware UTC datetime."""
-    from datetime import datetime, timezone
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -429,7 +429,7 @@ async def _fetch_complete_library(api: Any, username: str):
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
-    collected = dict(zip(names, results))
+    collected = dict(zip(names, results, strict=True))
     playing_entries = collected.get("playing", ())
     if callable(get_playing) and len(playing_entries) >= PLAYING_SINGLE_PAGE_LIMIT:
         raise RuntimeError(

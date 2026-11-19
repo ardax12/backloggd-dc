@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import NamedTuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from bot.feed_models import GROUPED_RATING_ID_PREFIX, FeedEvent
 from bot.feed_policy import parse_utc_datetime

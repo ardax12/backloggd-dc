@@ -221,7 +221,7 @@ async def ensure_profiles_fresh(
             if key in fetched_subscriptions
         }
 
-    for key, (name, _) in deduped.items():
+    for key, (_name, _) in deduped.items():
         status = statuses[key]
         info = sync_map.get(key)
         if status.stale and service is not None:

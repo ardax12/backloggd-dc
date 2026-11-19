@@ -1,26 +1,29 @@
 """StatsCog: Handles /server-top (with 5 specialty leaderboards) and /server-stats commands."""
 
-from datetime import datetime, timezone
 import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import List, Literal, Optional, Sequence
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-import logging
-from typing import List, Literal, Optional, Sequence
-from bot.ui.embeds import create_server_top_embed, create_server_stats_embed
-from bot.ui.views import ServerTopView
-from bot.services.guild_membership import (
-    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-    resolve_guild_member_ids,
-)
+
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.services.cooldowns import guild_cooldown
 from bot.services.freshness import (
     FRESHNESS_WINDOW_SECONDS,
     resolve_guild_aggregate_freshness,
     valid_played_count,
 )
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
+)
 from bot.services.library_sync import parse_sync_timestamp
-from bot.services.task_lifecycle import await_owned_task
+from bot.services.task_lifecycle import TaskDrainGroup
+from bot.ui.embeds import create_server_stats_embed, create_server_top_embed
+from bot.ui.views import ServerTopView
 
 logger = logging.getLogger("backloggd.cogs.stats")
 
@@ -63,39 +66,28 @@ class StatsCog(commands.Cog, name="Stats"):
         self.played_count_freshness_seconds = max(0.0, float(played_count_freshness_seconds))
         self.profile_count_concurrency = max(1, int(profile_count_concurrency))
         self._profile_count_slots = asyncio.Semaphore(self.profile_count_concurrency)
-        self._closing = False
-        self._profile_count_workers: set[asyncio.Task] = set()
+        self._drain_group = TaskDrainGroup()
+        self._profile_count_workers: set[asyncio.Task] = self._drain_group.tasks
         self._active_count_operations: set[asyncio.Task] = set()
-        self._close_task: asyncio.Task | None = None
+
+    @property
+    def _closing(self) -> bool:
+        return self._drain_group.closing
+
+    @_closing.setter
+    def _closing(self, value: bool) -> None:
+        self._drain_group.closing = bool(value)
 
     async def close(self) -> None:
         """Stop count work and wait for all SDK workers to unwind."""
-        self._closing = True
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._drain_count_work())
-        await await_owned_task(self._close_task)
-
-    async def _drain_count_work(self) -> None:
-        current = asyncio.current_task()
-        operations = [
-            task for task in self._active_count_operations
-            if task is not current and not task.done()
-        ]
-        for task in operations:
-            task.cancel()
-        if operations:
-            # Each count operation owns cancellation and gathering of its
-            # workers. Let that cleanup run once before handling any orphan.
-            await asyncio.gather(*operations, return_exceptions=True)
-
-        workers = [
-            task for task in self._profile_count_workers
-            if task is not current and not task.done()
-        ]
-        for task in workers:
-            task.cancel()
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+        # Each count operation owns cancellation and gathering of its workers.
+        # Drain active operations once first before cancelling any orphan workers.
+        await self._drain_group.close(
+            before_drain=lambda caller: TaskDrainGroup.cancel_and_drain(
+                self._active_count_operations, exclude=(caller,), repeat=False
+            ),
+            task_source=lambda: self._profile_count_workers,
+        )
 
     async def cog_unload(self) -> None:
         await self.close()
@@ -258,11 +250,13 @@ class StatsCog(commands.Cog, name="Stats"):
             "logged_profiles_stale": stale_used,
         }
 
-    async def _load_server_top_embed(
+    async def _load_server_top_pages(
         self,
         guild: Optional[discord.Guild],
         mode: str,
-    ) -> tuple[Optional[discord.Embed], Optional[str]]:
+        *,
+        min_ratings: int = 2,
+    ) -> tuple[Optional[list[discord.Embed]], Optional[str]]:
         if not guild:
             return None, "❌ This command must be run inside a Discord server."
 
@@ -270,6 +264,9 @@ class StatsCog(commands.Cog, name="Stats"):
         if spec is None:
             raise ValueError(f"Unsupported leaderboard mode: {mode!r}")
         mode_key, title, _ = spec
+
+        if isinstance(min_ratings, bool) or not isinstance(min_ratings, int) or not (1 <= min_ratings <= 50):
+            raise ValueError("min_ratings must be an integer between 1 and 50")
 
         guild_member_ids = await resolve_guild_member_ids(self.bot, guild)
         if guild_member_ids is None:
@@ -287,39 +284,78 @@ class StatsCog(commands.Cog, name="Stats"):
             require_subscribed=True,
         )
 
+        page_size = 10
+        max_entries = 50
         if mode == "Highest Rated":
-            entries = await self.bot.db.get_server_top_rated_for_profiles(profile_keys, limit=10, min_ratings=2)
+            entries = await self.bot.db.get_server_top_rated_for_profiles(
+                profile_keys, limit=max_entries, min_ratings=min_ratings
+            )
         elif mode == "Most Played":
-            entries = await self.bot.db.get_server_most_played_for_profiles(profile_keys, limit=10)
+            entries = await self.bot.db.get_server_most_played_for_profiles(
+                profile_keys, limit=max_entries
+            )
         elif mode == "Most Polarizing":
-            entries = await self.bot.db.get_server_polarizing_for_profiles(profile_keys, limit=10, min_ratings=2)
+            entries = await self.bot.db.get_server_polarizing_for_profiles(
+                profile_keys, limit=max_entries, min_ratings=min_ratings
+            )
         elif mode == "Hidden Gems":
-            entries = await self.bot.db.get_server_hidden_gems_for_profiles(profile_keys, limit=10)
+            entries = await self.bot.db.get_server_hidden_gems_for_profiles(
+                profile_keys, limit=max_entries
+            )
         elif mode == "Server Backlog Shame List":
-            entries = await self.bot.db.get_server_shame_list_for_profiles(profile_keys, limit=10)
+            entries = await self.bot.db.get_server_shame_list_for_profiles(
+                profile_keys, limit=max_entries
+            )
         else:
             raise ValueError(f"Unsupported leaderboard mode: {mode!r}")
 
-        embed = create_server_top_embed(
-            title=title,
-            entries=entries,
-            mode=mode_key,
-            guild_name=guild_name,
-            freshness_note=freshness_note,
-        )
-        return embed, None
+        total_pages = max(1, (len(entries) + page_size - 1) // page_size)
+        pages = [
+            create_server_top_embed(
+                title=title,
+                entries=entries,
+                mode=mode_key,
+                guild_name=guild_name,
+                freshness_note=freshness_note,
+                page=page_num,
+                per_page=page_size,
+                min_ratings=min_ratings,
+            )
+            for page_num in range(1, total_pages + 1)
+        ]
+        return pages, None
+
+    async def _load_server_top_embed(
+        self,
+        guild: Optional[discord.Guild],
+        mode: str,
+        *,
+        min_ratings: int = 2,
+    ) -> tuple[Optional[discord.Embed], Optional[str]]:
+        pages, error_message = await self._load_server_top_pages(guild, mode, min_ratings=min_ratings)
+        if error_message is not None or not pages:
+            return None, error_message
+        return pages[0], None
 
     @app_commands.command(name="server-top", description="View server game rankings and specialty leaderboards")
-    @app_commands.describe(mode="Choose leaderboard mode (e.g. Highest Rated, Most Polarizing, Shame List)")
+    @app_commands.describe(
+        mode="Choose leaderboard mode (e.g. Highest Rated, Most Polarizing, Shame List)",
+        min_ratings="Optional: Minimum ratings for Highest Rated & Most Polarizing (1-50, default 2)",
+    )
+    @app_commands.guild_only()
+    @guild_cooldown("server-top")
     async def server_top(
         self,
         interaction: discord.Interaction,
-        mode: LeaderboardMode = "Highest Rated"
+        mode: LeaderboardMode = "Highest Rated",
+        min_ratings: app_commands.Range[int, 1, 50] = 2,
     ):
         await defer_interaction(interaction)
 
-        embed, error_message = await self._load_server_top_embed(interaction.guild, mode)
-        if error_message is not None or embed is None:
+        pages, error_message = await self._load_server_top_pages(
+            interaction.guild, mode, min_ratings=min_ratings
+        )
+        if error_message is not None or not pages:
             await send_private_followup(
                 interaction,
                 error_message or "❌ This command must be run inside a Discord server.",
@@ -330,8 +366,10 @@ class StatsCog(commands.Cog, name="Stats"):
         async def on_mode_change(
             select_interaction: discord.Interaction,
             requested_mode: str,
-        ) -> tuple[Optional[discord.Embed], Optional[str]]:
-            return await self._load_server_top_embed(select_interaction.guild, requested_mode)
+        ) -> tuple[Optional[list[discord.Embed]], Optional[str]]:
+            return await self._load_server_top_pages(
+                select_interaction.guild, requested_mode, min_ratings=min_ratings
+            )
 
         author_id = getattr(getattr(interaction, "user", None), "id", None)
         view = ServerTopView(
@@ -339,10 +377,13 @@ class StatsCog(commands.Cog, name="Stats"):
             current_mode=mode,
             modes=_SERVER_TOP_SELECT_MODES,
             on_mode_change=on_mode_change,
+            pages=pages,
         )
-        view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
+        view.message = await send_public_followup(interaction, embed=pages[0], view=view, wait=True)
 
     @app_commands.command(name="server-stats", description="View gaming community statistics for this Discord server")
+    @app_commands.guild_only()
+    @guild_cooldown("server-stats")
     async def server_stats(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
 

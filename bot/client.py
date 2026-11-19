@@ -3,21 +3,24 @@
 import asyncio
 import logging
 import math
-from pathlib import Path
 import socket
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 import aiohttp
 import discord
+from backloggd import BackloggdClient
 from discord import app_commands
 from discord.ext import commands
-from backloggd import BackloggdClient
+
 from bot.command_errors import handle_app_command_error
-from bot.db import Database
 from bot.config import DATABASE_PATH, DEV_GUILD_ID
+from bot.db import Database
+from bot.services.cooldowns import GuildCooldownService
 from bot.services.guild_membership import GuildMembershipService
 from bot.services.library_sync import LibrarySyncService
+from bot.services.session_health import UpstreamSessionHealth
 from bot.services.task_lifecycle import await_owned_task
 
 logger = logging.getLogger("backloggd.bot")
@@ -77,6 +80,8 @@ class BackloggdBot(commands.Bot):
         )
         self.library_sync = LibrarySyncService(max_workers=2)
         self.guild_membership = GuildMembershipService()
+        self.cooldowns = GuildCooldownService(db_provider=lambda: self.db)
+        self.session_health = UpstreamSessionHealth()
         self._close_task: Optional[asyncio.Task] = None
         self._command_sync_task: Optional[asyncio.Task] = None
         self._closing: bool = False

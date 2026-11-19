@@ -1,19 +1,22 @@
 """Embed constructor for automatic activity feed events (Filmlinkd-style)."""
 
-import discord
 from datetime import datetime, timezone
-from bot.feed_rules import calendar_date
 from typing import Any
-from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED, COLOR_WISHLIST
+
+import discord
+
+from bot.config import COLOR_GOLD, COLOR_PLAYED, COLOR_PRIMARY, COLOR_WISHLIST
+from bot.feed_rules import calendar_date
 from bot.input_validation import escape_display_text
 from bot.ui.helpers import (
-    rating_to_stars,
+    DEFAULT_BACKLOGGD_AVATAR,
     build_backloggd_game_url,
     build_backloggd_user_url,
-    clean_image_url,
     clamp_escaped_text,
-    DEFAULT_BACKLOGGD_AVATAR
+    clean_image_url,
+    rating_to_stars,
 )
+
 
 def create_journal_feed_embed(
     username: str,

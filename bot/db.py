@@ -13,21 +13,25 @@ from typing import Any, Iterable, List, Optional
 import aiosqlite
 import libsql_client
 
+from bot import db_stats
 from bot.config import DATABASE_PATH, LIBSQL_AUTH_TOKEN, LIBSQL_DATABASE_URL
-from bot.feed_policy import FEED_DECISION_PRIORITY, group_event_aliases
 from bot.db_adapter import execute_batch_statements, normalize_libsql_row, open_transaction
+from bot.db_stats import (
+    MAX_SQL_BIND_PARAMS as _MAX_SQL_BIND_PARAMS,
+)
+from bot.db_stats import (
+    iter_sql_chunks as _iter_sql_chunks,
+)
+from bot.feed_policy import (
+    DEFAULT_GUILD_FEED_FILTERS,
+    FEED_DECISION_PRIORITY,
+    FEED_FILTER_KEYS,
+    group_event_aliases,
+)
 
 logger = logging.getLogger("backloggd.db")
 
-_MAX_SQL_BIND_PARAMS = 800
 _MAX_SQL_BATCH_BYTES = 56 * 1024
-
-
-def _iter_sql_chunks(items: list[Any], *, fixed_params: int = 0) -> Iterable[list[Any]]:
-    """Yield non-empty slices sized so fixed_params + len(chunk) <= _MAX_SQL_BIND_PARAMS."""
-    chunk_size = max(1, _MAX_SQL_BIND_PARAMS - fixed_params)
-    for start in range(0, len(items), chunk_size):
-        yield items[start:start + chunk_size]
 
 
 def _estimate_row_payload_bytes(row: tuple[Any, ...]) -> int:
@@ -2834,53 +2838,7 @@ class Database:
 
     async def get_guild_stats_context(self, member_ids: List[int]) -> dict[str, Any]:
         """Resolve linked-member count, distinct profiles, and sync metadata in one pass."""
-        members = list(dict.fromkeys(int(value) for value in member_ids))
-        if not members:
-            return {
-                "linked_members": 0,
-                "profile_keys": [],
-                "profiles": [],
-            }
-        linked_discord_ids: set[int] = set()
-        profiles: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(members, fixed_params=2):
-            placeholders = ",".join("?" for _ in chunk)
-            query = f"""
-                SELECT u.discord_id,
-                       p.profile_key, p.display_username, p.avatar_url,
-                       p.last_synced_at, p.last_sync_attempt_at, p.last_sync_error,
-                       p.played_count, p.played_count_observed_at,
-                       pending.fingerprint AS pending_refresh_token
-                FROM linked_users AS u
-                JOIN profiles AS p ON p.profile_key = u.profile_key
-                LEFT JOIN profile_activity_observations AS pending
-                       ON pending.profile_key = p.profile_key
-                      AND pending.source = ?
-                      AND pending.observation_key = ?
-                WHERE u.discord_id IN ({placeholders})
-                ORDER BY p.profile_key, u.discord_id
-            """
-            for row in await self._fetchall(query, [self._LIBRARY_SYNC_SOURCE, self._PENDING_REFRESH_KEY, *chunk]):
-                linked_discord_ids.add(int(row["discord_id"]))
-                key = row["profile_key"]
-                if key not in profiles:
-                    profiles[key] = {
-                        "profile_key": key,
-                        "display_username": row["display_username"],
-                        "avatar_url": row["avatar_url"],
-                        "last_synced_at": row["last_synced_at"],
-                        "last_sync_attempt_at": row["last_sync_attempt_at"],
-                        "last_sync_error": row["last_sync_error"],
-                        "played_count": row["played_count"],
-                        "played_count_observed_at": row["played_count_observed_at"],
-                        "pending_refresh_token": row["pending_refresh_token"],
-                    }
-        sorted_keys = sorted(profiles)
-        return {
-            "linked_members": len(linked_discord_ids),
-            "profile_keys": sorted_keys,
-            "profiles": [profiles[key] for key in sorted_keys],
-        }
+        return await db_stats.get_guild_stats_context(self, member_ids)
 
     async def _get_guild_linked_profile_keys(self, guild_member_ids: List[int]) -> List[str]:
         if not guild_member_ids:
@@ -2892,48 +2850,9 @@ class Database:
         self, profile_keys: List[str], limit: int = 10, min_ratings: int = 2
     ) -> List[dict[str, Any]]:
         """Query distinct canonical profile keys; return plain result dictionaries."""
-        if not profile_keys or limit <= 0:
-            return []
-        aggregates: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(profile_keys):
-            placeholders = ",".join("?" for _ in chunk)
-            query = f"""
-                SELECT g.slug, g.title, g.cover_url, g.release_year,
-                       SUM(r.rating) AS rating_sum,
-                       COUNT(r.rating) AS rating_count
-                FROM profile_ratings r
-                JOIN cached_games g ON r.game_slug = g.slug
-                WHERE r.profile_key IN ({placeholders}) AND r.rating IS NOT NULL
-                GROUP BY g.slug;
-            """
-            for row in await self._fetchall(query, chunk):
-                entry = aggregates.setdefault(
-                    row["slug"],
-                    {
-                        "slug": row["slug"],
-                        "title": row["title"],
-                        "cover_url": row["cover_url"],
-                        "release_year": row["release_year"],
-                        "rating_sum": 0.0,
-                        "rating_count": 0,
-                    },
-                )
-                entry["rating_sum"] += float(row["rating_sum"] or 0.0)
-                entry["rating_count"] += int(row["rating_count"] or 0)
-        results = []
-        for entry in aggregates.values():
-            count = entry["rating_count"]
-            if count >= min_ratings and count > 0:
-                results.append({
-                    "slug": entry["slug"],
-                    "title": entry["title"],
-                    "cover_url": entry["cover_url"],
-                    "release_year": entry["release_year"],
-                    "avg_rating": entry["rating_sum"] / count,
-                    "rating_count": count,
-                })
-        results.sort(key=lambda row: (-row["avg_rating"], -row["rating_count"], row["slug"]))
-        return results[:limit]
+        return await db_stats.get_server_top_rated_for_profiles(
+            self, profile_keys, limit=limit, min_ratings=min_ratings
+        )
 
     async def get_server_top_rated(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[dict[str, Any]]:
         """Get top games by average rating among distinct linked profiles."""
@@ -2946,58 +2865,7 @@ class Database:
         self, profile_keys: List[str], limit: int = 10
     ) -> List[dict[str, Any]]:
         """Query distinct canonical profile keys; return plain result dictionaries."""
-        if not profile_keys or limit <= 0:
-            return []
-        aggregates: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(profile_keys):
-            placeholders = ",".join("?" for _ in chunk)
-            query = f"""
-                SELECT g.slug, g.title, g.cover_url, g.release_year,
-                       COUNT(r.profile_key) AS play_count,
-                       SUM(r.rating) AS rating_sum,
-                       COUNT(r.rating) AS rating_count
-                FROM profile_ratings r
-                JOIN cached_games g ON r.game_slug = g.slug
-                WHERE r.profile_key IN ({placeholders}) AND r.status = 'played'
-                GROUP BY g.slug;
-            """
-            for row in await self._fetchall(query, chunk):
-                entry = aggregates.setdefault(
-                    row["slug"],
-                    {
-                        "slug": row["slug"],
-                        "title": row["title"],
-                        "cover_url": row["cover_url"],
-                        "release_year": row["release_year"],
-                        "play_count": 0,
-                        "rating_sum": 0.0,
-                        "rating_count": 0,
-                    },
-                )
-                entry["play_count"] += int(row["play_count"] or 0)
-                if row["rating_sum"] is not None:
-                    entry["rating_sum"] += float(row["rating_sum"])
-                entry["rating_count"] += int(row["rating_count"] or 0)
-        results = []
-        for entry in aggregates.values():
-            rating_count = entry["rating_count"]
-            results.append({
-                "slug": entry["slug"],
-                "title": entry["title"],
-                "cover_url": entry["cover_url"],
-                "release_year": entry["release_year"],
-                "play_count": entry["play_count"],
-                "avg_rating": (entry["rating_sum"] / rating_count) if rating_count > 0 else None,
-            })
-        results.sort(
-            key=lambda row: (
-                -row["play_count"],
-                row["avg_rating"] is None,
-                -(row["avg_rating"] if row["avg_rating"] is not None else 0.0),
-                row["slug"],
-            )
-        )
-        return results[:limit]
+        return await db_stats.get_server_most_played_for_profiles(self, profile_keys, limit=limit)
 
     async def get_server_most_played(self, guild_member_ids: List[int], limit: int = 10) -> List[dict[str, Any]]:
         """Get most completed games by distinct linked profiles."""
@@ -3010,34 +2878,7 @@ class Database:
         self, profile_keys: List[str], limit: int = 10
     ) -> List[dict[str, Any]]:
         """Query distinct canonical profile keys; return plain result dictionaries."""
-        if not profile_keys or limit <= 0:
-            return []
-        aggregates: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(profile_keys):
-            placeholders = ",".join("?" for _ in chunk)
-            query = f"""
-                SELECT g.slug, g.title, g.cover_url, g.release_year,
-                       COUNT(r.profile_key) AS backlog_count
-                FROM profile_ratings r
-                JOIN cached_games g ON r.game_slug = g.slug
-                WHERE r.profile_key IN ({placeholders}) AND r.status = 'backlog'
-                GROUP BY g.slug;
-            """
-            for row in await self._fetchall(query, chunk):
-                entry = aggregates.setdefault(
-                    row["slug"],
-                    {
-                        "slug": row["slug"],
-                        "title": row["title"],
-                        "cover_url": row["cover_url"],
-                        "release_year": row["release_year"],
-                        "backlog_count": 0,
-                    },
-                )
-                entry["backlog_count"] += int(row["backlog_count"] or 0)
-        results = list(aggregates.values())
-        results.sort(key=lambda row: (-row["backlog_count"], row["slug"]))
-        return results[:limit]
+        return await db_stats.get_server_shame_list_for_profiles(self, profile_keys, limit=limit)
 
     async def get_server_shame_list(self, guild_member_ids: List[int], limit: int = 10) -> List[dict[str, Any]]:
         """Get games most frequently sitting unplayed in linked profiles' backlogs."""
@@ -3050,60 +2891,9 @@ class Database:
         self, profile_keys: List[str], limit: int = 10, min_ratings: int = 2
     ) -> List[dict[str, Any]]:
         """Query distinct canonical profile keys; return plain result dictionaries."""
-        if not profile_keys or limit <= 0:
-            return []
-        aggregates: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(profile_keys):
-            placeholders = ",".join("?" for _ in chunk)
-            query = f"""
-                SELECT g.slug, g.title, g.cover_url, g.release_year,
-                       MAX(r.rating) AS max_rating,
-                       MIN(r.rating) AS min_rating,
-                       SUM(r.rating) AS rating_sum,
-                       COUNT(r.rating) AS rating_count
-                FROM profile_ratings r
-                JOIN cached_games g ON r.game_slug = g.slug
-                WHERE r.profile_key IN ({placeholders}) AND r.rating IS NOT NULL
-                GROUP BY g.slug;
-            """
-            for row in await self._fetchall(query, chunk):
-                row_max = float(row["max_rating"])
-                row_min = float(row["min_rating"])
-                entry = aggregates.get(row["slug"])
-                if entry is None:
-                    aggregates[row["slug"]] = {
-                        "slug": row["slug"],
-                        "title": row["title"],
-                        "cover_url": row["cover_url"],
-                        "release_year": row["release_year"],
-                        "max_rating": row_max,
-                        "min_rating": row_min,
-                        "rating_sum": float(row["rating_sum"] or 0.0),
-                        "rating_count": int(row["rating_count"] or 0),
-                    }
-                else:
-                    if row_max > entry["max_rating"]:
-                        entry["max_rating"] = row_max
-                    if row_min < entry["min_rating"]:
-                        entry["min_rating"] = row_min
-                    entry["rating_sum"] += float(row["rating_sum"] or 0.0)
-                    entry["rating_count"] += int(row["rating_count"] or 0)
-        results = []
-        for entry in aggregates.values():
-            count = entry["rating_count"]
-            delta = entry["max_rating"] - entry["min_rating"]
-            if count >= min_ratings and delta > 0:
-                results.append({
-                    "slug": entry["slug"],
-                    "title": entry["title"],
-                    "cover_url": entry["cover_url"],
-                    "release_year": entry["release_year"],
-                    "rating_delta": delta,
-                    "avg_rating": entry["rating_sum"] / count,
-                    "rating_count": count,
-                })
-        results.sort(key=lambda row: (-row["rating_delta"], -row["rating_count"], row["slug"]))
-        return results[:limit]
+        return await db_stats.get_server_polarizing_for_profiles(
+            self, profile_keys, limit=limit, min_ratings=min_ratings
+        )
 
     async def get_server_polarizing(self, guild_member_ids: List[int], limit: int = 10, min_ratings: int = 2) -> List[dict[str, Any]]:
         """Get games with the highest rating disparity (max - min) among distinct linked profiles."""
@@ -3116,50 +2906,7 @@ class Database:
         self, profile_keys: List[str], limit: int = 10
     ) -> List[dict[str, Any]]:
         """Query distinct canonical profile keys; return plain result dictionaries."""
-        if not profile_keys or limit <= 0:
-            return []
-        aggregates: dict[str, dict[str, Any]] = {}
-        for chunk in _iter_sql_chunks(profile_keys):
-            placeholders = ",".join("?" for _ in chunk)
-            query = f"""
-                SELECT g.slug, g.title, g.cover_url, g.release_year,
-                       SUM(r.rating) AS rating_sum,
-                       COUNT(r.rating) AS rating_count
-                FROM profile_ratings r
-                JOIN cached_games g ON r.game_slug = g.slug
-                WHERE r.profile_key IN ({placeholders}) AND r.rating IS NOT NULL
-                GROUP BY g.slug;
-            """
-            for row in await self._fetchall(query, chunk):
-                entry = aggregates.setdefault(
-                    row["slug"],
-                    {
-                        "slug": row["slug"],
-                        "title": row["title"],
-                        "cover_url": row["cover_url"],
-                        "release_year": row["release_year"],
-                        "rating_sum": 0.0,
-                        "rating_count": 0,
-                    },
-                )
-                entry["rating_sum"] += float(row["rating_sum"] or 0.0)
-                entry["rating_count"] += int(row["rating_count"] or 0)
-        results = []
-        for entry in aggregates.values():
-            count = entry["rating_count"]
-            if 0 < count <= 2:
-                avg_rating = entry["rating_sum"] / count
-                if avg_rating >= 4.5:
-                    results.append({
-                        "slug": entry["slug"],
-                        "title": entry["title"],
-                        "cover_url": entry["cover_url"],
-                        "release_year": entry["release_year"],
-                        "avg_rating": avg_rating,
-                        "rating_count": count,
-                    })
-        results.sort(key=lambda row: (-row["avg_rating"], row["rating_count"], row["slug"]))
-        return results[:limit]
+        return await db_stats.get_server_hidden_gems_for_profiles(self, profile_keys, limit=limit)
 
     async def get_server_hidden_gems(self, guild_member_ids: List[int], limit: int = 10) -> List[dict[str, Any]]:
         """Get high-scoring games (>= 4.5) rated by only 1 or 2 distinct linked profiles."""
@@ -3176,85 +2923,12 @@ class Database:
         include_library_row_counts: bool = True,
     ) -> dict:
         """Query distinct canonical profile keys; return plain result dictionaries."""
-        profile_count = len(profile_keys)
-        if not profile_keys:
-            result = {
-                "linked_members": linked_members,
-                "profile_count": 0,
-                "server_avg_rating": None,
-                "top_game": None,
-            }
-            if include_library_row_counts:
-                result["total_logged"] = 0
-                result["total_played"] = 0
-            return result
-
-        total_logged = 0
-        total_played = 0
-        rating_sum = 0.0
-        rating_count = 0
-        played_counts: dict[str, dict[str, Any]] = {}
-
-        for chunk in _iter_sql_chunks(profile_keys):
-            placeholders = ",".join("?" for _ in chunk)
-            if include_library_row_counts:
-                summary_sql = f"""
-                SELECT COUNT(*) AS total_logged,
-                       SUM(CASE WHEN status = 'played' THEN 1 ELSE 0 END) AS total_played,
-                       SUM(rating) AS rating_sum,
-                       COUNT(rating) AS rating_count
-                FROM profile_ratings
-                WHERE profile_key IN ({placeholders});
-                """
-            else:
-                summary_sql = f"""
-                SELECT SUM(rating) AS rating_sum,
-                       COUNT(rating) AS rating_count
-                FROM profile_ratings
-                WHERE profile_key IN ({placeholders});
-                """
-            row = await self._fetchone(summary_sql, chunk)
-            if row:
-                if include_library_row_counts:
-                    total_logged += int(row["total_logged"] or 0)
-                    total_played += int(row["total_played"] or 0)
-                if row["rating_sum"] is not None:
-                    rating_sum += float(row["rating_sum"])
-                rating_count += int(row["rating_count"] or 0)
-
-            top_rows = await self._fetchall(
-                f"""
-                SELECT g.slug, g.title, COUNT(r.profile_key) AS count
-                FROM profile_ratings r
-                JOIN cached_games g ON r.game_slug = g.slug
-                WHERE r.profile_key IN ({placeholders}) AND r.status = 'played'
-                GROUP BY g.slug;
-                """,
-                chunk,
-            )
-            for top_row in top_rows:
-                entry = played_counts.setdefault(
-                    top_row["slug"],
-                    {"slug": top_row["slug"], "title": top_row["title"], "count": 0},
-                )
-                entry["count"] += int(top_row["count"] or 0)
-
-        avg_rating = round(rating_sum / rating_count, 2) if rating_count > 0 else None
-        top_game = None
-        if played_counts:
-            best = min(played_counts.values(), key=lambda item: (-item["count"], item["slug"]))
-            top_game = f"{best['title']} ({best['count']} profile{'s' if best['count'] != 1 else ''})"
-
-        result = {
-            "linked_members": linked_members,
-            "profile_count": profile_count,
-            "server_avg_rating": avg_rating,
-            "top_game": top_game,
-        }
-        if include_library_row_counts:
-            result["total_logged"] = total_logged
-            result["total_played"] = total_played
-        return result
+        return await db_stats.get_server_stats_for_profiles(
+            self,
+            profile_keys,
+            linked_members=linked_members,
+            include_library_row_counts=include_library_row_counts,
+        )
 
     async def get_server_stats(self, guild_member_ids: List[int]) -> dict:
         """Compute aggregate community metrics for a server."""
@@ -3338,6 +3012,152 @@ class Database:
     async def get_all_guild_settings(self) -> List[Any]:
         """Retrieve all guilds with a configured feed channel."""
         return await self._fetchall("SELECT guild_id, feed_channel_id FROM guild_settings;")
+
+    async def get_guild_command_cooldowns(self, guild_id: int) -> dict[str, int]:
+        """Return persisted per-command cooldown overrides (in seconds) for a guild."""
+        rows = await self._fetchall(
+            """SELECT command_name, cooldown_seconds
+               FROM guild_command_cooldowns
+               WHERE guild_id = ?;""",
+            (guild_id,),
+        )
+        return {
+            str(row["command_name"]): int(row["cooldown_seconds"])
+            for row in rows
+        }
+
+    async def set_guild_command_cooldown(
+        self, guild_id: int, command_name: str, seconds: int
+    ) -> None:
+        """Persist or update a per-guild cooldown override in seconds."""
+        normalized_name = str(command_name).strip().lstrip("/").lower()
+        if not normalized_name:
+            raise ValueError("command_name must be a non-empty string")
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 1:
+            raise ValueError("seconds must be a positive integer")
+        await self._execute(
+            """INSERT INTO guild_command_cooldowns
+                   (guild_id, command_name, cooldown_seconds, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(guild_id, command_name) DO UPDATE SET
+                   cooldown_seconds = excluded.cooldown_seconds,
+                   updated_at = CURRENT_TIMESTAMP;""",
+            (guild_id, normalized_name, seconds),
+        )
+
+    async def reset_guild_command_cooldown(
+        self, guild_id: int, command_name: Optional[str] = None
+    ) -> int:
+        """Delete one or all cooldown overrides for a guild, returning deleted row count."""
+        if command_name is None:
+            return await self._rowcount_execute(
+                "DELETE FROM guild_command_cooldowns WHERE guild_id = ?;",
+                (guild_id,),
+            )
+        normalized_name = str(command_name).strip().lstrip("/").lower()
+        if not normalized_name:
+            raise ValueError("command_name must be a non-empty string")
+        return await self._rowcount_execute(
+            "DELETE FROM guild_command_cooldowns WHERE guild_id = ? AND command_name = ?;",
+            (guild_id, normalized_name),
+        )
+
+    async def get_guild_feed_filters(self, guild_id: int) -> dict[str, bool]:
+        """Return per-guild activity feed category filters (all enabled when unset)."""
+        row = await self._fetchone(
+            """SELECT allow_started, allow_finished, allow_replays, allow_ratings, allow_reviews
+               FROM guild_feed_filters
+               WHERE guild_id = ?;""",
+            (guild_id,),
+        )
+        if not row:
+            return dict(DEFAULT_GUILD_FEED_FILTERS)
+        return {key: bool(row[key]) for key in FEED_FILTER_KEYS}
+
+    async def get_all_guild_feed_filters(
+        self, guild_ids: Iterable[int]
+    ) -> dict[int, dict[str, bool]]:
+        """Bulk fetch feed category filters for multiple guilds within SQL bind budgets."""
+        unique_ids = list(dict.fromkeys(int(gid) for gid in guild_ids))
+        result: dict[int, dict[str, bool]] = {
+            gid: dict(DEFAULT_GUILD_FEED_FILTERS) for gid in unique_ids
+        }
+        if not unique_ids:
+            return result
+        for chunk in _iter_sql_chunks(unique_ids, fixed_params=0):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self._fetchall(
+                f"""SELECT guild_id, allow_started, allow_finished, allow_replays,
+                           allow_ratings, allow_reviews
+                    FROM guild_feed_filters
+                    WHERE guild_id IN ({placeholders});""",
+                chunk,
+            )
+            for row in rows:
+                result[int(row["guild_id"])] = {
+                    key: bool(row[key]) for key in FEED_FILTER_KEYS
+                }
+        return result
+
+    async def set_guild_feed_filters(
+        self,
+        guild_id: int,
+        *,
+        allow_started: Optional[bool] = None,
+        allow_finished: Optional[bool] = None,
+        allow_replays: Optional[bool] = None,
+        allow_ratings: Optional[bool] = None,
+        allow_reviews: Optional[bool] = None,
+    ) -> dict[str, bool]:
+        """Atomically update one or more per-guild feed category filters and return the active set."""
+        overrides = {
+            "allow_started": allow_started,
+            "allow_finished": allow_finished,
+            "allow_replays": allow_replays,
+            "allow_ratings": allow_ratings,
+            "allow_reviews": allow_reviews,
+        }
+        for key, value in overrides.items():
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{key} must be a boolean or None")
+
+        async with self._transaction() as tx:
+            existing = await tx.fetchone(
+                """SELECT allow_started, allow_finished, allow_replays, allow_ratings, allow_reviews
+                   FROM guild_feed_filters
+                   WHERE guild_id = ?;""",
+                (guild_id,),
+            )
+            merged = (
+                {key: bool(existing[key]) for key in FEED_FILTER_KEYS}
+                if existing
+                else dict(DEFAULT_GUILD_FEED_FILTERS)
+            )
+            for key, value in overrides.items():
+                if value is not None:
+                    merged[key] = value
+            await tx.execute(
+                """INSERT INTO guild_feed_filters
+                       (guild_id, allow_started, allow_finished, allow_replays,
+                        allow_ratings, allow_reviews, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(guild_id) DO UPDATE SET
+                       allow_started = excluded.allow_started,
+                       allow_finished = excluded.allow_finished,
+                       allow_replays = excluded.allow_replays,
+                       allow_ratings = excluded.allow_ratings,
+                       allow_reviews = excluded.allow_reviews,
+                       updated_at = CURRENT_TIMESTAMP;""",
+                (
+                    guild_id,
+                    int(merged["allow_started"]),
+                    int(merged["allow_finished"]),
+                    int(merged["allow_replays"]),
+                    int(merged["allow_ratings"]),
+                    int(merged["allow_reviews"]),
+                ),
+            )
+        return merged
 
     async def is_journal_entry_delivered(
         self, guild_id: int, profile_key: str, entry_id: str

@@ -1,10 +1,21 @@
 """Conservative first-discovery policy for activity feed announcements."""
 
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timezone
-from collections.abc import Iterable
-
 
 SESSION_ACTIONS = {"playing", "completed", "replay"}
+
+FEED_FILTER_KEYS = (
+    "allow_started",
+    "allow_finished",
+    "allow_replays",
+    "allow_ratings",
+    "allow_reviews",
+)
+
+DEFAULT_GUILD_FEED_FILTERS: dict[str, bool] = {
+    key: True for key in FEED_FILTER_KEYS
+}
 
 FEED_DECISION_PRIORITY = {
     "suppressed_pre_activation": 0,
@@ -12,9 +23,43 @@ FEED_DECISION_PRIORITY = {
     "held_ambiguous": 2,
     "held_future": 3,
     "held_uncertain": 4,
-    "baseline": 5,
-    "eligible": 6,
+    "filtered": 5,
+    "baseline": 6,
+    "eligible": 7,
 }
+
+
+def feed_event_allowed_by_filters(event, filters: Mapping[str, bool] | None) -> bool:
+    """Return True if at least one constituent category of the event is enabled.
+
+    Missing filter dictionaries or keys default to enabled (True). Combined
+    events (e.g. a Finished milestone with a written review or rating) are
+    allowed when any of their constituent announcement types is enabled.
+    """
+    if filters is None:
+        return True
+
+    action = str(getattr(event, "action_type", "") or "").strip().lower()
+    labels = tuple(getattr(event, "session_labels", ()) or ())
+    is_replay = bool(getattr(event, "is_replay", False))
+    has_rating = getattr(event, "rating", None) is not None
+    has_review = bool(str(getattr(event, "review_notes", "") or "").strip())
+
+    categories: list[str] = []
+    if action == "playing" or "Started" in labels:
+        categories.append("allow_started")
+    if action == "completed" or "Finished" in labels:
+        categories.append("allow_finished")
+    if action == "replay" or is_replay:
+        categories.append("allow_replays")
+    if action == "rated" or has_rating:
+        categories.append("allow_ratings")
+    if action == "reviewed" or has_review:
+        categories.append("allow_reviews")
+
+    if not categories:
+        return True
+    return any(bool(filters.get(key, True)) for key in categories)
 
 
 def group_event_aliases(alias_groups: Iterable[Iterable[str]]) -> list[list[str]]:

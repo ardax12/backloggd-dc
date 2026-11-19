@@ -1,34 +1,32 @@
 """DiscoveryCog: Handles profile-based recommendations and an unplayed-game roulette."""
 
 import asyncio
-from datetime import datetime, timezone
-import discord
-from discord import app_commands
-from discord.ext import commands
 import logging
 import random
+from datetime import datetime, timezone
 from typing import Literal, Optional
+
+import discord
 from backloggd.analytics import calculate_similarity_raw
-from bot.ui.embeds import append_freshness_note, create_roulette_embed
-from bot.ui.views import RouletteView, LinkButtonView
-from bot.ui.helpers import (
-    build_backloggd_game_url,
-    build_backloggd_user_url,
-    clamp_escaped_text,
-    rating_to_stars,
-)
-from bot.config import COLOR_PRIMARY, COLOR_GOLD, COLOR_PLAYED
+from discord import app_commands
+from discord.ext import commands
+
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.config import COLOR_PLAYED
 from bot.input_validation import escape_display_text
 from bot.recommendation_rules import (
+    compute_taste_compatibility,
+    eligible_pool_slugs,
     excluded_recommendation_slugs,
     has_uncertain_library_exclusion,
     numeric_ratings,
+    qualifying_high_rated_games,
+    rank_taste_matches,
+    resolve_display_title,
+    select_diverse_recommendations,
+    select_friend_recommendations,
 )
-from bot.services.guild_membership import (
-    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-    resolve_guild_member_ids,
-)
-from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.services.cooldowns import guild_cooldown
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -36,15 +34,39 @@ from bot.services.freshness import (
     format_profile_freshness_line,
     summarize_aggregate_freshness,
 )
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
+)
+from bot.ui.embeds import append_freshness_note, create_roulette_embed
+from bot.ui.helpers import (
+    build_backloggd_game_url,
+    build_backloggd_user_url,
+    clamp_escaped_text,
+    rating_to_stars,
+)
+from bot.ui.views import RouletteView
 
 logger = logging.getLogger("backloggd.cogs.discovery")
 
 RoulettePool = Literal["Both", "Backlog", "Wishlist"]
+RecommendPool = Literal["Any Unplayed", "Backlog", "Wishlist", "Backlog & Wishlist"]
 
 _ROULETTE_POOLS: dict[str, tuple[str, str, str]] = {
     "both": ("both", "Both", "`Backlog` or `Wishlist`"),
     "backlog": ("backlog", "Backlog", "`Backlog`"),
     "wishlist": ("wishlist", "Wishlist", "`Wishlist`"),
+}
+
+_RECOMMEND_POOLS: dict[str, tuple[Optional[frozenset[str]], str, str]] = {
+    "any unplayed": (None, "Any Unplayed", ""),
+    "backlog": (frozenset({"backlog"}), "Backlog", "`Backlog`"),
+    "wishlist": (frozenset({"wishlist"}), "Wishlist", "`Wishlist`"),
+    "backlog & wishlist": (
+        frozenset({"backlog", "wishlist"}),
+        "Backlog & Wishlist",
+        "`Backlog` or `Wishlist`",
+    ),
 }
 
 
@@ -127,7 +149,19 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         remaining = len(backlog_games)
         freshness_note = format_profile_freshness_line(status)
         reroll_lock = asyncio.Lock()
-        active_state = {"view": None, "generation": 0}
+        seen_slugs = {chosen_game["slug"]}
+        active_state = {"view": None, "generation": 0, "last_slug": chosen_game["slug"]}
+
+        def _pick_next_game() -> tuple[dict, bool]:
+            if len(backlog_games) <= 1:
+                return random.choice(backlog_games), False
+            unseen = [g for g in backlog_games if g["slug"] not in seen_slugs]
+            if unseen:
+                return random.choice(unseen), False
+            candidates = [g for g in backlog_games if g["slug"] != active_state["last_slug"]]
+            if not candidates:
+                candidates = backlog_games
+            return random.choice(candidates), True
 
         def _build_roulette_view(choice, *, generation: int) -> RouletteView:
             built_view = None
@@ -138,7 +172,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 async with reroll_lock:
                     if built_view is not active_state["view"] or generation != active_state["generation"]:
                         return
-                    new_choice = random.choice(backlog_games)
+                    new_choice, reset_cycle = _pick_next_game()
                     next_generation = generation + 1
                     new_embed = create_roulette_embed(
                         username,
@@ -161,6 +195,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                     except BaseException:
                         new_view.retire()
                         raise
+                    if reset_cycle:
+                        seen_slugs.clear()
+                    seen_slugs.add(new_choice["slug"])
+                    active_state["last_slug"] = new_choice["slug"]
                     new_view.message = edited_message or parent_message
                     active_state["view"] = new_view
                     active_state["generation"] = next_generation
@@ -194,9 +232,22 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         description="Get taste-matched recommendations or recommend your top games to a friend"
     )
     @app_commands.describe(
-        user="Optional server member to recommend your games to (defaults to recommendations for you)"
+        user="Optional server member to recommend your games to (defaults to recommendations for you)",
+        pool="Optional: Filter to Backlog, Wishlist, or Backlog & Wishlist (defaults to Any Unplayed)",
     )
-    async def recommend(self, interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    @app_commands.guild_only()
+    @guild_cooldown("recommend")
+    async def recommend(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        pool: RecommendPool = "Any Unplayed",
+    ):
+        pool_spec = _RECOMMEND_POOLS.get(pool.strip().lower()) if isinstance(pool, str) else None
+        if pool_spec is None:
+            raise ValueError(f"Unsupported recommendation pool: {pool!r}")
+        allowed_pool_statuses, pool_label, pool_empty_label = pool_spec
+
         await defer_interaction(interaction)
 
         if not interaction.guild:
@@ -227,6 +278,18 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                 await send_private_followup(
                     interaction,
                     "ℹ️ Both Discord members link to the same Backloggd profile, so there is no separate profile to recommend to.",
+                    log=logger,
+                )
+                return
+
+            if allowed_pool_statuses is not None and not friend_link:
+                safe_member_name = escape_display_text(user.display_name)
+                await send_private_followup(
+                    interaction,
+                    clamp_escaped_text(
+                        f"❌ Filtering recommendations to **{safe_member_name}**'s {pool_empty_label} requires them to link their Backloggd account with `/link` first.",
+                        2000,
+                    ),
                     log=logger,
                 )
                 return
@@ -262,6 +325,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
             safe_friend = escape_display_text(friend_username)
             friend_key = self._linked_profile_key(friend_link) if friend_link else None
+            friend_status = statuses.get(friend_key) if friend_key else None
             friend_ratings = (
                 await self.bot.db.get_profile_ratings_dict(friend_key) if friend_link else {}
             )
@@ -276,31 +340,56 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
 
             # Optional compatibility score if friend is linked and has ratings
-            taste_pct = None
-            caller_numeric = numeric_ratings(caller_ratings)
-            friend_numeric = numeric_ratings(friend_ratings)
-            if len(caller_numeric) >= 5 and len(friend_numeric) >= 5:
-                sim_score, _, _ = calculate_similarity_raw(caller_numeric, friend_numeric)
-                taste_pct = int(round(sim_score))
+            taste_pct = compute_taste_compatibility(
+                caller_ratings, friend_ratings, similarity_fn=calculate_similarity_raw
+            )
 
             # Pick caller's top-rated games (rated >= 4.0) not played, started, unknown, or rated by friend
-            qualifying_games = [
-                (slug, rating)
-                for slug, rating in caller_ratings.items()
-                if rating is not None and rating >= 4.0
-            ]
-            eligible_games = [
-                (slug, rating)
-                for slug, rating in qualifying_games
-                if slug not in friend_excluded_slugs
-            ]
-            eligible_games.sort(key=lambda x: x[1], reverse=True)
+            qualifying_games = qualifying_high_rated_games(caller_ratings)
+            if not qualifying_games:
+                await send_private_followup(
+                    interaction,
+                    "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
+                    log=logger,
+                )
+                return
 
-            if not eligible_games:
-                if not qualifying_games:
+            friend_pool_slugs: Optional[set[str]] = None
+            if allowed_pool_statuses is not None:
+                if not friend_entries and friend_status is not None and friend_status.missing:
                     await send_private_followup(
                         interaction,
-                        "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
+                        format_fetching_library_message(friend_username, friend_status),
+                        log=logger,
+                    )
+                    return
+                friend_pool_slugs = eligible_pool_slugs(friend_entries, allowed_pool_statuses)
+                if not friend_pool_slugs:
+                    await send_private_followup(
+                        interaction,
+                        clamp_escaped_text(
+                            f"ℹ️ **{safe_friend}** has no unrated games in {pool_empty_label} in the local cache. Try `/refresh` to sync their library.",
+                            2000,
+                        ),
+                        log=logger,
+                    )
+                    return
+
+            top_picks = select_friend_recommendations(
+                qualifying_games,
+                excluded_slugs=friend_excluded_slugs,
+                pool_slugs=friend_pool_slugs,
+                limit=5,
+            )
+
+            if not top_picks:
+                if allowed_pool_statuses is not None:
+                    await send_private_followup(
+                        interaction,
+                        clamp_escaped_text(
+                            f"ℹ️ None of your 4.0+ rated games are currently unrated in **{safe_friend}**'s {pool_empty_label}.",
+                            2000,
+                        ),
                         log=logger,
                     )
                 elif friend_link:
@@ -333,13 +422,18 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
                     )
                 return
 
-            top_picks = eligible_games[:5]
             cand_slugs = [slug for slug, _ in top_picks]
             cached_meta = await self.bot.db.get_games_by_slugs(cand_slugs) if cand_slugs else {}
 
             comp_str = f" • `{taste_pct}%` taste compatibility" if taste_pct is not None else ""
             caller_url = build_backloggd_user_url(caller_username)
-            desc = f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library{comp_str}:"
+            if allowed_pool_statuses is not None:
+                desc = (
+                    f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library "
+                    f"matching **{safe_friend}**'s {pool_label}{comp_str}:"
+                )
+            else:
+                desc = f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library{comp_str}:"
             if not friend_link:
                 safe_member_name = escape_display_text(user.display_name)
                 desc += f"\n*(Note: {safe_member_name} hasn't linked Backloggd yet, showing your all-time highest ratings)*"
@@ -351,8 +445,7 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
 
             for slug, rating in top_picks:
-                meta = cached_meta.get(slug)
-                title = meta["title"] if meta and meta["title"] else slug.replace("-", " ").title()
+                title = resolve_display_title(slug, cached_meta)
                 url = build_backloggd_game_url(slug)
                 stars = rating_to_stars(rating)
                 embed.add_field(
@@ -429,6 +522,23 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
             return
 
+        get_entries = getattr(self.bot.db, "get_profile_library_entries", None)
+        my_entries = None
+        my_pool_slugs: Optional[set[str]] = None
+        if allowed_pool_statuses is not None:
+            my_entries = await get_entries(caller_key) if get_entries is not None else None
+            my_pool_slugs = eligible_pool_slugs(my_entries, allowed_pool_statuses)
+            if not my_pool_slugs:
+                await send_private_followup(
+                    interaction,
+                    clamp_escaped_text(
+                        f"ℹ️ **{safe_caller}** has no unrated games in {pool_empty_label} in the local cache. Try `/refresh` to sync your library.",
+                        2000,
+                    ),
+                    log=logger,
+                )
+                return
+
         guild_member_ids = await resolve_guild_member_ids(
             self.bot, interaction.guild, exclude_member_id=caller_discord_id
         )
@@ -459,24 +569,12 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         other_profile_keys = [other["profile_key"] for other in other_linked]
         all_other_ratings = await self.bot.db.get_multi_profile_ratings_dict(other_profile_keys)
 
-        taste_matches = []
-        enough_rated_profiles = False
-        for other in other_linked:
-            other_profile_key = other["profile_key"]
-            other_username = other["display_username"]
-            other_ratings = all_other_ratings.get(other_profile_key, {})
-            other_numeric_ratings = numeric_ratings(other_ratings)
-
-            if len(other_numeric_ratings) < 5:
-                continue
-            enough_rated_profiles = True
-
-            common_rated = set(my_numeric_ratings) & set(other_numeric_ratings)
-            if len(common_rated) < 2:
-                continue
-
-            final_score, _, _ = calculate_similarity_raw(my_numeric_ratings, other_numeric_ratings)
-            taste_matches.append((other_profile_key, other_username, final_score, other_ratings))
+        taste_matches, enough_rated_profiles = rank_taste_matches(
+            my_numeric_ratings,
+            other_linked,
+            all_other_ratings,
+            similarity_fn=calculate_similarity_raw,
+        )
 
         if not taste_matches:
             if enough_rated_profiles:
@@ -490,59 +588,28 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             )
             return
 
-        # Sort profiles by similarity score descending.
-        taste_matches.sort(key=lambda x: x[2], reverse=True)
-
-        get_entries = getattr(self.bot.db, "get_profile_library_entries", None)
-        my_entries = await get_entries(caller_key) if get_entries is not None else None
+        if my_entries is None and get_entries is not None and allowed_pool_statuses is None:
+            my_entries = await get_entries(caller_key)
         my_excluded_slugs = (
             excluded_recommendation_slugs(my_entries)
             if my_entries is not None
             else set(my_ratings.keys())
         )
-        raw_candidates = []
-        chosen_slugs = set()
-
-        # PASS 1: Strict diversity — exactly 1 top recommendation per profile.
-        for other_profile_key, other_name, match_score, other_ratings in taste_matches:
-            match_pct = int(round(match_score))
-            # Sort this profile's eligible games by rating descending.
-            user_top_games = [
-                (slug, rating)
-                for slug, rating in other_ratings.items()
-                if rating is not None and rating >= 4.0 and slug not in my_excluded_slugs and slug not in chosen_slugs
-            ]
-            user_top_games.sort(key=lambda x: x[1], reverse=True)
-
-            if user_top_games:
-                best_slug, best_rating = user_top_games[0]
-                raw_candidates.append((best_slug, best_rating, other_name, match_pct))
-                chosen_slugs.add(best_slug)
-                if len(raw_candidates) >= 5:
-                    break
-
-        # PASS 2: If fewer than 5 recommendations found (e.g. only 2 or 3 taste twins in server),
-        # round-robin additional top games from highest matches to fill up to 5
-        if len(raw_candidates) < 5:
-            for other_profile_key, other_name, match_score, other_ratings in taste_matches:
-                match_pct = int(round(match_score))
-                user_top_games = [
-                    (slug, rating)
-                    for slug, rating in other_ratings.items()
-                    if rating is not None and rating >= 4.0 and slug not in my_excluded_slugs and slug not in chosen_slugs
-                ]
-                user_top_games.sort(key=lambda x: x[1], reverse=True)
-
-                for slug, rating in user_top_games:
-                    raw_candidates.append((slug, rating, other_name, match_pct))
-                    chosen_slugs.add(slug)
-                    if len(raw_candidates) >= 5:
-                        break
-                if len(raw_candidates) >= 5:
-                    break
+        raw_candidates = select_diverse_recommendations(
+            taste_matches,
+            excluded_slugs=my_excluded_slugs,
+            pool_slugs=my_pool_slugs,
+            limit=5,
+        )
 
         if not raw_candidates:
-            if any(
+            if allowed_pool_statuses is not None:
+                await send_private_followup(
+                    interaction,
+                    f"ℹ️ None of your similar server profiles have rated any unrated games in your {pool_empty_label} 4.0 or above.",
+                    log=logger,
+                )
+            elif any(
                 has_uncertain_library_exclusion(other_ratings, my_entries)
                 for _, _, _, other_ratings in taste_matches
             ):
@@ -566,21 +633,27 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         cand_slugs = [c[0] for c in raw_candidates]
         cached_meta = await self.bot.db.get_games_by_slugs(cand_slugs) if cand_slugs else {}
 
-        recommendations = []
-        for slug, rating, other_name, match_pct in raw_candidates:
-            meta = cached_meta.get(slug)
-            title = meta["title"] if meta and meta["title"] else slug.replace("-", " ").title()
-            recommendations.append({
+        recommendations = [
+            {
                 "slug": slug,
-                "title": title,
+                "title": resolve_display_title(slug, cached_meta),
                 "rating": rating,
                 "recommender": other_name,
-                "match_pct": match_pct
-            })
+                "match_pct": match_pct,
+            }
+            for slug, rating, other_name, match_pct in raw_candidates
+        ]
+
+        if allowed_pool_statuses is not None:
+            mode1_desc = (
+                f"Hand-picked games from your {pool_label} recommended by server profiles that share your taste:\n"
+            )
+        else:
+            mode1_desc = "Hand-picked games from different server profiles that share your taste:\n"
 
         embed = discord.Embed(
             title=f"💡 Recommendations for {caller_username}"[:256],
-            description="Hand-picked games from different server profiles that share your taste:\n",
+            description=mode1_desc,
             color=COLOR_PLAYED
         )
 

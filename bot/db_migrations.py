@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
-
 
 Execute = Callable[[str, tuple | list], Awaitable[Any]]
 FetchOne = Callable[[str, tuple | list], Awaitable[Any]]
@@ -534,6 +533,34 @@ async def _migrate_profile_feed_history_indexes(execute: Execute, fetchone: Fetc
         last_rowid = int(max_rowid)
 
 
+async def _migrate_guild_command_cooldowns(execute: Execute, fetchone: FetchOne) -> None:
+    """Store per-guild moderator-configured slash command cooldown overrides."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_command_cooldowns (
+            guild_id INTEGER NOT NULL,
+            command_name TEXT NOT NULL,
+            cooldown_seconds INTEGER NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, command_name)
+        )
+    """, ())
+
+
+async def _migrate_guild_feed_filters(execute: Execute, fetchone: FetchOne) -> None:
+    """Store per-guild activity feed event category filters."""
+    await execute("""
+        CREATE TABLE IF NOT EXISTS guild_feed_filters (
+            guild_id INTEGER PRIMARY KEY,
+            allow_started BOOLEAN NOT NULL DEFAULT 1,
+            allow_finished BOOLEAN NOT NULL DEFAULT 1,
+            allow_replays BOOLEAN NOT NULL DEFAULT 1,
+            allow_ratings BOOLEAN NOT NULL DEFAULT 1,
+            allow_reviews BOOLEAN NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """, ())
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -579,3 +606,9 @@ async def run_migrations(database) -> None:
         if version < 11:
             await _migrate_profile_feed_history_indexes(tx.execute, tx.fetchone)
             await tx.execute("INSERT INTO schema_migrations (version) VALUES (11)")
+        if version < 12:
+            await _migrate_guild_command_cooldowns(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (12)")
+        if version < 13:
+            await _migrate_guild_feed_filters(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (13)")

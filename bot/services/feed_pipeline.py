@@ -2,17 +2,32 @@
 
 from __future__ import annotations
 
-import aiohttp
-import discord
-import hashlib
-import logging
 import asyncio
+import hashlib
 import json
+import logging
+import time
 import uuid
-from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from typing import Any
 
+import aiohttp
+import discord
+
+from bot.feed_decisions import (
+    accept_feed_decisions,
+    feed_decision_aliases,
+    plan_feed_decisions,
+    prepare_feed_candidates,
+)
+from bot.feed_models import GROUPED_RATING_ID_PREFIX, FeedEvent
+from bot.feed_policy import (
+    DEFAULT_GUILD_FEED_FILTERS,
+    classify_feed_event,
+    feed_event_allowed_by_filters,
+    parse_utc_datetime,
+)
 from bot.feed_rules import (
     VISIBLE_ACTIONS,
     calendar_date,
@@ -21,20 +36,13 @@ from bot.feed_rules import (
     merge_milestones,
     merge_ratings_and_reviews,
 )
-from bot.feed_policy import classify_feed_event, parse_utc_datetime
-from bot.feed_decisions import (
-    accept_feed_decisions,
-    feed_decision_aliases,
-    plan_feed_decisions,
-    prepare_feed_candidates,
-)
-from bot.services.guild_membership import resolve_guild_member_ids
 from bot.services.grouped_ratings import resolve_grouped_ratings
+from bot.services.guild_membership import resolve_guild_member_ids
 from bot.services.library_sync import parse_sync_timestamp
+from bot.services.session_health import UpstreamSessionHealth
 from bot.ui.feed_embed import create_journal_feed_embed
-from bot.ui.views import LinkButtonView
 from bot.ui.helpers import build_backloggd_game_url
-from bot.feed_models import GROUPED_RATING_ID_PREFIX, FeedEvent
+from bot.ui.views import LinkButtonView
 
 logger = logging.getLogger("backloggd.services.feed_pipeline")
 
@@ -70,9 +78,16 @@ class PreparedAnnouncements:
 
 
 class FeedPipeline:
-    def __init__(self, bot, *, clock=None):
+    def __init__(self, bot, *, clock=None, monotonic_clock=None):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        existing_health = getattr(bot, "session_health", None)
+        self.session_health = (
+            existing_health
+            if isinstance(existing_health, UpstreamSessionHealth)
+            else UpstreamSessionHealth(clock=self.clock)
+        )
         self._activity_snapshot_meta = {}
         self._unavailable_target_reasons: dict[int, str] = {}
         self._last_publish_errors: dict[tuple[int, str], str] = {}
@@ -360,6 +375,7 @@ class FeedPipeline:
         database = self.bot.db
         health_now = self.clock()
         previous_snapshot = self._activity_snapshot_meta.pop(profile_key, None)
+        upstream_error: BaseException | None = None
         try:
             health = None
             await database.record_feed_source_attempt(
@@ -383,7 +399,7 @@ class FeedPipeline:
                 if not isinstance(pages_read, int) or pages_read < 1:
                     raise ValueError("activity snapshot pages_read must be a positive integer")
             else:
-                # Published backloggd-py 0.2.0 exposes only the latest-page list API.
+                # Retained list-only fallback for SDK doubles/clients without snapshot coverage metadata.
                 entries = await self.bot.backloggd.get_user_activity(username)
                 coverage, pages_read = "unsupported", 1
             if not isinstance(entries, (list, tuple)):
@@ -462,25 +478,42 @@ class FeedPipeline:
                 }
         except Exception as error:
             logger.warning("Could not read activity for %s: %s", username, error)
+            if isinstance(poll_context, dict) and isinstance(poll_context.get("stats"), dict):
+                poll_context["stats"]["source_errors"] += 1
             await database.record_feed_source_failure(profile_key, "activity", str(error))
-        try:
-            await database.record_feed_source_attempt(
-                profile_key, "journal", now=health_now,
-            )
-            entries = await self.bot.backloggd.get_user_journal(
-                username, max_pages=1, require_complete=False,
-            )
-            parsed_journal = journal_events(entries, username)
-            await database.record_feed_source_success(
-                profile_key, "journal", coverage="latest_page", pages_read=1,
-                now=health_now,
-            )
-            sources["journal"] = parsed_journal
-            if poll_context is not None:
-                poll_context.setdefault("partial_journals", set()).add(profile_key)
-        except Exception as error:
-            logger.warning("Could not read journal for %s: %s", username, error)
-            await database.record_feed_source_failure(profile_key, "journal", str(error))
+            upstream_kind = self.session_health.record_failure(error)
+            if upstream_kind is not None:
+                upstream_error = error
+                if isinstance(poll_context, dict):
+                    poll_context["upstream_aborted"] = upstream_kind
+        if upstream_error is None:
+            try:
+                await database.record_feed_source_attempt(
+                    profile_key, "journal", now=health_now,
+                )
+                entries = await self.bot.backloggd.get_user_journal(
+                    username, max_pages=1, require_complete=False,
+                )
+                parsed_journal = journal_events(entries, username)
+                await database.record_feed_source_success(
+                    profile_key, "journal", coverage="latest_page", pages_read=1,
+                    now=health_now,
+                )
+                sources["journal"] = parsed_journal
+                if poll_context is not None:
+                    poll_context.setdefault("partial_journals", set()).add(profile_key)
+            except Exception as error:
+                logger.warning("Could not read journal for %s: %s", username, error)
+                if isinstance(poll_context, dict) and isinstance(poll_context.get("stats"), dict):
+                    poll_context["stats"]["source_errors"] += 1
+                await database.record_feed_source_failure(profile_key, "journal", str(error))
+                upstream_kind = self.session_health.record_failure(error)
+                if upstream_kind is not None:
+                    upstream_error = error
+                    if isinstance(poll_context, dict):
+                        poll_context["upstream_aborted"] = upstream_kind
+        if upstream_error is None and "activity" in sources and "journal" in sources:
+            self.session_health.record_success()
         return sources
 
 
@@ -498,7 +531,9 @@ class FeedPipeline:
             # Observations stay durable without modifying archived Discord messages.
             return False
         prepared = await self._prepare_announcements(target, events, history, now)
-        return await self._deliver_announcements(target, history, prepared, now)
+        return await self._deliver_announcements(
+            target, history, prepared, now, poll_context=poll_context,
+        )
 
 
     async def _load_and_initialize_history(self, target, sources) -> FeedHistory:
@@ -887,47 +922,104 @@ class FeedPipeline:
         )
 
 
-    async def _deliver_announcements(self, target, history, prepared, now) -> bool:
+    async def _deliver_announcements(self, target, history, prepared, now, *, poll_context: dict | None = None) -> bool:
         target_ok = True
         for event in prepared.events:
-            if not await self._deliver_event(target, event, history, prepared, now):
+            if not await self._deliver_event(target, event, history, prepared, now, poll_context=poll_context):
                 target_ok = False
         return target_ok
 
 
-    async def _deliver_event(self, target, event, history, prepared, now) -> bool:
-        """Keep archive edits, send ownership, persistence and cleanup in one scope."""
-        guild_id, profile_key = target.guild_id, target.profile_key
-        username, avatar_url, channel = target.username, target.avatar_url, target.channel
-        saved, row_events_by_id = history.saved, history.row_events_by_id
-        activity_rating_history = prepared.activity_rating_history
-        journal_rating_history = prepared.journal_rating_history
-        journal_rating_times_unknown = prepared.journal_rating_times_unknown
-        delivered_alias_ids = prepared.delivered_alias_ids
-        target_ok = True
-        aliases = event.event_ids or (event.activity_id,)
+    async def _get_guild_feed_filters(
+        self, guild_id: int, poll_context: dict | None = None
+    ) -> dict[str, bool]:
+        cached = poll_context.get("guild_filters") if isinstance(poll_context, dict) else None
+        if isinstance(cached, dict) and guild_id in cached:
+            return cached[guild_id]
+        if hasattr(self.bot.db, "get_guild_feed_filters"):
+            filters = await self.bot.db.get_guild_feed_filters(guild_id)
+        else:
+            filters = dict(DEFAULT_GUILD_FEED_FILTERS)
+        if isinstance(cached, dict):
+            cached[guild_id] = filters
+        return filters
+
+    async def _record_guild_filtered_event(
+        self,
+        guild_id: int,
+        profile_key: str,
+        event: FeedEvent,
+        aliases: tuple[str, ...],
+        payload: str,
+        now: datetime,
+        saved: dict,
+    ) -> None:
+        """Record a guild-filtered event as suppressed and baseline it against future backfill."""
+        _, _, event_date = classify_feed_event(event, now)
+        if hasattr(self.bot.db, "persist_feed_event_decisions"):
+            inserts = [
+                {
+                    "event_id": alias,
+                    "source": "journal" if str(alias).startswith("journal_") else event.source,
+                    "event_date": event_date,
+                    "decision": "filtered",
+                    "reason": "guild_filter",
+                    "payload": payload,
+                    "observed_at": now,
+                }
+                for alias in aliases
+            ]
+            await self.bot.db.persist_feed_event_decisions(
+                guild_id,
+                profile_key,
+                inserts=inserts,
+                alias_groups=(aliases,),
+            )
+        await self.bot.db.store_feed_message(
+            guild_id,
+            profile_key,
+            aliases,
+            payload,
+            None,
+            None,
+            delivery_state="baseline",
+        )
+        for alias in aliases:
+            saved[alias] = {
+                "payload": payload,
+                "message_id": None,
+                "channel_id": None,
+                "delivery_state": "baseline",
+            }
+
+
+    @staticmethod
+    def _select_delivery_record(saved, delivered_alias_ids, event, aliases):
+        """Select the canonical saved delivery record (or synthetic baseline) for an event's aliases."""
         records = [saved[key] for key in aliases if key in saved]
         sent_records = [r for r in records if r["message_id"] is not None]
         if sent_records:
             deleted_sent = [r for r in sent_records if dict(r).get("delivery_state") == "deleted"]
             pool = deleted_sent or sent_records
-            record = min(pool, key=lambda row: row["message_id"])
-        elif records:
+            return min(pool, key=lambda row: row["message_id"])
+        if records:
             protected = [
                 r for r in records
                 if dict(r).get("delivery_state") in {"deleted", "unknown", "pending"}
             ]
-            record = protected[0] if protected else records[0]
-        else:
-            record = None
-        if record is None and any(alias in delivered_alias_ids for alias in aliases):
-            record = {
+            return protected[0] if protected else records[0]
+        if any(alias in delivered_alias_ids for alias in aliases):
+            return {
                 "payload": json.dumps(asdict(event), sort_keys=True),
                 "message_id": None,
                 "channel_id": None,
                 "delivery_state": "baseline",
                 "_synthetic_event": event,
             }
+        return None
+
+    def _resolve_delivery_event(self, event, record, row_events_by_id, prepared):
+        """Annotate previous_rating from saved state or poll history and detect unchanged events."""
         unchanged = False
         if record:
             record_keys = record.keys() if hasattr(record, "keys") else ()
@@ -963,16 +1055,345 @@ class FeedPipeline:
         elif event.action_type == "rated" and not event.activity_id.startswith(GROUPED_RATING_ID_PREFIX):
             old_rating = self._previous_rating_from_history(
                 event,
-                activity_rating_history.get(event.game_slug, ()),
-                journal_rating_history.get(event.game_slug, ()),
-                journal_time_unknown=event.game_slug in journal_rating_times_unknown,
+                prepared.activity_rating_history.get(event.game_slug, ()),
+                prepared.journal_rating_history.get(event.game_slug, ()),
+                journal_time_unknown=event.game_slug in prepared.journal_rating_times_unknown,
             )
             if old_rating != event.rating:
                 event = replace(event, previous_rating=old_rating)
+        return event, unchanged
+
+    async def _store_missing_aliases(
+        self,
+        guild_id: int,
+        profile_key: str,
+        missing_aliases,
+        payload: str,
+        message_id,
+        channel_id,
+        delivery_state: str,
+        saved: dict,
+    ) -> None:
+        """Persist newly observed aliases for an existing feed message record and update local cache."""
+        await self.bot.db.store_feed_message(
+            guild_id,
+            profile_key,
+            missing_aliases,
+            payload,
+            message_id,
+            channel_id,
+            delivery_state=delivery_state,
+        )
+        for alias in missing_aliases:
+            saved[alias] = {
+                "payload": payload,
+                "message_id": message_id,
+                "channel_id": channel_id,
+                "delivery_state": delivery_state,
+            }
+
+    def _resolve_edit_channel(self, guild_id: int, old_channel, current_channel):
+        """Resolve and validate the target channel for editing an existing announcement."""
+        if old_channel is None:
+            return None, "Original channel ID missing"
+        if old_channel == current_channel.id:
+            channel_guild_id = getattr(getattr(current_channel, "guild", None), "id", None)
+            if (
+                isinstance(channel_guild_id, int)
+                and not isinstance(channel_guild_id, bool)
+                and channel_guild_id != guild_id
+            ):
+                return None, f"Configured channel <#{old_channel}> belongs to another server"
+            return current_channel, None
+        edit_channel, _, edit_issue = self.inspect_target_channel(
+            guild_id, old_channel, require_channel_lookup=True
+        )
+        return edit_channel, edit_issue
+
+    async def _edit_existing_announcement(
+        self,
+        target,
+        *,
+        old_channel,
+        message_id,
+        state,
+        record,
+        aliases,
+        missing_aliases,
+        payload: str,
+        embed,
+        view,
+        saved: dict,
+        stats,
+    ) -> bool | None:
+        """Edit an existing announcement message.
+
+        Returns None when the edit succeeded and the caller should persist the updated payload,
+        True when handled terminally (e.g. message deleted), or False on a retryable error.
+        """
+        guild_id, profile_key = target.guild_id, target.profile_key
+        username, channel = target.username, target.channel
+        edit_channel, edit_issue = self._resolve_edit_channel(guild_id, old_channel, channel)
+        if edit_channel is None:
+            if missing_aliases:
+                await self._store_missing_aliases(
+                    guild_id, profile_key, missing_aliases, record["payload"],
+                    message_id, old_channel, state or "sent", saved,
+                )
+            if isinstance(stats, dict):
+                stats["delivery_errors"] += 1
+            self._last_publish_errors[(guild_id, profile_key)] = (
+                edit_issue or "channel unavailable"
+            )[:500]
+            logger.warning(
+                "Could not edit feed message %s in prior channel %s for %s in guild %d (%s); keeping confirmed payload for retry",
+                message_id,
+                old_channel,
+                username,
+                guild_id,
+                edit_issue or "channel unavailable",
+            )
+            return False
+
+        try:
+            await edit_channel.get_partial_message(message_id).edit(embed=embed, view=view)
+            if isinstance(stats, dict):
+                stats["edited"] += 1
+            return None
+        except discord.NotFound:
+            # A removed announcement stays removed; do not repost it.
+            await self.bot.db.mark_feed_message_deleted(
+                guild_id, profile_key, aliases, payload
+            )
+            if missing_aliases:
+                await self.bot.db.store_feed_message(
+                    guild_id, profile_key, missing_aliases, payload,
+                    message_id, old_channel, delivery_state="deleted",
+                )
+            for alias in aliases:
+                saved[alias] = {
+                    "payload": payload,
+                    "message_id": message_id,
+                    "channel_id": old_channel,
+                    "delivery_state": "deleted",
+                }
+            return True
+        except asyncio.CancelledError:
+            raise
+        except (discord.HTTPException, discord.RateLimited, aiohttp.ClientError, TimeoutError, ConnectionError) as error:
+            if missing_aliases:
+                await self._store_missing_aliases(
+                    guild_id, profile_key, missing_aliases, record["payload"],
+                    message_id, old_channel, state or "sent", saved,
+                )
+            if isinstance(stats, dict):
+                stats["delivery_errors"] += 1
+            err_status = getattr(error, "status", "rate_limited" if isinstance(error, discord.RateLimited) else type(error).__name__)
+            self._last_publish_errors[(guild_id, profile_key)] = f"edit_failed:{err_status}: {error}"[:500]
+            logger.warning(
+                "Could not edit feed message %s for %s in guild %d (status %s); keeping previous payload for retry",
+                message_id,
+                username,
+                guild_id,
+                err_status,
+            )
+            return False
+
+    async def _send_new_announcement(
+        self,
+        target,
+        *,
+        event,
+        record,
+        aliases,
+        payload: str,
+        embed,
+        view,
+        saved: dict,
+        stats,
+    ) -> bool:
+        """Publish a new announcement inside one send-ownership and cancellation-shielded scope."""
+        guild_id, profile_key = target.guild_id, target.profile_key
+        username, channel = target.username, target.channel
+        owner_token = uuid.uuid4().hex
+        if not await self.bot.db.begin_feed_delivery(
+            guild_id, profile_key, aliases, payload, channel.id,
+            owner_token=owner_token,
+        ):
+            return True
+        durable_finalized = False
+        cleanup_launched = False
+        sent_message = None
+
+        async def _write_delivery_state(outcome: str, *, msg: Any = None) -> None:
+            nonlocal durable_finalized
+            if outcome == "release":
+                await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
+                durable_finalized = True
+                return
+            if outcome == "sent" and msg is not None and getattr(msg, "id", None) is not None:
+                await self.bot.db.store_feed_message(
+                    guild_id, profile_key, aliases, payload, msg.id, channel.id
+                )
+                durable_finalized = True
+                for alias in aliases:
+                    saved[alias] = {
+                        "payload": payload,
+                        "message_id": msg.id,
+                        "channel_id": channel.id,
+                        "delivery_state": "sent",
+                    }
+                return
+            await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
+            durable_finalized = True
+            for alias in aliases:
+                saved[alias] = {
+                    "payload": payload,
+                    "message_id": None,
+                    "channel_id": channel.id,
+                    "delivery_state": "unknown",
+                }
+
+        async def _finalize_delivery_state(outcome: str, *, msg: Any = None) -> None:
+            try:
+                await _write_delivery_state(outcome, msg=msg)
+            except Exception:
+                logger.warning(
+                    "Could not finalize delivery state for %s (%s) in guild %d; leaving intent recoverable",
+                    event.activity_id,
+                    username,
+                    guild_id,
+                    exc_info=True,
+                )
+            finally:
+                self.bot.db.release_feed_delivery_ownership(
+                    guild_id,
+                    profile_key,
+                    aliases,
+                    owner_token,
+                    recheck_recovery=not durable_finalized,
+                )
+
+        async def _shield_delivery_cleanup(outcome: str, *, msg: Any = None) -> None:
+            nonlocal cleanup_launched
+            cleanup_launched = True
+            cleanup_task = self._track_delivery_cleanup(
+                _finalize_delivery_state(outcome, msg=msg)
+            )
+            await asyncio.shield(cleanup_task)
+
+        async def _transition_delivery(outcome: str, *, msg: Any = None) -> None:
+            try:
+                await _write_delivery_state(outcome, msg=msg)
+            except asyncio.CancelledError:
+                await _shield_delivery_cleanup(outcome, msg=msg)
+                raise
+
+        async def _mark_unknown_fallback(warning_msg: str, *warning_args: Any) -> None:
+            try:
+                await _transition_delivery("unknown")
+            except Exception:
+                logger.warning(warning_msg, *warning_args, exc_info=True)
+
+        try:
+            try:
+                sent_message = await channel.send(embed=embed, view=view)
+            except asyncio.CancelledError:
+                await _shield_delivery_cleanup("unknown")
+                raise
+            except discord.RateLimited as error:
+                await _transition_delivery("release")
+                if isinstance(stats, dict):
+                    stats["delivery_errors"] += 1
+                self._last_publish_errors[(guild_id, profile_key)] = f"rate_limited:{error.retry_after:.2f}s"[:500]
+                logger.warning(
+                    "Rate limited sending feed event %s for %s in guild %d (retry_after=%.2fs); released pending intent",
+                    event.activity_id,
+                    username,
+                    guild_id,
+                    error.retry_after,
+                )
+                return False
+            except discord.HTTPException as error:
+                status = getattr(error, "status", None)
+                is_client_rejection = isinstance(status, int) and 400 <= status < 500
+                await _transition_delivery("release" if is_client_rejection else "unknown")
+                if isinstance(stats, dict):
+                    stats["delivery_errors"] += 1
+                self._last_publish_errors[(guild_id, profile_key)] = (
+                    f"http_{status if status is not None else 'error'}: {error}"[:500]
+                )
+                logger.warning(
+                    "Could not send feed event %s for %s in guild %d (status %s); %s",
+                    event.activity_id,
+                    username,
+                    guild_id,
+                    status if status is not None else "unknown",
+                    "released pending intent" if is_client_rejection else "marked delivery unknown",
+                )
+                return False
+            except (aiohttp.ClientError, TimeoutError, ConnectionError) as error:
+                await _transition_delivery("unknown")
+                if isinstance(stats, dict):
+                    stats["delivery_errors"] += 1
+                self._last_publish_errors[(guild_id, profile_key)] = f"{type(error).__name__}: {error}"[:500]
+                logger.warning(
+                    "Uncertain transport failure sending feed event %s for %s in guild %d (%s); marked delivery unknown",
+                    event.activity_id,
+                    username,
+                    guild_id,
+                    error,
+                )
+                return False
+            except Exception:
+                await _mark_unknown_fallback(
+                    "Could not mark delivery unknown after error sending %s in guild %d",
+                    event.activity_id,
+                    guild_id,
+                )
+                raise
+            message_id = sent_message.id
+            try:
+                await _transition_delivery("sent", msg=sent_message)
+                if isinstance(stats, dict):
+                    stats["sent"] += 1
+            except Exception:
+                await _mark_unknown_fallback(
+                    "Could not record unknown state after post-send write error for message %s (%s) in guild %d",
+                    message_id,
+                    event.activity_id,
+                    guild_id,
+                )
+                raise
+        finally:
+            if not cleanup_launched:
+                self.bot.db.release_feed_delivery_ownership(
+                    guild_id,
+                    profile_key,
+                    aliases,
+                    owner_token,
+                    recheck_recovery=not durable_finalized,
+                )
+        if not record:
+            await asyncio.sleep(1)
+        return True
+
+    async def _deliver_event(
+        self, target, event, history, prepared, now, *, poll_context: dict | None = None
+    ) -> bool:
+        """Orchestrate record lookup, filtering, archive edits, new sends, and persistence."""
+        stats = poll_context.get("stats") if isinstance(poll_context, dict) else None
+        guild_id, profile_key = target.guild_id, target.profile_key
+        saved = history.saved
+        aliases = event.event_ids or (event.activity_id,)
+
+        record = self._select_delivery_record(saved, prepared.delivered_alias_ids, event, aliases)
+        event, unchanged = self._resolve_delivery_event(event, record, history.row_events_by_id, prepared)
         message_id = record["message_id"] if record else None
         old_channel = record["channel_id"] if record else None
         state = record["delivery_state"] if record and "delivery_state" in record.keys() else None
         missing_aliases = [alias for alias in aliases if alias not in saved] if record else list(aliases)
+
         if not unchanged:
             payload = json.dumps(asdict(event), sort_keys=True)
             if record and payload == record["payload"]:
@@ -980,288 +1401,48 @@ class FeedPipeline:
         if unchanged:
             if missing_aliases:
                 alias_state = state or ("sent" if message_id is not None else "baseline")
-                await self.bot.db.store_feed_message(
+                await self._store_missing_aliases(
                     guild_id, profile_key, missing_aliases, record["payload"],
-                    message_id, old_channel, delivery_state=alias_state,
+                    message_id, old_channel, alias_state, saved,
                 )
-                for alias in missing_aliases:
-                    saved[alias] = {
-                        "payload": record["payload"],
-                        "message_id": message_id,
-                        "channel_id": old_channel,
-                        "delivery_state": alias_state,
-                    }
-            return target_ok
+            return True
         if state in {"pending", "unknown", "deleted"}:
-            await self.bot.db.store_feed_message(
-                guild_id, profile_key, aliases, payload, message_id, old_channel,
-                delivery_state=state,
+            await self._store_missing_aliases(
+                guild_id, profile_key, aliases, payload, message_id, old_channel, state, saved
             )
-            for alias in aliases:
-                saved[alias] = {
-                    "payload": payload,
-                    "message_id": message_id,
-                    "channel_id": old_channel,
-                    "delivery_state": state,
-                }
-            return target_ok
+            return True
+
         if record and message_id is None:
             # Historic baseline: remember aliases but never publish history.
             pass
+        elif message_id is None and not feed_event_allowed_by_filters(
+            event, await self._get_guild_feed_filters(guild_id, poll_context)
+        ):
+            # Suppress newly discovered event blocked by this server's category filters
+            # and baseline it so re-enabling the category later never backfills history.
+            await self._record_guild_filtered_event(
+                guild_id, profile_key, event, aliases, payload, now, saved
+            )
+            return True
         else:
-            embed = create_journal_feed_embed(username, avatar_url, event, now=now)
+            embed = create_journal_feed_embed(target.username, target.avatar_url, event, now=now)
             view = LinkButtonView(label="View on Backloggd", url=build_backloggd_game_url(event.game_slug))
             if message_id is not None:
-                if old_channel is None:
-                    edit_channel, edit_issue = None, "Original channel ID missing"
-                elif old_channel == channel.id:
-                    channel_guild_id = getattr(getattr(channel, "guild", None), "id", None)
-                    if (
-                        isinstance(channel_guild_id, int)
-                        and not isinstance(channel_guild_id, bool)
-                        and channel_guild_id != guild_id
-                    ):
-                        edit_channel, edit_issue = None, f"Configured channel <#{old_channel}> belongs to another server"
-                    else:
-                        edit_channel, edit_issue = channel, None
-                else:
-                    edit_channel, _, edit_issue = self.inspect_target_channel(
-                        guild_id, old_channel, require_channel_lookup=True
-                    )
-
-                if edit_channel is None:
-                    if missing_aliases:
-                        alias_state = state or "sent"
-                        await self.bot.db.store_feed_message(
-                            guild_id, profile_key, missing_aliases, record["payload"],
-                            message_id, old_channel, delivery_state=alias_state,
-                        )
-                        for alias in missing_aliases:
-                            saved[alias] = {
-                                "payload": record["payload"],
-                                "message_id": message_id,
-                                "channel_id": old_channel,
-                                "delivery_state": alias_state,
-                            }
-                    target_ok = False
-                    self._last_publish_errors[(guild_id, profile_key)] = (
-                        edit_issue or "channel unavailable"
-                    )[:500]
-                    logger.warning(
-                        "Could not edit feed message %s in prior channel %s for %s in guild %d (%s); keeping confirmed payload for retry",
-                        message_id,
-                        old_channel,
-                        username,
-                        guild_id,
-                        edit_issue or "channel unavailable",
-                    )
-                    return target_ok
-
-                try:
-                    await edit_channel.get_partial_message(message_id).edit(embed=embed, view=view)
-                except discord.NotFound:
-                    # A removed announcement stays removed; do not repost it.
-                    await self.bot.db.mark_feed_message_deleted(
-                        guild_id, profile_key, aliases, payload
-                    )
-                    if missing_aliases:
-                        await self.bot.db.store_feed_message(
-                            guild_id, profile_key, missing_aliases, payload,
-                            message_id, old_channel, delivery_state="deleted",
-                        )
-                    for alias in aliases:
-                        saved[alias] = {
-                            "payload": payload,
-                            "message_id": message_id,
-                            "channel_id": old_channel,
-                            "delivery_state": "deleted",
-                        }
-                    return target_ok
-                except asyncio.CancelledError:
-                    raise
-                except (discord.HTTPException, discord.RateLimited, aiohttp.ClientError, TimeoutError, ConnectionError) as error:
-                    if missing_aliases:
-                        alias_state = state or "sent"
-                        await self.bot.db.store_feed_message(
-                            guild_id, profile_key, missing_aliases, record["payload"],
-                            message_id, old_channel, delivery_state=alias_state,
-                        )
-                        for alias in missing_aliases:
-                            saved[alias] = {
-                                "payload": record["payload"],
-                                "message_id": message_id,
-                                "channel_id": old_channel,
-                                "delivery_state": alias_state,
-                            }
-                    target_ok = False
-                    err_status = getattr(error, "status", "rate_limited" if isinstance(error, discord.RateLimited) else type(error).__name__)
-                    self._last_publish_errors[(guild_id, profile_key)] = f"edit_failed:{err_status}: {error}"[:500]
-                    logger.warning(
-                        "Could not edit feed message %s for %s in guild %d (status %s); keeping previous payload for retry",
-                        message_id,
-                        username,
-                        guild_id,
-                        err_status,
-                    )
-                    return target_ok
+                edit_outcome = await self._edit_existing_announcement(
+                    target,
+                    old_channel=old_channel, message_id=message_id, state=state,
+                    record=record, aliases=aliases, missing_aliases=missing_aliases,
+                    payload=payload, embed=embed, view=view, saved=saved, stats=stats,
+                )
+                if edit_outcome is not None:
+                    return edit_outcome
             else:
-                owner_token = uuid.uuid4().hex
-                if not await self.bot.db.begin_feed_delivery(
-                    guild_id, profile_key, aliases, payload, channel.id,
-                    owner_token=owner_token,
-                ):
-                    return target_ok
-                durable_finalized = False
-                cleanup_launched = False
-                sent_message = None
+                return await self._send_new_announcement(
+                    target,
+                    event=event, record=record, aliases=aliases,
+                    payload=payload, embed=embed, view=view, saved=saved, stats=stats,
+                )
 
-                async def _write_delivery_state(outcome: str, *, msg: Any = None) -> None:
-                    nonlocal durable_finalized
-                    if outcome == "release":
-                        await self.bot.db.release_feed_delivery(guild_id, profile_key, aliases)
-                        durable_finalized = True
-                        return
-                    if outcome == "sent" and msg is not None and getattr(msg, "id", None) is not None:
-                        await self.bot.db.store_feed_message(
-                            guild_id, profile_key, aliases, payload, msg.id, channel.id
-                        )
-                        durable_finalized = True
-                        for alias in aliases:
-                            saved[alias] = {
-                                "payload": payload,
-                                "message_id": msg.id,
-                                "channel_id": channel.id,
-                                "delivery_state": "sent",
-                            }
-                        return
-                    await self.bot.db.mark_feed_delivery_unknown(guild_id, profile_key, aliases)
-                    durable_finalized = True
-                    for alias in aliases:
-                        saved[alias] = {
-                            "payload": payload,
-                            "message_id": None,
-                            "channel_id": channel.id,
-                            "delivery_state": "unknown",
-                        }
-
-                async def _finalize_delivery_state(outcome: str, *, msg: Any = None) -> None:
-                    try:
-                        await _write_delivery_state(outcome, msg=msg)
-                    except Exception:
-                        logger.warning(
-                            "Could not finalize delivery state for %s (%s) in guild %d; leaving intent recoverable",
-                            event.activity_id,
-                            username,
-                            guild_id,
-                            exc_info=True,
-                        )
-                    finally:
-                        self.bot.db.release_feed_delivery_ownership(
-                            guild_id,
-                            profile_key,
-                            aliases,
-                            owner_token,
-                            recheck_recovery=not durable_finalized,
-                        )
-
-                async def _shield_delivery_cleanup(outcome: str, *, msg: Any = None) -> None:
-                    nonlocal cleanup_launched
-                    cleanup_launched = True
-                    cleanup_task = self._track_delivery_cleanup(
-                        _finalize_delivery_state(outcome, msg=msg)
-                    )
-                    await asyncio.shield(cleanup_task)
-
-                async def _transition_delivery(outcome: str, *, msg: Any = None) -> None:
-                    try:
-                        await _write_delivery_state(outcome, msg=msg)
-                    except asyncio.CancelledError:
-                        await _shield_delivery_cleanup(outcome, msg=msg)
-                        raise
-
-                async def _mark_unknown_fallback(warning_msg: str, *warning_args: Any) -> None:
-                    try:
-                        await _transition_delivery("unknown")
-                    except Exception:
-                        logger.warning(warning_msg, *warning_args, exc_info=True)
-
-                try:
-                    try:
-                        sent_message = await channel.send(embed=embed, view=view)
-                    except asyncio.CancelledError:
-                        await _shield_delivery_cleanup("unknown")
-                        raise
-                    except discord.RateLimited as error:
-                        await _transition_delivery("release")
-                        target_ok = False
-                        self._last_publish_errors[(guild_id, profile_key)] = f"rate_limited:{error.retry_after:.2f}s"[:500]
-                        logger.warning(
-                            "Rate limited sending feed event %s for %s in guild %d (retry_after=%.2fs); released pending intent",
-                            event.activity_id,
-                            username,
-                            guild_id,
-                            error.retry_after,
-                        )
-                        return target_ok
-                    except discord.HTTPException as error:
-                        status = getattr(error, "status", None)
-                        is_client_rejection = isinstance(status, int) and 400 <= status < 500
-                        await _transition_delivery("release" if is_client_rejection else "unknown")
-                        target_ok = False
-                        self._last_publish_errors[(guild_id, profile_key)] = (
-                            f"http_{status if status is not None else 'error'}: {error}"[:500]
-                        )
-                        logger.warning(
-                            "Could not send feed event %s for %s in guild %d (status %s); %s",
-                            event.activity_id,
-                            username,
-                            guild_id,
-                            status if status is not None else "unknown",
-                            "released pending intent" if is_client_rejection else "marked delivery unknown",
-                        )
-                        return target_ok
-                    except (aiohttp.ClientError, TimeoutError, ConnectionError) as error:
-                        await _transition_delivery("unknown")
-                        target_ok = False
-                        self._last_publish_errors[(guild_id, profile_key)] = f"{type(error).__name__}: {error}"[:500]
-                        logger.warning(
-                            "Uncertain transport failure sending feed event %s for %s in guild %d (%s); marked delivery unknown",
-                            event.activity_id,
-                            username,
-                            guild_id,
-                            error,
-                        )
-                        return target_ok
-                    except Exception:
-                        await _mark_unknown_fallback(
-                            "Could not mark delivery unknown after error sending %s in guild %d",
-                            event.activity_id,
-                            guild_id,
-                        )
-                        raise
-                    message_id = sent_message.id
-                    try:
-                        await _transition_delivery("sent", msg=sent_message)
-                    except Exception:
-                        await _mark_unknown_fallback(
-                            "Could not record unknown state after post-send write error for message %s (%s) in guild %d",
-                            message_id,
-                            event.activity_id,
-                            guild_id,
-                        )
-                        raise
-                finally:
-                    if not cleanup_launched:
-                        self.bot.db.release_feed_delivery_ownership(
-                            guild_id,
-                            profile_key,
-                            aliases,
-                            owner_token,
-                            recheck_recovery=not durable_finalized,
-                        )
-                if not record:
-                    await asyncio.sleep(1)
-                return target_ok
         await self.bot.db.store_feed_message(guild_id, profile_key, aliases, payload, message_id, old_channel)
         saved_state = "sent" if message_id is not None else "baseline"
         for alias in aliases:
@@ -1273,7 +1454,8 @@ class FeedPipeline:
             }
         if not record:
             await asyncio.sleep(1)
-        return target_ok
+        return True
+
 
 
     @staticmethod
@@ -1567,25 +1749,42 @@ class FeedPipeline:
 
     async def poll(self):
         """Periodically check linked users' journals and broadcast new logs."""
-        try:
-            if self._closing:
-                return
-            if not self.bot.db or not self.bot.db.is_connected:
-                return
+        if self._closing:
+            return
+        if not self.bot.db or not self.bot.db.is_connected:
+            return
 
+        poll_start = self._monotonic_clock()
+        stats = {
+            "guilds": 0,
+            "profiles": 0,
+            "sent": 0,
+            "edited": 0,
+            "source_errors": 0,
+            "delivery_errors": 0,
+        }
+        try:
             guild_settings = await self.bot.db.get_all_guild_settings()
             if not guild_settings:
                 self._unavailable_target_reasons.clear()
                 return
 
             active_guild_ids = {setting["guild_id"] for setting in guild_settings}
+            stats["guilds"] = len(active_guild_ids)
             for stale_guild_id in list(self._unavailable_target_reasons):
                 if stale_guild_id not in active_guild_ids:
                     self._unavailable_target_reasons.pop(stale_guild_id, None)
 
             profile_entries: dict[str, dict] = {}
             skipped_targets: dict[str, list[tuple]] = {}
-            poll_context = {"activity_health": {}}
+            guild_filters: dict[int, dict[str, bool]] = {}
+            if hasattr(self.bot.db, "get_all_guild_feed_filters"):
+                guild_filters = await self.bot.db.get_all_guild_feed_filters(active_guild_ids)
+            poll_context = {
+                "activity_health": {},
+                "stats": stats,
+                "guild_filters": guild_filters,
+            }
             pending_legacy_guilds: set[int] | None = None
 
             async def retain_skipped_targets(guild_id):
@@ -1648,6 +1847,7 @@ class FeedPipeline:
                     )
 
             for profile_key in sorted(set(profile_entries) | set(skipped_targets)):
+                stats["profiles"] += 1
                 entry = profile_entries.get(profile_key)
                 active_targets = entry["targets"] if entry else []
                 skipped = skipped_targets.get(profile_key, [])
@@ -1695,6 +1895,7 @@ class FeedPipeline:
                         except Exception as e:
                             all_guilds_ok = False
                             if channel is not None:
+                                stats["delivery_errors"] += 1
                                 failed_active.append((
                                     guild_id,
                                     self._last_publish_errors.pop((guild_id, profile_key), str(e)),
@@ -1726,10 +1927,26 @@ class FeedPipeline:
                             now=health_now,
                         )
                 except Exception as e:
+                    stats["source_errors"] += 1
                     logger.warning("Error polling activity for %s: %s", username, e)
+
+                if poll_context.get("upstream_aborted"):
+                    break
 
                 # Pause between users to stay respectful to Backloggd servers
                 await asyncio.sleep(1.5)
 
         except Exception as e:
             logger.error("Error in journal_feed_loop: %s", e, exc_info=True)
+        finally:
+            elapsed_s = max(0.0, self._monotonic_clock() - poll_start)
+            logger.info(
+                "Feed poll complete: guilds=%d profiles=%d sent=%d edited=%d source_errors=%d delivery_errors=%d elapsed_s=%.2f",
+                stats["guilds"],
+                stats["profiles"],
+                stats["sent"],
+                stats["edited"],
+                stats["source_errors"],
+                stats["delivery_errors"],
+                elapsed_s,
+            )

@@ -2,9 +2,11 @@
 
 import asyncio
 import logging
+from typing import Any, Callable, Coroutine, Optional, Sequence, Union
+
 import discord
-from discord.ui import View, Button
-from typing import Optional, Callable, Coroutine, Any, Sequence
+from discord.ui import Button, View
+
 from bot.command_errors import (
     GENERIC_COMMAND_ERROR_MESSAGE,
     defer_interaction,
@@ -377,7 +379,7 @@ class FeedListView(ExpiringView):
 
 
 class ServerTopView(ExpiringView):
-    """Author-only, expiring mode switcher for /server-top leaderboards."""
+    """Author-only, expiring mode switcher and paginator for /server-top leaderboards."""
 
     def __init__(
         self,
@@ -386,9 +388,14 @@ class ServerTopView(ExpiringView):
         modes: Sequence[tuple[str, Optional[str]]],
         on_mode_change: Callable[
             [discord.Interaction, str],
-            Coroutine[Any, Any, tuple[Optional[discord.Embed], Optional[str]]],
+            Coroutine[
+                Any,
+                Any,
+                tuple[Optional[Union[discord.Embed, Sequence[discord.Embed]]], Optional[str]],
+            ],
         ],
         *,
+        pages: Optional[Sequence[discord.Embed]] = None,
         timeout: float = 180,
     ):
         if not modes or len(modes) > 25:
@@ -398,6 +405,8 @@ class ServerTopView(ExpiringView):
         self.current_mode = current_mode
         self.on_mode_change = on_mode_change
         self._valid_modes = {mode_name for mode_name, _ in modes}
+        self._pages: list[discord.Embed] = list(pages) if pages else []
+        self.page = 0
         self._generation = 0
         self._edit_lock = asyncio.Lock()
 
@@ -415,29 +424,119 @@ class ServerTopView(ExpiringView):
             min_values=1,
             max_values=1,
             options=options,
+            row=0,
         )
         self.select.callback = self._handle_select
         self.add_item(self.select)
+
+        self.previous_button = Button(
+            label="Previous",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        self.previous_button.callback = self._handle_previous
+        self.next_button = Button(
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        self.next_button.callback = self._handle_next
+        self._sync_pagination_controls()
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, len(self._pages))
 
     def _set_active_mode(self, mode: str) -> None:
         self.current_mode = mode
         for option in self.select.options:
             option.default = option.value == mode
 
+    def _sync_pagination_controls(self) -> None:
+        if len(self._pages) > 1:
+            if self.previous_button not in self.children:
+                self.add_item(self.previous_button)
+            if self.next_button not in self.children:
+                self.add_item(self.next_button)
+            self.previous_button.disabled = self.page <= 0
+            self.next_button.disabled = self.page >= len(self._pages) - 1
+        else:
+            if self.previous_button in self.children:
+                self.remove_item(self.previous_button)
+            if self.next_button in self.children:
+                self.remove_item(self.next_button)
+
+    @staticmethod
+    def _normalize_pages(
+        payload: Optional[Union[discord.Embed, Sequence[discord.Embed]]],
+    ) -> Optional[list[discord.Embed]]:
+        if payload is None:
+            return None
+        if isinstance(payload, discord.Embed):
+            return [payload]
+        pages = list(payload)
+        return pages if pages else None
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Discord.py refreshes the view timeout only after this check passes.
         if self.author_id is not None and interaction.user.id == self.author_id:
             return True
         await interaction.response.send_message(
-            "❌ Only the person who ran `/server-top` can switch leaderboard modes.",
+            "❌ Only the person who ran `/server-top` can switch leaderboard modes or pages.",
             ephemeral=True,
         )
         return False
 
     async def on_timeout(self) -> None:
-        # Apply the disabled controls after any in-flight selection edit.
+        # Apply the disabled controls after any in-flight selection or page edit.
         async with self._edit_lock:
             await super().on_timeout()
+
+    async def _handle_previous(self, interaction: discord.Interaction) -> None:
+        await self._move_page(interaction, -1)
+
+    async def _handle_next(self, interaction: discord.Interaction) -> None:
+        await self._move_page(interaction, 1)
+
+    async def _move_page(self, interaction: discord.Interaction, offset: int) -> None:
+        if self._retired or self.is_finished():
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "⏳ This leaderboard menu has expired. Please run `/server-top` again.",
+                    ephemeral=True,
+                )
+            return
+
+        self._generation += 1
+        generation = self._generation
+
+        if not interaction.response.is_done():
+            await defer_interaction(interaction)
+
+        async with self._edit_lock:
+            if generation != self._generation or self._retired or self.is_finished():
+                return
+            if len(self._pages) <= 1:
+                return
+
+            target_page = max(0, min(len(self._pages) - 1, self.page + offset))
+            if target_page == self.page:
+                return
+
+            previous_page = self.page
+            self.page = target_page
+            self._sync_pagination_controls()
+            try:
+                edited_message = await interaction.edit_original_response(
+                    embed=self._pages[target_page],
+                    view=self,
+                )
+            except BaseException:
+                self.page = previous_page
+                self._sync_pagination_controls()
+                raise
+            if edited_message is not None:
+                self.message = edited_message
 
     async def _handle_select(self, interaction: discord.Interaction) -> None:
         if self._retired or self.is_finished():
@@ -471,13 +570,14 @@ class ServerTopView(ExpiringView):
         if not interaction.response.is_done():
             await defer_interaction(interaction)
 
-        embed, error_message = await self.on_mode_change(interaction, requested_mode)
+        payload, error_message = await self.on_mode_change(interaction, requested_mode)
+        new_pages = self._normalize_pages(payload)
 
         async with self._edit_lock:
             if generation != self._generation or self._retired or self.is_finished():
                 return
 
-            if error_message is not None or embed is None:
+            if error_message is not None or new_pages is None:
                 await send_private_followup(
                     interaction,
                     error_message or GENERIC_COMMAND_ERROR_MESSAGE,
@@ -486,11 +586,22 @@ class ServerTopView(ExpiringView):
                 return
 
             previous_mode = self.current_mode
+            previous_pages = self._pages
+            previous_page = self.page
             self._set_active_mode(requested_mode)
+            self._pages = new_pages
+            self.page = 0
+            self._sync_pagination_controls()
             try:
-                edited_message = await interaction.edit_original_response(embed=embed, view=self)
+                edited_message = await interaction.edit_original_response(
+                    embed=new_pages[0],
+                    view=self,
+                )
             except BaseException:
                 self._set_active_mode(previous_mode)
+                self._pages = previous_pages
+                self.page = previous_page
+                self._sync_pagination_controls()
                 raise
             if edited_message is not None:
                 self.message = edited_message

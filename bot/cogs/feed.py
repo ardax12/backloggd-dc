@@ -1,29 +1,41 @@
 """FeedCog: Handles /setchannel, /unsetchannel, and the periodic playthrough journal feed loop."""
 
+import asyncio
+import logging
+from typing import Optional
+
 import discord
+from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
 from discord import app_commands
 from discord.ext import commands, tasks
-import logging
-import asyncio
-from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
+
 from bot.command_errors import (
     defer_interaction,
     mark_interaction_error_handled,
     send_ephemeral_error,
     send_private_followup,
 )
+from bot.feed_policy import DEFAULT_GUILD_FEED_FILTERS
 from bot.input_validation import (
     InvalidUsernameError,
     escape_display_text,
     normalize_backloggd_username,
 )
-from bot.services.library_sync import parse_sync_timestamp
-from bot.ui.views import FeedListView
-from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, format_health_error_excerpt
 from bot.services.feed_pipeline import FeedPipeline
-from bot.services.task_lifecycle import await_owned_task
+from bot.services.library_sync import parse_sync_timestamp
+from bot.services.task_lifecycle import TaskDrainGroup
+from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, format_health_error_excerpt
+from bot.ui.views import FeedListView
 
 logger = logging.getLogger("backloggd.cogs.feed")
+
+_FEED_FILTER_LABELS: tuple[tuple[str, str], ...] = (
+    ("allow_started", "Started"),
+    ("allow_finished", "Finished"),
+    ("allow_replays", "Replays"),
+    ("allow_ratings", "Ratings"),
+    ("allow_reviews", "Reviews"),
+)
 
 class FeedCog(commands.Cog, name="Feed"):
     feed = app_commands.Group(name="feed", description="Manage your server's Backloggd activity feed")
@@ -31,8 +43,19 @@ class FeedCog(commands.Cog, name="Feed"):
     def __init__(self, bot, *, clock=None):
         self.bot = bot
         self.pipeline = FeedPipeline(bot, clock=clock)
-        self._closing = False
-        self._draining_task: asyncio.Task | None = None
+        self._drain_group = TaskDrainGroup()
+
+    @property
+    def _closing(self) -> bool:
+        return self._drain_group.closing
+
+    @_closing.setter
+    def _closing(self, value: bool) -> None:
+        self._drain_group.closing = bool(value)
+
+    @property
+    def _draining_task(self) -> asyncio.Task | None:
+        return self._drain_group._draining_task
 
     async def cog_load(self):
         # Start loop when cog is loaded and bot event loop is active
@@ -41,27 +64,16 @@ class FeedCog(commands.Cog, name="Feed"):
 
     async def close(self) -> None:
         """Stop accepting polls, cancel the loop and wait for its work to unwind."""
-        self._closing = True
-        current = asyncio.current_task()
-        if self._draining_task is not None:
-            await await_owned_task(self._draining_task)
-            return
-
-        async def _drain() -> None:
+        async def _drain_feed(caller: asyncio.Task | None) -> None:
             drain_task = asyncio.current_task()
             task = self.journal_feed_loop.get_task()
-            if task is not None and task is not current and task is not drain_task:
+            if task is not None and task is not caller and task is not drain_task:
                 if not task.done() and not task.cancelling():
                     self.journal_feed_loop.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-            await self.pipeline.close(exclude_task=current)
+            await self.pipeline.close(exclude_task=caller)
 
-        self._draining_task = asyncio.create_task(_drain())
-        try:
-            await await_owned_task(self._draining_task)
-        finally:
-            if self._draining_task.done():
-                self._draining_task = None
+        await self._drain_group.close(before_drain=_drain_feed)
 
     async def cog_unload(self) -> None:
         await self.close()
@@ -460,7 +472,20 @@ class FeedCog(commands.Cog, name="Feed"):
             status=status,
         )
 
-        desc_lines = [
+        session_health = getattr(self.bot, "session_health", None) or getattr(
+            self.pipeline, "session_health", None
+        )
+        upstream_warning = (
+            session_health.format_feed_status_warning()
+            if session_health is not None
+            and callable(getattr(session_health, "format_feed_status_warning", None))
+            else None
+        )
+
+        desc_lines = []
+        if upstream_warning:
+            desc_lines.extend([upstream_warning, ""])
+        desc_lines.extend([
             lead_sentence,
             "",
             f"**Profile:** [{escape_display_text(username)}]({build_backloggd_user_url(username)})",
@@ -468,7 +493,7 @@ class FeedCog(commands.Cog, name="Feed"):
             f"**In this server's feed:** {'Yes' if is_candidate else 'No'} ({source_summary})",
             f"**Feed channel:** {channel_text}",
             f"**Effective state:** {effective_state}",
-        ]
+        ])
         if member_ids is None:
             desc_lines.append("⚠️ Current member participation could not be verified from Discord's member cache.")
         elif admin_source and not sources and not enabled:
@@ -495,6 +520,16 @@ class FeedCog(commands.Cog, name="Feed"):
                 desc_lines.append(
                     "Continuity unverified: awaiting a complete member snapshot; no prior member candidates remain, pending final snapshot confirmation."
                 )
+
+        if hasattr(self.bot.db, "get_guild_feed_filters"):
+            guild_filters = await self.bot.db.get_guild_feed_filters(interaction.guild_id)
+        else:
+            guild_filters = dict(DEFAULT_GUILD_FEED_FILTERS)
+        disabled_filter_labels = self._disabled_feed_filter_labels(guild_filters)
+        if disabled_filter_labels:
+            desc_lines.append(
+                f"**Server filters:** Excluding {', '.join(disabled_filter_labels)}"
+            )
 
         embed = discord.Embed(
             title="Server Feed Status",
@@ -596,6 +631,9 @@ class FeedCog(commands.Cog, name="Feed"):
             f"Future-dated: {suppressions.get('held_future', 0)}",
             f"Ambiguous edits: {suppressions.get('held_ambiguous', 0)}",
         ]
+        filtered_count = suppressions.get("filtered", 0)
+        if filtered_count or disabled_filter_labels:
+            policy_parts.append(f"Filtered: {filtered_count}")
         unknown_deliveries = deliveries.get("unknown", 0)
         pending_deliveries = deliveries.get("pending", 0)
         if unknown_deliveries or pending_deliveries:
@@ -791,11 +829,95 @@ class FeedCog(commands.Cog, name="Feed"):
         )
         view.message = message
 
+    @staticmethod
+    def _disabled_feed_filter_labels(filters: dict[str, bool]) -> list[str]:
+        return [
+            label
+            for key, label in _FEED_FILTER_LABELS
+            if not filters.get(key, True)
+        ]
+
+    @staticmethod
+    def _format_guild_feed_filters(filters: dict[str, bool]) -> str:
+        lines = []
+        for key, label in _FEED_FILTER_LABELS:
+            enabled = bool(filters.get(key, True))
+            icon = "✅" if enabled else "❌"
+            state = "Enabled" if enabled else "Disabled"
+            lines.append(f"{icon} **{label}** — {state}")
+        return "\n".join(lines)
+
+    @feed.command(
+        name="filter",
+        description="View or toggle which activity categories this server's feed announces",
+    )
+    @app_commands.describe(
+        started="Announce when a followed profile starts playing a game",
+        finished="Announce when a followed profile finishes a game",
+        replays="Announce replay playthrough logs",
+        ratings="Announce explicit ratings and rating changes",
+        reviews="Announce written reviews",
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_channels=True)
+    async def feed_filter(
+        self,
+        interaction: discord.Interaction,
+        started: Optional[bool] = None,
+        finished: Optional[bool] = None,
+        replays: Optional[bool] = None,
+        ratings: Optional[bool] = None,
+        reviews: Optional[bool] = None,
+    ):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        await defer_interaction(interaction, ephemeral=True)
+        has_changes = any(
+            value is not None
+            for value in (started, finished, replays, ratings, reviews)
+        )
+        if has_changes:
+            filters = await self.bot.db.set_guild_feed_filters(
+                interaction.guild_id,
+                allow_started=started,
+                allow_finished=finished,
+                allow_replays=replays,
+                allow_ratings=ratings,
+                allow_reviews=reviews,
+            )
+            title = "Updated Server Feed Filters"
+            note = (
+                "Applies to newly discovered events only. Already-posted announcements "
+                "continue updating in place, and re-enabling a category never backfills older history."
+            )
+        else:
+            filters = await self.bot.db.get_guild_feed_filters(interaction.guild_id)
+            title = "Server Feed Filters"
+            note = (
+                "Use `/feed filter` options (for example `started:False`) to toggle "
+                "categories for this server."
+            )
+
+        disabled = self._disabled_feed_filter_labels(filters)
+        lines = [self._format_guild_feed_filters(filters), "", note]
+        if len(disabled) == len(_FEED_FILTER_LABELS):
+            lines.append("⚠️ All announcement categories are currently disabled for this server.")
+        embed = discord.Embed(
+            title=title,
+            description=clamp_escaped_text("\n".join(lines), 4096),
+            color=discord.Color.blurple(),
+        )
+        await send_private_followup(interaction, embed=embed, log=logger)
+
     @setchannel.error
     @unsetchannel.error
     @feed_add.error
     @feed_remove.error
     @feed_list.error
+    @feed_filter.error
     async def channel_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
             reply = "❌ You need the **Manage Channels** permission to configure or manage the server activity feed."

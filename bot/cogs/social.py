@@ -1,35 +1,37 @@
 """SocialCog: Handles /compare taste duel and similarity between users."""
 
 import asyncio
-from datetime import datetime, timezone
-from dataclasses import dataclass
-import discord
-from discord import app_commands
-from discord.ext import commands
 import logging
-from typing import Optional, Dict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+import discord
 from backloggd.analytics import calculate_similarity_raw
 from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
-from bot.input_validation import (
-    InvalidUsernameError,
-    escape_display_text,
-    normalize_backloggd_username,
-    parse_discord_member_id,
-)
-from bot.ui.embeds import create_compare_embed, create_taste_twins_embed
-from bot.ui.views import LinkButtonView, TasteTwinsView
-from bot.ui.helpers import build_backloggd_user_url
-from bot.recommendation_rules import numeric_ratings
-from bot.services.guild_membership import (
-    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-    resolve_guild_member_ids,
-)
+from discord import app_commands
+from discord.ext import commands
+
 from bot.command_errors import (
     defer_interaction,
     handle_component_error,
     send_private_followup,
     send_public_followup,
 )
+from bot.input_validation import (
+    InvalidUsernameError,
+    escape_display_text,
+    normalize_backloggd_username,
+    parse_discord_member_id,
+)
+from bot.recommendation_rules import (
+    build_comparison_highlights,
+    compute_taste_twin_candidates,
+    numeric_ratings,
+    resolve_display_title,
+    summarize_taste_twins,
+)
+from bot.services.cooldowns import guild_cooldown
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_aggregate_freshness,
@@ -37,7 +39,14 @@ from bot.services.freshness import (
     format_profile_freshness_line,
     summarize_aggregate_freshness,
 )
-from bot.services.task_lifecycle import await_owned_task
+from bot.services.guild_membership import (
+    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    resolve_guild_member_ids,
+)
+from bot.services.task_lifecycle import TaskDrainGroup
+from bot.ui.embeds import create_compare_embed, create_taste_twins_embed
+from bot.ui.helpers import build_backloggd_user_url
+from bot.ui.views import LinkButtonView, TasteTwinsView
 
 logger = logging.getLogger("backloggd.cogs.social")
 
@@ -81,41 +90,23 @@ class SocialCog(commands.Cog, name="Social"):
         self._live_library_semaphore = asyncio.Semaphore(self.live_fetch_concurrency)
         self._live_library_generations: Dict[str, _LiveFetchGeneration] = {}
         # Retired generations may still be unwinding after their last waiter leaves.
-        self._tracked_live_tasks: set[asyncio.Task] = set()
-        self._closing: bool = False
-        self._draining_task: Optional[asyncio.Task] = None
+        self._drain_group = TaskDrainGroup()
+        self._tracked_live_tasks: set[asyncio.Task] = self._drain_group.tasks
+
+    @property
+    def _closing(self) -> bool:
+        return self._drain_group.closing
+
+    @_closing.setter
+    def _closing(self, value: bool) -> None:
+        self._drain_group.closing = bool(value)
 
     async def close(self) -> None:
         """Idempotently cancel and drain all tracked live-library fetches."""
-        self._closing = True
-        current = asyncio.current_task()
-        draining = self._draining_task
-        if draining is not None and not draining.done():
-            await await_owned_task(draining)
-            return
-
-        async def _drain() -> None:
-            drain_task = asyncio.current_task()
-            while True:
-                pending = [
-                    task for task in list(self._tracked_live_tasks)
-                    if not task.done() and task is not current and task is not drain_task
-                ]
-                if not pending:
-                    break
-                for task in pending:
-                    if not task.cancelling():
-                        task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-            self._live_library_generations.clear()
-
-        draining = asyncio.create_task(_drain())
-        self._draining_task = draining
-        try:
-            await await_owned_task(draining)
-        finally:
-            if self._draining_task is draining and draining.done():
-                self._draining_task = None
+        await self._drain_group.close(
+            task_source=lambda: self._tracked_live_tasks,
+            after_drain=lambda _caller: self._live_library_generations.clear(),
+        )
 
     async def cog_unload(self) -> None:
         """Drain active live fetches when the cog is unloaded."""
@@ -225,6 +216,7 @@ class SocialCog(commands.Cog, name="Social"):
         user1="First user (Backloggd username or @mention)",
         user2="Optional second user (defaults to you if comparing with user1)"
     )
+    @guild_cooldown("compare")
     async def compare(
         self,
         interaction: discord.Interaction,
@@ -373,32 +365,13 @@ class SocialCog(commands.Cog, name="Social"):
                 if common_slugs and callable(slug_lookup)
                 else {}
             )
-            shared_loves = []
-            disagreements = []
-
-            for slug in common_slugs:
-                r1 = rated1[slug]
-                r2 = rated2[slug]
-                delta = abs(r1 - r2)
-                meta = cached_meta.get(slug)
-                cached_title = meta["title"] if meta else None
-                if not isinstance(cached_title, str) or not cached_title.strip():
-                    cached_title = None
-                live_title = snapshot1.titles.get(slug) or snapshot2.titles.get(slug)
-                if not isinstance(live_title, str) or not live_title.strip():
-                    live_title = None
-                title = cached_title.strip() if cached_title else (
-                    live_title.strip() if live_title else slug.replace("-", " ").title()
-                )
-                # Shared loves (both rated 4.0+)
-                if r1 >= 4.0 and r2 >= 4.0:
-                    shared_loves.append({"title": title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
-                # Disagreements (delta >= 1.0)
-                if delta >= 1.0:
-                    disagreements.append({"title": title, "r1": r1, "r2": r2, "delta": delta})
-
-            shared_loves.sort(key=lambda x: (-x["avg"], x["title"]))
-            disagreements.sort(key=lambda x: (-x["delta"], x["title"]))
+            fallback_titles = {
+                slug: (snapshot1.titles.get(slug) or snapshot2.titles.get(slug))
+                for slug in common_slugs
+            }
+            shared_loves, disagreements = build_comparison_highlights(
+                rated1, rated2, cached_meta, fallback_titles=fallback_titles
+            )
 
             line1 = format_profile_freshness_line(s1, label=safe_u1, unlinked_live=not sub1)
             line2 = format_profile_freshness_line(s2, label=safe_u2, unlinked_live=not sub2)
@@ -450,6 +423,8 @@ class SocialCog(commands.Cog, name="Social"):
     @app_commands.describe(
         user="Optional server member or Backloggd user to analyze (defaults to you)"
     )
+    @app_commands.guild_only()
+    @guild_cooldown("taste-twins")
     async def taste_twins(
         self,
         interaction: discord.Interaction,
@@ -609,58 +584,12 @@ class SocialCog(commands.Cog, name="Social"):
             other_profile_keys = [o["profile_key"] for o in other_linked]
             all_other_ratings = await self.bot.db.get_multi_profile_ratings_dict(other_profile_keys)
 
-            candidates = []
-            slugs_to_lookup = set()
-            enough_rated_profiles = False
-
-            for other in other_linked:
-                other_profile_key = other["profile_key"]
-                other_username = other["display_username"]
-                other_avatar = other["avatar_url"]
-                other_ratings = numeric_ratings(all_other_ratings.get(other_profile_key, {}))
-                if len(other_ratings) >= 5:
-                    enough_rated_profiles = True
-
-                # Similarity requires at least two shared numeric ratings.
-                common_slugs = list(set(my_numeric_ratings) & set(other_ratings))
-                if len(common_slugs) < 2:
-                    continue
-
-                final_score, _, _ = calculate_similarity_raw(my_numeric_ratings, other_ratings)
-                match_pct = int(round(final_score))
-
-                # Find top shared love (both rated >= 3.5)
-                shared_loves = [
-                    (s, (my_numeric_ratings[s] + other_ratings[s]) / 2.0)
-                    for s in common_slugs
-                    if my_numeric_ratings[s] >= 3.5 and other_ratings[s] >= 3.5
-                ]
-                shared_loves.sort(key=lambda x: x[1], reverse=True)
-                top_fav_slug = shared_loves[0][0] if shared_loves else None
-
-                # Find biggest disagreement
-                disagreements = [
-                    (s, abs(my_numeric_ratings[s] - other_ratings[s]))
-                    for s in common_slugs
-                ]
-                disagreements.sort(key=lambda x: x[1], reverse=True)
-                top_disagree_slug, max_delta = (disagreements[0][0], disagreements[0][1]) if disagreements else (None, 0.0)
-
-                if top_fav_slug:
-                    slugs_to_lookup.add(top_fav_slug)
-                if top_disagree_slug:
-                    slugs_to_lookup.add(top_disagree_slug)
-
-                candidates.append({
-                    "profile_key": other_profile_key,
-                    "username": other_username,
-                    "avatar_url": other_avatar,
-                    "match_pct": match_pct,
-                    "shared_count": len(common_slugs),
-                    "top_fav_slug": top_fav_slug,
-                    "top_disagree_slug": top_disagree_slug,
-                    "delta": max_delta,
-                })
+            candidates, slugs_to_lookup, enough_rated_profiles = compute_taste_twin_candidates(
+                my_numeric_ratings,
+                other_linked,
+                all_other_ratings,
+                similarity_fn=calculate_similarity_raw,
+            )
 
             if not candidates:
                 if enough_rated_profiles:
@@ -677,26 +606,15 @@ class SocialCog(commands.Cog, name="Social"):
             # 5. Batch resolve authentic game titles from cache
             cached_meta = await self.bot.db.get_games_by_slugs(list(slugs_to_lookup)) if slugs_to_lookup else {}
             for c in candidates:
-                if c["top_fav_slug"]:
-                    meta = cached_meta.get(c["top_fav_slug"])
-                    c["top_fav"] = meta["title"] if meta and meta["title"] else c["top_fav_slug"].replace("-", " ").title()
-                else:
-                    c["top_fav"] = None
+                c["top_fav"] = resolve_display_title(c["top_fav_slug"], cached_meta) if c["top_fav_slug"] else None
+                c["top_disagree"] = (
+                    resolve_display_title(c["top_disagree_slug"], cached_meta)
+                    if c["top_disagree_slug"]
+                    else None
+                )
 
-                if c["top_disagree_slug"]:
-                    meta = cached_meta.get(c["top_disagree_slug"])
-                    c["top_disagree"] = meta["title"] if meta and meta["title"] else c["top_disagree_slug"].replace("-", " ").title()
-                else:
-                    c["top_disagree"] = None
-
-            # 6. Sort candidates by similarity descending
-            candidates.sort(key=lambda x: (x["match_pct"], x["shared_count"]), reverse=True)
-
-            twins = candidates[:3]
-            # Nemesis is lowest match candidate if score is divergent (< 65%)
-            nemesis = candidates[-1] if len(candidates) > 1 and candidates[-1]["match_pct"] < 65 else None
-            server_avg_match = sum(c["match_pct"] for c in candidates) / len(candidates)
-
+            # 6. Rank candidates and derive twins, optional nemesis, and server average
+            twins, nemesis, server_avg_match = summarize_taste_twins(candidates)
             top_twin_name = twins[0]["username"] if twins else None
 
             # Interactive duel callback
@@ -722,28 +640,9 @@ class SocialCog(commands.Cog, name="Social"):
                         extra_meta = await slug_lookup(missing_slugs)
                         if extra_meta:
                             duel_meta.update(extra_meta)
-                    c_loves = []
-                    c_dis = []
-                    for s in sorted(c_slugs):
-                        r1 = my_numeric_ratings.get(s)
-                        r2 = t2_ratings.get(s)
-                        if r1 is None or r2 is None:
-                            continue
-                        d = abs(r1 - r2)
-                        meta_lookup = duel_meta.get(s)
-                        raw_title = meta_lookup["title"] if meta_lookup else None
-                        t_title = (
-                            raw_title.strip()
-                            if isinstance(raw_title, str) and raw_title.strip()
-                            else s.replace("-", " ").title()
-                        )
-                        if r1 >= 4.0 and r2 >= 4.0:
-                            c_loves.append({"title": t_title, "r1": r1, "r2": r2, "avg": (r1 + r2) / 2})
-                        if d >= 1.0:
-                            c_dis.append({"title": t_title, "r1": r1, "r2": r2, "delta": d})
-
-                    c_loves.sort(key=lambda x: (-x["avg"], x["title"]))
-                    c_dis.sort(key=lambda x: (-x["delta"], x["title"]))
+                    c_loves, c_dis = build_comparison_highlights(
+                        my_numeric_ratings, t2_ratings, duel_meta
+                    )
                     l1 = format_profile_freshness_line(target_status, label=safe_target, unlinked_live=not target_subscribed)
                     l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=escape_display_text(top_twin_name))
                     duel_freshness = " · ".join(line for line in (l1, l2) if line) or None

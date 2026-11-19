@@ -1,20 +1,58 @@
 """Entry point script for the Backloggd Discord bot."""
 
 import asyncio
+import json
 import logging
 import os
+import signal
 import sys
+from datetime import datetime, timezone
 from typing import Any, Optional
+
 from aiohttp import web
+
 from bot.client import BackloggdBot
 from bot.config import DISCORD_TOKEN
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+_PLAIN_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+class JsonLogFormatter(logging.Formatter):
+    """Format log records as single-line JSON objects for structured log collectors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        elif record.exc_text:
+            payload["exc_info"] = record.exc_text
+        if record.stack_info:
+            payload["stack_info"] = self.formatStack(record.stack_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def build_log_formatter(log_format: Optional[str] = None) -> logging.Formatter:
+    """Return a JSON formatter when LOG_FORMAT=json, otherwise the default plain-text formatter."""
+    selected = (os.getenv("LOG_FORMAT", "") if log_format is None else log_format).strip().lower()
+    if selected == "json":
+        return JsonLogFormatter()
+    return logging.Formatter(_PLAIN_LOG_FORMAT)
+
+
+def configure_logging(log_format: Optional[str] = None, *, force: bool = True) -> logging.Handler:
+    """Configure stdout logging using LOG_FORMAT (plain text by default, or json)."""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(build_log_formatter(log_format))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=force)
+    return handler
+
+
+configure_logging(force=False)
 logger = logging.getLogger("backloggd.main")
 
 SERVICE_NAME = "backloggd-discord-bot"
@@ -51,6 +89,11 @@ async def handle_health_check(request: web.Request) -> web.Response:
     revision = get_deployed_revision()
     if revision is not None:
         payload["revision"] = revision
+    session_health = getattr(bot, "session_health", None)
+    if session_health is not None:
+        get_metadata = getattr(session_health, "get_health_metadata", None)
+        if callable(get_metadata):
+            payload.update(get_metadata())
     return web.json_response(payload, status=http_status)
 
 
@@ -95,14 +138,49 @@ async def main():
 
     bot = BackloggdBot()
     runner = None
+    loop = asyncio.get_running_loop()
+    shutdown_tasks: set[asyncio.Task[Any]] = set()
+    sigterm_registered = False
+
+    def _on_shutdown_task_done(task: asyncio.Task[Any]) -> None:
+        shutdown_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.error("Error during signal-triggered bot shutdown", exc_info=exc)
+
+    def _handle_sigterm() -> None:
+        if shutdown_tasks or getattr(bot, "_closing", False) is True:
+            return
+        logger.info("Received SIGTERM; initiating graceful shutdown.")
+        task = loop.create_task(bot.close())
+        shutdown_tasks.add(task)
+        task.add_done_callback(_on_shutdown_task_done)
+
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        try:
+            loop.add_signal_handler(sigterm, _handle_sigterm)
+            sigterm_registered = True
+        except NotImplementedError:
+            pass
+
     try:
         async with bot:
             # Hosting platforms can request a health server through PORT.
             port_env = os.getenv("PORT")
             if port_env and port_env.isdigit():
                 runner = await start_health_server(int(port_env), bot=bot)
-            await bot.start(DISCORD_TOKEN)
+            if getattr(bot, "_closing", False) is not True:
+                await bot.start(DISCORD_TOKEN)
     finally:
+        if sigterm_registered and sigterm is not None:
+            try:
+                loop.remove_signal_handler(sigterm)
+            except (NotImplementedError, ValueError):
+                pass
+        if shutdown_tasks:
+            await asyncio.gather(*shutdown_tasks, return_exceptions=True)
         if runner:
             await runner.cleanup()
 

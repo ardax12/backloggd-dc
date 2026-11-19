@@ -35,8 +35,8 @@ Multiple members may connect the same public Backloggd profile. The bot counts t
 | `/compare` | Compare two profiles' ratings and shared favorites. |
 | `/taste-twins` | Find the server members whose game tastes are closest to yours. |
 | `/roulette [member] [pool]` | Pick an unrated game from a linked member's backlog, wishlist, or both (e.g. `/roulette pool:Backlog`). |
-| `/recommend [member]` | Find games you might enjoy, or suggest your favorites to a member. |
-| `/server-top` | Browse highest-rated, most-played, polarizing, hidden-gem, and backlog rankings. |
+| `/recommend [member] [pool]` | Find games you might enjoy, or suggest your favorites to a member (optionally filtered to Backlog/Wishlist). |
+| `/server-top [mode] [min_ratings]` | Browse paginated server rankings (up to top 50) across highest-rated, most-played, polarizing, hidden-gem, and backlog modes. |
 | `/server-stats` | See community totals and how recently the libraries were updated. |
 | `/link` | Connect a Backloggd profile and join the current server's feed. |
 | `/unlink` | Disconnect your profile. Existing announcements remain as an archive. |
@@ -52,6 +52,15 @@ Admins with **Manage Channels** can also use:
 | `/unsetchannel` | Pause the server's feed without deleting old announcements. |
 | `/feed add` / `/feed remove` | Follow or unfollow any public Backloggd profile. |
 | `/feed list` | Browse followed profiles and their feed status. |
+| `/feed filter` | View or toggle which activity categories (started, finished, replays, ratings, reviews) this server announces. |
+
+Moderators with **Administrator**, **Manage Server**, **Manage Channels**, or **Moderate Members** can also use:
+
+| Command | What it does |
+| --- | --- |
+| `/cooldown view` | View current per-command cooldown durations and allowed ranges in this server. |
+| `/cooldown set` | Set a custom server cooldown for a scraping-heavy command (within safe bounds). |
+| `/cooldown reset` | Reset one or all custom server cooldowns back to their defaults. |
 
 Admin follows are separate from member preferences. `/feed off` does not remove an admin follow, and `/feed remove` does not unlink a member. Profiles followed only by an admin do not enter server statistics or library comparisons.
 
@@ -163,7 +172,7 @@ Use the connection URL and access token supplied by your database host. The endp
 
 **Back up before updating the bot.** For SQLite, stop the bot cleanly and copy the database together with any matching `-wal` and `-shm` files. With Docker, back up the database inside the mounted volume. For a remote database, use your host's snapshot or export tools.
 
-Database upgrades run automatically on startup (currently schema versions 1-11). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
+Database upgrades run automatically on startup (currently schema versions 1-13). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
 
 ## How updates and announcements work
 
@@ -173,7 +182,7 @@ Database upgrades run automatically on startup (currently schema versions 1-11).
 
 **Feed setup:** The first successful activity and journal checks establish a starting point silently. The bot checks journal page 1 every five minutes, including at setup and after an outage. Backdated entries, edits, or missed entries that stay on later pages may go unnoticed.
 
-**What gets announced:** Started/Finished milestones, identifiable replays, explicit ratings, rating changes, and written reviews. Ordinary daily sessions, backlog/wishlist changes, likes, follows, comments, badges, and lists are hidden. Related events are combined where they can be matched safely.
+**What gets announced:** Started/Finished milestones, identifiable replays, explicit ratings, rating changes, and written reviews. Ordinary daily sessions, backlog/wishlist changes, likes, follows, comments, badges, and lists are hidden. Related events are combined where they can be matched safely. Server admins can use `/feed filter` to disable specific categories for new events without affecting in-place edits of already-posted messages or backfilling history if re-enabled later.
 
 **Backdated entries:** Newly discovered playthrough milestones more than seven UTC calendar days old are suppressed. Recent backdated milestones keep Started/Finished in the title and show the played date. A new rating or review can still be announced independently of an older milestone.
 

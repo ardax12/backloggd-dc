@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Iterable, Optional, Sequence
 from urllib.parse import urljoin, urlsplit
 

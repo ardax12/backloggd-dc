@@ -1,28 +1,23 @@
 """Constructors for all Backloggd Discord Embeds."""
 
 import re
+from typing import Any, List, Optional
+
 import discord
-from typing import List, Optional, Any
-from bot.config import (
-    COLOR_PRIMARY,
-    COLOR_GOLD,
-    COLOR_PLAYED,
-    COLOR_PLAYING,
-    COLOR_WISHLIST,
-    COLOR_MUTED,
-    COLOR_ERROR
-)
+
+from bot.config import COLOR_ERROR, COLOR_GOLD, COLOR_PLAYED, COLOR_PRIMARY
 from bot.input_validation import escape_display_text
 from bot.ui.helpers import (
-    rating_to_stars,
-    format_number,
-    format_status,
+    DEFAULT_BACKLOGGD_AVATAR,
     build_backloggd_game_url,
     build_backloggd_user_url,
-    clean_image_url,
     clamp_escaped_text,
-    DEFAULT_BACKLOGGD_AVATAR
+    clean_image_url,
+    format_number,
+    format_status,
+    rating_to_stars,
 )
+
 
 def append_freshness_note(embed: discord.Embed, note: Optional[str]) -> None:
     """Append a single subdued line, keeping relative timestamps renderable."""
@@ -49,7 +44,7 @@ def create_game_embed(
     """Construct embed for /game command with one rating row per server profile."""
     game_url = build_backloggd_game_url(game.slug)
     title = f"{game.title} ({game.release_year})" if game.release_year else game.title
-    
+
     embed = discord.Embed(
         title=title[:256],
         url=game_url,
@@ -150,7 +145,7 @@ def create_profile_embed(
 ) -> discord.Embed:
     """Construct embed for /profile command with clean formatting and top-left avatar."""
     user_url = build_backloggd_user_url(profile.username)
-    
+
     # Filter special role badges for title (VIP, Patron, Supporter, Founder, Mod)
     special_roles = {"vip": "VIP", "patron": "Patron", "supporter": "Supporter", "founder": "Founder", "mod": "Mod"}
     title_badges = []
@@ -420,6 +415,10 @@ def create_server_top_embed(
     mode: str,
     guild_name: str,
     freshness_note: Optional[str] = None,
+    *,
+    page: int = 1,
+    per_page: int = 10,
+    min_ratings: int = 2,
 ) -> discord.Embed:
     """Construct embed for /server-top leaderboards."""
     embed = discord.Embed(
@@ -427,15 +426,31 @@ def create_server_top_embed(
         color=COLOR_PRIMARY
     )
 
+    show_min_ratings = mode in ("highest_rated", "polarizing") and min_ratings != 2
+
     if not entries:
-        embed.description = "*Not enough server data to generate this leaderboard yet.*"
+        if show_min_ratings:
+            noun = "rating" if min_ratings == 1 else "ratings"
+            embed.description = (
+                f"*Not enough server data to generate this leaderboard yet "
+                f"(minimum {min_ratings} profile {noun} required).*"
+            )
+        else:
+            embed.description = "*Not enough server data to generate this leaderboard yet.*"
         append_freshness_note(embed, freshness_note)
         return embed
 
+    page_size = max(1, int(per_page))
+    total_pages = max(1, (len(entries) + page_size - 1) // page_size)
+    current_page = max(1, min(int(page), total_pages))
+    start_idx = (current_page - 1) * page_size
+    page_entries = entries[start_idx : start_idx + page_size]
+
     lines = []
     medals = ["🥇", "🥈", "🥉"]
-    for i, row in enumerate(entries, 1):
-        prefix = medals[i - 1] if i <= 3 else f"`#{i}`"
+    for offset, row in enumerate(page_entries):
+        rank = start_idx + offset + 1
+        prefix = medals[rank - 1] if rank <= 3 else f"`#{rank}`"
         game_title = escape_display_text(row["title"])
         slug = row["slug"]
         url = build_backloggd_game_url(slug)
@@ -463,7 +478,16 @@ def create_server_top_embed(
 
     embed.description = clamp_escaped_text("\n".join(lines), 4096)
     append_freshness_note(embed, freshness_note)
-    embed.set_footer(text=f"Server rankings across distinct Backloggd profiles linked in {guild_name}"[:2048])
+
+    footer_parts: list[str] = []
+    if total_pages > 1:
+        footer_parts.append(f"Page {current_page}/{total_pages}")
+    if show_min_ratings:
+        noun = "rating" if min_ratings == 1 else "ratings"
+        footer_parts.append(f"Min {min_ratings} {noun}")
+    base_footer = f"Server rankings across distinct Backloggd profiles linked in {guild_name}"
+    footer_text = f"{' · '.join(footer_parts)} · {base_footer}" if footer_parts else base_footer
+    embed.set_footer(text=footer_text[:2048])
     return embed
 
 def create_server_stats_embed(

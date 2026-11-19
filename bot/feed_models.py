@@ -1,6 +1,7 @@
 """Discord announcement state layered over the SDK's scraped activity model."""
 from dataclasses import asdict, dataclass
 from typing import Optional
+
 from backloggd import ActivityEntry
 
 GROUPED_RATING_ID_PREFIX = "group_rating_"

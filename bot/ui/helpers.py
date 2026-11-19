@@ -1,10 +1,11 @@
 """Formatting helpers for stars, status badges, numbers, and Backloggd URLs."""
 
 import re
-from typing import Any, Optional
 import urllib.parse
+from typing import Any, Optional
 
 from bot.input_validation import escape_display_text
+
 
 def rating_to_stars(rating: Optional[float], max_stars: int = 5) -> str:
     """
@@ -12,7 +13,7 @@ def rating_to_stars(rating: Optional[float], max_stars: int = 5) -> str:
     """
     if rating is None:
         return "☆☆☆☆☆"
-    
+
     full_stars = int(rating)
     decimal = rating - full_stars
     has_half = decimal >= 0.25 and decimal < 0.75

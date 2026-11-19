@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
-import json
 from typing import TYPE_CHECKING, Any
 
 from bot.feed_policy import FEED_DECISION_PRIORITY, classify_feed_event, parse_utc_datetime

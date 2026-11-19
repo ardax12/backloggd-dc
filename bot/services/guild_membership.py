@@ -136,7 +136,7 @@ def get_membership_service(bot) -> GuildMembershipService:
         return service
     service = GuildMembershipService()
     try:
-        setattr(bot, "guild_membership", service)
+        bot.guild_membership = service
     except Exception:
         pass
     return service

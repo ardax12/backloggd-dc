@@ -1,29 +1,31 @@
 """UsersCog: Handles /profile command displaying stats, metrics, and favorite games."""
 
 import asyncio
+import logging
 from datetime import datetime, timezone
+from typing import Optional
+
 import discord
+from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
 from discord import app_commands
 from discord.ext import commands
-import logging
-from typing import Optional
-from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
+
+from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.input_validation import (
     InvalidUsernameError,
     escape_display_text,
     normalize_backloggd_username,
     parse_discord_member_id,
 )
-from bot.ui.embeds import create_profile_embed
-from bot.ui.views import LinkButtonView
-from bot.ui.helpers import build_backloggd_review_url, build_backloggd_user_url
-from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
+from bot.services.cooldowns import guild_cooldown
 from bot.services.freshness import (
     ensure_profiles_fresh,
     format_profile_freshness_line,
     valid_played_count,
 )
-from bot.services.library_sync import PLAYING_SINGLE_PAGE_LIMIT
+from bot.ui.embeds import create_profile_embed
+from bot.ui.helpers import build_backloggd_review_url, build_backloggd_user_url
+from bot.ui.views import LinkButtonView
 
 logger = logging.getLogger("backloggd.cogs.users")
 
@@ -43,6 +45,7 @@ class UsersCog(commands.Cog, name="Users"):
 
     @app_commands.command(name="profile", description="View a Backloggd user's profile, library stats, and favorite games")
     @app_commands.describe(user="Optional: Mention a server member or provide a Backloggd username (defaults to you)")
+    @guild_cooldown("profile")
     async def profile(self, interaction: discord.Interaction, user: Optional[str] = None):
         await defer_interaction(interaction)
 
@@ -137,18 +140,6 @@ class UsersCog(commands.Cog, name="Users"):
                     counts_observed_at = self.clock()
                 except Exception as error:
                     logger.debug("Collection counts unavailable for %s: %s", canonical_username, type(error).__name__)
-            elif "playing" in missing_counts:
-                # SDK 0.2.3 predates the Games tab counters API.
-                try:
-                    playing = await asyncio.wait_for(
-                        self.bot.backloggd.get_user_playing(canonical_username), timeout=5.0,
-                    )
-                    # This SDK call returns one page and does not prove empty
-                    # or potentially truncated responses are complete.
-                    if 0 < len(playing) < PLAYING_SINGLE_PAGE_LIMIT:
-                        collection_counts["playing"] = len(playing)
-                except Exception as error:
-                    logger.debug("Playing count unavailable for %s: %s", canonical_username, type(error).__name__)
             played_observed_at = profile_observed_at
             authoritative_played = None
             if played_observed_at is not None:
