@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import discord
 from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
@@ -23,9 +23,10 @@ from bot.services.freshness import (
     format_profile_freshness_line,
     valid_played_count,
 )
+from bot.services.session_health import report_upstream_failure, report_upstream_success
 from bot.ui.embeds import create_profile_embed
 from bot.ui.helpers import build_backloggd_review_url, build_backloggd_user_url
-from bot.ui.views import LinkButtonView
+from bot.ui.views import ProfileCardView
 
 logger = logging.getLogger("backloggd.cogs.users")
 
@@ -33,6 +34,25 @@ class UsersCog(commands.Cog, name="Users"):
     def __init__(self, bot, *, clock=None):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._profile_context_menu = app_commands.ContextMenu(
+            name="View Backloggd Profile",
+            callback=self._context_view_profile,
+        )
+        app_commands.guild_only()(self._profile_context_menu)
+        guild_cooldown("profile")(self._profile_context_menu)
+
+    async def cog_load(self) -> None:
+        tree = getattr(self.bot, "tree", None)
+        if tree is not None:
+            tree.add_command(self._profile_context_menu, override=True)
+
+    async def cog_unload(self) -> None:
+        tree = getattr(self.bot, "tree", None)
+        if tree is not None:
+            tree.remove_command(
+                self._profile_context_menu.name,
+                type=self._profile_context_menu.type,
+            )
 
     async def _load_profile(self, username: str):
         sdk = self.bot.backloggd
@@ -43,11 +63,31 @@ class UsersCog(commands.Cog, name="Users"):
         profile = await sdk.get_user_profile(username, force_refresh=True)
         return profile, self.clock()
 
+    async def _context_view_profile(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+    ) -> None:
+        if getattr(member, "bot", False):
+            msg = "🤖 Bots don't have Backloggd profiles."
+            is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+            if callable(is_done) and is_done():
+                await send_private_followup(interaction, msg, log=logger)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+        await self._execute_profile(interaction, f"<@{member.id}>")
+
     @app_commands.command(name="profile", description="View a Backloggd user's profile, library stats, and favorite games")
     @app_commands.describe(user="Optional: Mention a server member or provide a Backloggd username (defaults to you)")
     @guild_cooldown("profile")
     async def profile(self, interaction: discord.Interaction, user: Optional[str] = None):
-        await defer_interaction(interaction)
+        await self._execute_profile(interaction, user)
+
+    async def _execute_profile(self, interaction: discord.Interaction, user: Optional[str] = None):
+        is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+        if not (callable(is_done) and is_done()):
+            await defer_interaction(interaction)
 
         target_username = None
         target_discord_id = None
@@ -98,6 +138,18 @@ class UsersCog(commands.Cog, name="Users"):
             journal_entries = results[1] if not isinstance(results[1], Exception) and isinstance(results[1], list) else []
             user_reviews = results[2] if not isinstance(results[2], Exception) and isinstance(results[2], list) else []
 
+            upstream_failed = False
+            for item in results:
+                if isinstance(item, Exception) and not isinstance(item, (UserNotFoundError, ResourceNotFoundError)):
+                    if report_upstream_failure(self.bot, item) is not None:
+                        upstream_failed = True
+            if not upstream_failed and (
+                profile_observed_at is not None
+                or not isinstance(results[1], Exception)
+                or not isinstance(results[2], Exception)
+            ):
+                report_upstream_success(self.bot)
+
             if profile_error:
                 if isinstance(profile_error, (UserNotFoundError, ResourceNotFoundError)):
                     await send_private_followup(
@@ -138,7 +190,9 @@ class UsersCog(commands.Cog, name="Users"):
                 try:
                     collection_counts = await asyncio.wait_for(counts_method(canonical_username), timeout=5.0)
                     counts_observed_at = self.clock()
+                    report_upstream_success(self.bot)
                 except Exception as error:
+                    report_upstream_failure(self.bot, error)
                     logger.debug("Collection counts unavailable for %s: %s", canonical_username, type(error).__name__)
             played_observed_at = profile_observed_at
             authoritative_played = None
@@ -148,7 +202,9 @@ class UsersCog(commands.Cog, name="Users"):
                 authoritative_played = valid_played_count(collection_counts.get("played"))
                 played_observed_at = counts_observed_at
             if authoritative_played is not None:
-                played_updater = getattr(self.bot.db, "update_profile_played_count", None)
+                played_updater: Optional[Callable[..., Any]] = getattr(
+                    self.bot.db, "update_profile_played_count", None
+                )
                 if callable(played_updater):
                     try:
                         await played_updater(
@@ -216,13 +272,78 @@ class UsersCog(commands.Cog, name="Users"):
                 review_url = build_backloggd_review_url(profile_data.username, latest_review.review_id)
                 extra_buttons.append(("Read Latest Review", review_url))
 
-            view = LinkButtonView(
-                label="View Profile on Backloggd",
-                url=build_backloggd_user_url(profile_data.username),
-                extra_buttons=extra_buttons if extra_buttons else None
+            async def _reply_ephemeral(btn_interaction: discord.Interaction, message: str) -> None:
+                is_done_fn = getattr(getattr(btn_interaction, "response", None), "is_done", None)
+                if callable(is_done_fn) and is_done_fn():
+                    await send_private_followup(btn_interaction, message, log=logger)
+                else:
+                    await btn_interaction.response.send_message(message, ephemeral=True)
+
+            async def on_compare(btn_interaction: discord.Interaction) -> None:
+                get_cog: Optional[Callable[..., Any]] = getattr(self.bot, "get_cog", None)
+                social_cog: Any = get_cog("Social") if callable(get_cog) else None
+                if social_cog is None or not hasattr(social_cog, "_execute_compare"):
+                    await _reply_ephemeral(btn_interaction, "❌ Taste comparison is currently unavailable.")
+                    return
+
+                linked_caller = await self.bot.db.get_linked_user(btn_interaction.user.id)
+                if not linked_caller:
+                    await _reply_ephemeral(
+                        btn_interaction,
+                        "❌ You haven't linked your Backloggd account yet! Use `/link <username>` first.",
+                    )
+                    return
+
+                caller_key = str(linked_caller["backloggd_username"]).strip().lower()
+                if caller_key == canonical_key:
+                    await _reply_ephemeral(
+                        btn_interaction,
+                        "ℹ️ Both inputs resolve to the same Backloggd profile, so there is no separate profile to compare.",
+                    )
+                    return
+
+                cooldowns = getattr(self.bot, "cooldowns", None)
+                check_cd: Optional[Callable[..., Any]] = getattr(
+                    cooldowns, "check_component_cooldown", None
+                )
+                if callable(check_cd):
+                    retry_after = await check_cd(
+                        btn_interaction,
+                        "compare",
+                        db=getattr(self.bot, "db", None),
+                    )
+                    if retry_after is not None:
+                        await _reply_ephemeral(
+                            btn_interaction,
+                            f"⏳ Slow down! Please try comparing again in **{retry_after:.1f}s**.",
+                        )
+                        return
+
+                await social_cog._execute_compare(btn_interaction, canonical_username, None)
+
+            async def on_roulette(btn_interaction: discord.Interaction) -> None:
+                get_cog: Optional[Callable[..., Any]] = getattr(self.bot, "get_cog", None)
+                discovery_cog: Any = get_cog("Discovery") if callable(get_cog) else None
+                if discovery_cog is None or not hasattr(discovery_cog, "_execute_roulette_for_profile"):
+                    await _reply_ephemeral(btn_interaction, "❌ Backlog roulette is currently unavailable.")
+                    return
+
+                await discovery_cog._execute_roulette_for_profile(
+                    btn_interaction,
+                    profile_key=canonical_key,
+                    username=canonical_username,
+                    pool="Both",
+                    discord_id=target_discord_id,
+                )
+
+            view = ProfileCardView(
+                profile_url=build_backloggd_user_url(profile_data.username),
+                extra_links=extra_buttons if extra_buttons else None,
+                on_compare=on_compare,
+                on_roulette=on_roulette if subscribed else None,
             )
 
-            await send_public_followup(interaction, embed=embed, view=view)
+            view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
         except Exception as e:
             logger.error("Error looking up profile for '%s': %s", target_username, e, exc_info=True)

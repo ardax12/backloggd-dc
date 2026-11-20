@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from bot.input_validation import escape_display_text
 from bot.services.library_sync import (
@@ -147,7 +147,7 @@ async def _fetch_sync_info_map(db: Any, profiles: dict[str, tuple[str, Any]]) ->
     if missing_keys:
         result.update(await db.get_profiles_sync_info(missing_keys))
     if missing_token_keys:
-        token_getter = getattr(db, "get_profiles_refresh_pending_tokens", None)
+        token_getter: Optional[Callable[..., Any]] = getattr(db, "get_profiles_refresh_pending_tokens", None)
         if callable(token_getter):
             token_map = await token_getter(missing_token_keys)
             for key in missing_token_keys:
@@ -213,7 +213,7 @@ async def ensure_profiles_fresh(
     }
     stale_keys = [key for key, status in statuses.items() if status.stale]
     subscription_evidence: dict[str, bool] = {}
-    if service is not None and require_subscribed and subscribed is None and stale_keys:
+    if db is not None and service is not None and require_subscribed and subscribed is None and stale_keys:
         fetched_subscriptions = await db.get_profiles_library_subscription_map(stale_keys)
         subscription_evidence = {
             key: bool(fetched_subscriptions[key])

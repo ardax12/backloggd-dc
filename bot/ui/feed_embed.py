@@ -24,6 +24,7 @@ def create_journal_feed_embed(
     entry: Any,
     *,
     now: datetime | None = None,
+    force_spoiler_reviews: bool = False,
 ) -> discord.Embed:
     """Construct embed for an automatic playthrough journal or activity log announcement."""
     user_url = build_backloggd_user_url(username)
@@ -115,7 +116,7 @@ def create_journal_feed_embed(
     # Review notes or written thoughts if present
     notes = getattr(entry, "review_notes", None)
     if notes:
-        has_spoilers = bool(getattr(entry, "has_spoilers", False))
+        has_spoilers = bool(getattr(entry, "has_spoilers", False)) or bool(force_spoiler_reviews)
         normalized = str(notes).replace("\r\n", "\n").replace("\r", "\n")
         escaped_notes = escape_display_text(normalized)
         wrapped_notes = f"||{escaped_notes}||" if has_spoilers else escaped_notes

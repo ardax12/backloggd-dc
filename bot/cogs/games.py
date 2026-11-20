@@ -15,11 +15,13 @@ from discord.ext import commands
 
 from bot.command_errors import defer_interaction, send_private_followup, send_public_followup
 from bot.input_validation import escape_display_text
+from bot.services.cooldowns import guild_cooldown
 from bot.services.freshness import resolve_guild_aggregate_freshness
 from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
+from bot.services.session_health import report_upstream_failure, report_upstream_success
 from bot.ui.embeds import create_game_embed
 from bot.ui.helpers import build_backloggd_game_url, clamp_escaped_text, truncate_button_label
 from bot.ui.views import GameCardView, GamePickerView, RatingsView
@@ -198,6 +200,7 @@ class GamesCog(commands.Cog, name="Games"):
                 self.bot.backloggd.search_games(clean_query),
                 timeout=self._autocomplete_timeout_seconds,
             )
+            report_upstream_success(self.bot)
             choices = []
             for g in results[:15]:  # Discord limit is 25, 15 keeps it fast
                 name = f"{g.title} ({g.release_year})" if g.release_year else g.title
@@ -231,12 +234,14 @@ class GamesCog(commands.Cog, name="Games"):
             )
             return []
         except Exception as e:
+            report_upstream_failure(self.bot, e)
             logger.warning("Autocomplete search error for '%s': %s", clean_query, e)
             return []
 
     @app_commands.command(name="game", description="Search for a game and view Backloggd ratings & server member scores")
     @app_commands.describe(title="Type game title to search with live autocomplete")
     @app_commands.autocomplete(title=game_autocomplete)
+    @guild_cooldown("game")
     async def game(self, interaction: discord.Interaction, title: str):
         query = title.strip()
         # A free-text search can end in a private selection menu.
@@ -278,6 +283,7 @@ class GamesCog(commands.Cog, name="Games"):
                     return
             else:
                 search_results = await self.bot.backloggd.search_games(query)
+                report_upstream_success(self.bot)
                 candidates = _build_picker_candidates(search_results or [])
                 if not candidates:
                     safe_query = _format_display_excerpt(query)
@@ -314,6 +320,7 @@ class GamesCog(commands.Cog, name="Games"):
             await self._load_and_render_game(interaction, slug)
 
         except Exception as e:
+            report_upstream_failure(self.bot, e)
             logger.error("Error looking up game '%s': %s", title, e, exc_info=True)
             safe_title = _format_display_excerpt(query or title)
             await send_private_followup(
@@ -327,7 +334,12 @@ class GamesCog(commands.Cog, name="Games"):
 
     async def _load_and_render_game(self, interaction: discord.Interaction, slug: str) -> bool:
         """Load game details, resolve server ratings and freshness, and post the public card."""
-        game_data = await self.bot.backloggd.get_game(slug)
+        try:
+            game_data = await self.bot.backloggd.get_game(slug)
+        except Exception as error:
+            report_upstream_failure(self.bot, error)
+            raise
+        report_upstream_success(self.bot)
         if not game_data:
             safe_slug = _format_display_excerpt(slug)
             await send_private_followup(
@@ -384,8 +396,10 @@ class GamesCog(commands.Cog, name="Games"):
                         timeout=4.0,
                     )
                 except Exception as error:
+                    report_upstream_failure(self.bot, error)
                     logger.debug("Live game rating unavailable for %s: %s", game_data.slug, type(error).__name__)
                 else:
+                    report_upstream_success(self.bot)
                     if rating is not None:
                         server_ratings = list(server_ratings)
                         server_ratings[index] = {**dict(row), "rating": rating}

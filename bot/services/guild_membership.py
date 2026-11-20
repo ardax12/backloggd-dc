@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("backloggd.membership")
 
@@ -42,7 +42,7 @@ class GuildMembershipService:
 
     async def _chunk_guild(self, guild) -> Optional[list]:
         guild_id = getattr(guild, "id", None)
-        chunk_fn = getattr(guild, "chunk", None)
+        chunk_fn: Optional[Callable[..., Any]] = getattr(guild, "chunk", None)
         if not callable(chunk_fn):
             logger.warning("Guild %s cache is incomplete and exposes no chunk()", guild_id)
             return None
@@ -117,6 +117,12 @@ class GuildMembershipService:
         if members is None:
             return None
         return [member.id for member in members]
+
+    def evict_guild(self, guild_id: int) -> None:
+        """Cancel and drop any in-flight member chunk task for a removed guild."""
+        task = self._inflight.pop(guild_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def close(self) -> None:
         """Cancel any active chunk tasks and wait for clean teardown."""

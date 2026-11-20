@@ -28,6 +28,8 @@ COOLDOWN_SPECS: dict[str, CooldownSpec] = {
     "recommend": CooldownSpec("recommend", 15, 5, 3600, per_guild=False, scope_label="per member"),
     "profile": CooldownSpec("profile", 10, 5, 3600, per_guild=False, scope_label="per member"),
     "server-top": CooldownSpec("server-top", 10, 5, 3600, per_guild=False, scope_label="per member"),
+    "playing": CooldownSpec("playing", 10, 5, 3600, per_guild=False, scope_label="per member"),
+    "game": CooldownSpec("game", 5, 3, 3600, per_guild=False, scope_label="per member"),
 }
 
 CooldownCommandName = Literal[
@@ -38,6 +40,8 @@ CooldownCommandName = Literal[
     "recommend",
     "profile",
     "server-top",
+    "playing",
+    "game",
 ]
 
 
@@ -237,6 +241,54 @@ class GuildCooldownService:
                     self._cache[guild_id].pop(target_name, None)
             self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
         return int(removed)
+
+    async def check_component_cooldown(
+        self,
+        interaction: discord.Interaction,
+        command_name: str,
+        *,
+        db: Any = None,
+    ) -> Optional[float]:
+        """Enforce a command's per-guild cooldown for interactive components.
+
+        Returns remaining seconds when rate-limited, or None when allowed.
+        """
+        import time
+
+        spec = get_cooldown_spec(command_name)
+        guild_id = getattr(interaction, "guild_id", None)
+        user_id = getattr(getattr(interaction, "user", None), "id", 0)
+        seconds = await self.get_cooldown_seconds(guild_id, spec.command_name, db=db)
+        generation = self.get_generation(guild_id)
+
+        created_at = getattr(interaction, "created_at", None)
+        now_ts = created_at.timestamp() if created_at is not None else time.monotonic()
+
+        bucket_map: dict[tuple, float] | None = getattr(self, "_component_last_used", None)
+        if bucket_map is None:
+            bucket_map = {}
+            self._component_last_used = bucket_map
+
+        if guild_id is None:
+            key = ("dm", user_id, spec.command_name, 0)
+        elif spec.per_guild:
+            key = ("guild", guild_id, spec.command_name, generation)
+        else:
+            key = ("member", guild_id, user_id, spec.command_name, generation)
+
+        last_ts = bucket_map.get(key)
+        if last_ts is not None:
+            elapsed = now_ts - last_ts
+            if 0 <= elapsed < seconds:
+                return float(seconds - elapsed)
+
+        if len(bucket_map) >= 2048:
+            cutoff = now_ts - 3600.0
+            for stale_key in [k for k, ts in bucket_map.items() if ts < cutoff]:
+                bucket_map.pop(stale_key, None)
+
+        bucket_map[key] = now_ts
+        return None
 
 
 _DEFAULT_COOLDOWN_SERVICE = GuildCooldownService()

@@ -17,6 +17,19 @@ DEFAULT_GUILD_FEED_FILTERS: dict[str, bool] = {
     key: True for key in FEED_FILTER_KEYS
 }
 
+GUILD_FEED_OPTION_KEYS = (
+    "spoiler_reviews",
+)
+
+DEFAULT_GUILD_FEED_OPTIONS: dict[str, bool] = {
+    "spoiler_reviews": False,
+}
+
+DEFAULT_GUILD_FEED_SETTINGS: dict[str, bool] = {
+    **DEFAULT_GUILD_FEED_FILTERS,
+    **DEFAULT_GUILD_FEED_OPTIONS,
+}
+
 FEED_DECISION_PRIORITY = {
     "suppressed_pre_activation": 0,
     "suppressed_old": 1,

@@ -1,5 +1,7 @@
 """Server leaderboard and community statistics queries for Database."""
 
+import json
+from datetime import datetime, timezone
 from typing import Any, Iterable, List
 
 MAX_SQL_BIND_PARAMS = 800
@@ -400,3 +402,215 @@ async def get_server_stats_for_profiles(
         result["total_logged"] = total_logged
         result["total_played"] = total_played
     return result
+
+
+async def get_server_currently_playing_for_profiles(
+    db: Any,
+    profile_keys: List[str],
+    *,
+    limit: int = 50,
+) -> List[dict[str, Any]]:
+    """Return games marked 'playing' by distinct canonical profile keys, grouped by game."""
+    if not profile_keys or limit <= 0:
+        return []
+    deduped_keys = list(dict.fromkeys(str(key).strip().lower() for key in profile_keys if str(key).strip()))
+    if not deduped_keys:
+        return []
+
+    aggregates: dict[str, dict[str, Any]] = {}
+    for chunk in iter_sql_chunks(deduped_keys):
+        placeholders = ",".join("?" for _ in chunk)
+        query = f"""
+            SELECT g.slug, g.title, g.cover_url, g.release_year,
+                   r.profile_key, p.display_username
+            FROM profile_ratings r
+            JOIN cached_games g ON r.game_slug = g.slug
+            JOIN profiles p ON p.profile_key = r.profile_key
+            WHERE r.profile_key IN ({placeholders})
+              AND LOWER(r.status) = 'playing';
+        """
+        for row in await db._fetchall(query, chunk):
+            slug = row["slug"]
+            entry = aggregates.setdefault(
+                slug,
+                {
+                    "slug": slug,
+                    "title": row["title"],
+                    "cover_url": row["cover_url"],
+                    "release_year": row["release_year"],
+                    "players_by_key": {},
+                },
+            )
+            profile_key = str(row["profile_key"]).strip().lower()
+            username = str(row["display_username"] or row["profile_key"])
+            if profile_key not in entry["players_by_key"]:
+                entry["players_by_key"][profile_key] = username
+
+    results: list[dict[str, Any]] = []
+    for entry in aggregates.values():
+        players = sorted(
+            entry["players_by_key"].values(),
+            key=lambda name: (name.lower(), name),
+        )
+        results.append({
+            "slug": entry["slug"],
+            "title": entry["title"],
+            "cover_url": entry["cover_url"],
+            "release_year": entry["release_year"],
+            "players": players,
+            "player_count": len(players),
+        })
+
+    results.sort(key=lambda row: (-row["player_count"], str(row["title"] or "").lower(), row["slug"]))
+    return results[:limit]
+
+
+def _format_since_sql_timestamp(value: datetime | str) -> str:
+    if isinstance(value, datetime):
+        dt = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    raw = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        dt = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return raw
+
+
+async def get_guild_activity_recap(
+    db: Any,
+    guild_id: int,
+    *,
+    since_utc: datetime | str,
+) -> dict[str, Any]:
+    """Summarize delivered feed announcements for a guild since a UTC timestamp."""
+    since_sql = _format_since_sql_timestamp(since_utc)
+    rows = await db._fetchall(
+        """SELECT m.profile_key,
+                  COALESCE(p.display_username, af.display_username, m.profile_key) AS display_username,
+                  m.event_id,
+                  m.message_id,
+                  m.payload,
+                  m.recorded_at
+           FROM profile_feed_messages AS m
+           LEFT JOIN profiles AS p ON p.profile_key = m.profile_key
+           LEFT JOIN guild_admin_follows AS af
+                  ON af.guild_id = m.guild_id AND af.profile_key = m.profile_key
+           WHERE m.guild_id = ?
+             AND m.delivery_state = 'sent'
+             AND m.recorded_at IS NOT NULL
+             AND m.recorded_at >= ?
+           ORDER BY m.recorded_at DESC, m.event_id ASC;""",
+        (int(guild_id), since_sql),
+    )
+
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for row in rows:
+        message_id = row["message_id"]
+        profile_key = str(row["profile_key"] or "").strip().lower()
+        dedupe_key: tuple[Any, ...] = (
+            ("msg", int(message_id))
+            if message_id is not None
+            else ("ev", profile_key, str(row["event_id"] or ""))
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        deduped.append({
+            "profile_key": profile_key,
+            "username": str(row["display_username"] or profile_key).strip() or profile_key,
+            "payload": row["payload"],
+            "recorded_at": row["recorded_at"],
+        })
+
+    finished_count = 0
+    started_count = 0
+    rated_count = 0
+    reviewed_count = 0
+    top_rated: list[dict[str, Any]] = []
+    recently_finished: list[dict[str, Any]] = []
+    seen_finished: set[tuple[str, str]] = set()
+    player_activity: dict[str, dict[str, Any]] = {}
+
+    for item in deduped:
+        profile_key = item["profile_key"]
+        username = item["username"]
+        player_entry = player_activity.setdefault(
+            profile_key,
+            {"profile_key": profile_key, "username": username, "count": 0},
+        )
+        player_entry["count"] += 1
+
+        try:
+            data = json.loads(item["payload"]) if item["payload"] else {}
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        action = str(data.get("action_type") or "").strip().lower()
+        raw_labels = data.get("session_labels")
+        labels = tuple(raw_labels) if isinstance(raw_labels, (list, tuple)) else ()
+        rating_raw = data.get("rating")
+        rating: float | None = None
+        if isinstance(rating_raw, (int, float)) and not isinstance(rating_raw, bool):
+            rating = float(rating_raw)
+        review_notes = str(data.get("review_notes") or "").strip()
+        game_title = str(data.get("game_title") or "Unknown Game").strip() or "Unknown Game"
+        game_slug = str(data.get("game_slug") or "").strip()
+
+        is_finished = action == "completed" or "Finished" in labels
+        is_started = action == "playing" or "Started" in labels
+        has_review = action == "reviewed" or bool(review_notes)
+
+        if is_finished:
+            finished_count += 1
+            fin_key = (profile_key, game_slug or game_title.lower())
+            if fin_key not in seen_finished:
+                seen_finished.add(fin_key)
+                recently_finished.append({
+                    "title": game_title,
+                    "slug": game_slug,
+                    "rating": rating,
+                    "username": username,
+                    "recorded_at": item["recorded_at"],
+                })
+        if is_started:
+            started_count += 1
+        if rating is not None:
+            rated_count += 1
+            top_rated.append({
+                "title": game_title,
+                "slug": game_slug,
+                "rating": rating,
+                "username": username,
+                "recorded_at": item["recorded_at"],
+            })
+        if has_review:
+            reviewed_count += 1
+
+    top_rated.sort(
+        key=lambda entry: (
+            -entry["rating"],
+            entry["title"].lower(),
+            entry["slug"],
+            entry["username"].lower(),
+        )
+    )
+    most_active_players = sorted(
+        player_activity.values(),
+        key=lambda entry: (-entry["count"], entry["username"].lower(), entry["profile_key"]),
+    )
+
+    return {
+        "total_announcements": len(deduped),
+        "finished_count": finished_count,
+        "started_count": started_count,
+        "rated_count": rated_count,
+        "reviewed_count": reviewed_count,
+        "top_rated": top_rated[:5],
+        "recently_finished": recently_finished[:5],
+        "most_active_players": most_active_players[:5],
+    }

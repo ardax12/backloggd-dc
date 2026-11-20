@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
+from bot.services.session_health import report_upstream_failure, report_upstream_success
+
 logger = logging.getLogger("backloggd.library_sync")
 
 SyncOperation = Callable[[], Awaitable[Optional[int]]]
@@ -329,7 +331,7 @@ def _merge_entry(existing: Any, incoming: Any) -> Any:
     if community_rating is None:
         community_rating = getattr(secondary, "community_rating", None)
 
-    if is_dataclass(primary):
+    if is_dataclass(primary) and not isinstance(primary, type):
         updates: dict[str, Any] = {
             "rating": rating,
             "is_liked": is_liked,
@@ -338,7 +340,7 @@ def _merge_entry(existing: Any, incoming: Any) -> Any:
         }
         return replace(primary, **updates)
     return SimpleNamespace(
-        slug=primary.slug,
+        slug=getattr(primary, "slug", None),
         title=title,
         rating=rating,
         status=getattr(primary, "status", "unknown"),
@@ -354,15 +356,16 @@ def _with_fallback_status(entry: Any, fallback_status: Optional[str]) -> Any:
         return entry
     if _entry_status_key(getattr(entry, "status", "unknown")) != "unknown":
         return entry
-    if is_dataclass(entry):
+    if is_dataclass(entry) and not isinstance(entry, type):
         from backloggd.models.game import GameStatus
         try:
             return replace(entry, status=GameStatus(fallback_status))
         except ValueError:
             return entry
+    slug = getattr(entry, "slug", None)
     return SimpleNamespace(
-        slug=entry.slug,
-        title=getattr(entry, "title", entry.slug),
+        slug=slug,
+        title=getattr(entry, "title", slug),
         rating=getattr(entry, "rating", None),
         status=fallback_status,
         is_liked=bool(getattr(entry, "is_liked", False)),
@@ -457,6 +460,7 @@ async def sync_profile_library(
     try:
         pending_token = await bot.db.get_profile_refresh_pending_token(profile_key)
         library = await _fetch_complete_library(bot.backloggd, username)
+        report_upstream_success(bot)
         kwargs = {"require_linked": True}
         if synced_at is not None:
             kwargs["synced_at"] = synced_at
@@ -471,6 +475,7 @@ async def sync_profile_library(
     except asyncio.CancelledError:
         raise
     except Exception as error:
+        report_upstream_failure(bot, error)
         logger.error("Error syncing library for %s: %s", username, error, exc_info=True)
         try:
             kwargs = {"attempted_at": synced_at} if synced_at is not None else {}

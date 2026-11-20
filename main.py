@@ -91,9 +91,11 @@ async def handle_health_check(request: web.Request) -> web.Response:
         payload["revision"] = revision
     session_health = getattr(bot, "session_health", None)
     if session_health is not None:
-        get_metadata = getattr(session_health, "get_health_metadata", None)
+        get_metadata: Any = getattr(session_health, "get_health_metadata", None)
         if callable(get_metadata):
-            payload.update(get_metadata())
+            metadata = get_metadata()
+            if isinstance(metadata, dict):
+                payload.update(metadata)
     return web.json_response(payload, status=http_status)
 
 

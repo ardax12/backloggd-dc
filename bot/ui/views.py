@@ -34,7 +34,7 @@ class ExpiringView(View):
 
     def __init__(self, *, timeout: float = 180):
         super().__init__(timeout=timeout)
-        self.message = None
+        self.message: Any = None
         self._retired = False
 
     def retire(self) -> None:
@@ -48,8 +48,9 @@ class ExpiringView(View):
         if self._retired:
             return
         for item in self.children:
-            if getattr(item, "url", None) is None:
-                item.disabled = True
+            if getattr(item, "url", None) is None and hasattr(item, "disabled"):
+                item_any: Any = item
+                item_any.disabled = True
         message = self.message
         if message:
             try:
@@ -116,7 +117,7 @@ class TasteTwinsView(ExpiringView):
         super().__init__()
         self.add_item(Button(label="View Profile on Backloggd", url=user_url, style=discord.ButtonStyle.link))
         if top_twin_name and on_compare:
-            compare_btn = Button(
+            compare_btn: Any = Button(
                 label=truncate_button_label(f"Duel with {top_twin_name}"),
                 emoji="⚔️",
                 style=discord.ButtonStyle.primary
@@ -136,7 +137,7 @@ class GameCardView(ExpiringView):
         super().__init__()
         self.add_item(Button(label="View on Backloggd", url=game_url, style=discord.ButtonStyle.link))
         if total_ratings > 12 and on_view_all:
-            view_all_btn = Button(
+            view_all_btn: Any = Button(
                 label=truncate_button_label(f"View All Ratings ({total_ratings})"),
                 emoji="👥",
                 style=discord.ButtonStyle.secondary
@@ -200,7 +201,7 @@ class GamePickerView(ExpiringView):
         *,
         selected_label: Optional[str],
     ) -> None:
-        edit_original = getattr(interaction, "edit_original_response", None)
+        edit_original: Optional[Callable[..., Any]] = getattr(interaction, "edit_original_response", None)
         if not callable(edit_original):
             return
         edit_kwargs: dict[str, Any] = {"view": self}
@@ -242,8 +243,9 @@ class GamePickerView(ExpiringView):
             return
 
         values = list(self.select.values)
-        if not values and isinstance(getattr(interaction, "data", None), dict):
-            raw_values = interaction.data.get("values")
+        raw_data = getattr(interaction, "data", None)
+        if not values and isinstance(raw_data, dict):
+            raw_values = raw_data.get("values")
             if isinstance(raw_values, list):
                 values = [str(v) for v in raw_values]
 
@@ -548,8 +550,9 @@ class ServerTopView(ExpiringView):
             return
 
         values = list(self.select.values)
-        if not values and isinstance(getattr(interaction, "data", None), dict):
-            raw_values = interaction.data.get("values")
+        raw_data = getattr(interaction, "data", None)
+        if not values and isinstance(raw_data, dict):
+            raw_values = raw_data.get("values")
             if isinstance(raw_values, list):
                 values = [str(v) for v in raw_values]
 
@@ -605,3 +608,232 @@ class ServerTopView(ExpiringView):
                 raise
             if edited_message is not None:
                 self.message = edited_message
+
+
+class PaginatedEmbedView(ExpiringView):
+    """Author-locked Previous/Next pagination view for pre-built embed pages."""
+
+    def __init__(
+        self,
+        author_id: Optional[int],
+        pages: Sequence[discord.Embed],
+        *,
+        command_name: str = "/playing",
+        timeout: float = 180,
+    ):
+        if not pages:
+            raise ValueError("PaginatedEmbedView requires at least one page")
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.pages: list[discord.Embed] = list(pages)
+        self.command_name = command_name
+        self.page = 0
+        self._edit_lock = asyncio.Lock()
+        self._update_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return len(self.pages)
+
+    def _update_buttons(self) -> None:
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= len(self.pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.author_id is None or interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            f"❌ Only the person who ran `{self.command_name}` can change pages.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        async with self._edit_lock:
+            await super().on_timeout()
+
+    async def _move(self, interaction: discord.Interaction, offset: int) -> None:
+        if self._retired or self.is_finished():
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"⏳ This menu has expired. Please run `{self.command_name}` again.",
+                    ephemeral=True,
+                )
+            return
+        if not interaction.response.is_done():
+            await defer_interaction(interaction)
+        async with self._edit_lock:
+            if self._retired or self.is_finished():
+                return
+            target_page = max(0, min(len(self.pages) - 1, self.page + offset))
+            if target_page == self.page:
+                return
+            previous_page = self.page
+            self.page = target_page
+            self._update_buttons()
+            try:
+                edited_message = await interaction.edit_original_response(
+                    embed=self.pages[target_page],
+                    view=self,
+                )
+            except BaseException:
+                self.page = previous_page
+                self._update_buttons()
+                raise
+            if edited_message is not None:
+                self.message = edited_message
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: Button):
+        await self._move(interaction, -1)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: Button):
+        await self._move(interaction, 1)
+
+
+class HelpView(ExpiringView):
+    """Author-locked category selector for the ephemeral /help command."""
+
+    def __init__(
+        self,
+        author_id: Optional[int],
+        *,
+        current_topic: str = "Overview",
+        timeout: float = 180,
+    ):
+        from bot.ui.embeds import HELP_TOPICS
+
+        super().__init__(timeout=timeout)
+        self.author_id = author_id
+        self.current_topic = current_topic
+        self._valid_topics = {name for name, _, _ in HELP_TOPICS}
+        self._edit_lock = asyncio.Lock()
+
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=name,
+                emoji=emoji,
+                description=summary[:100],
+                default=(name == current_topic),
+            )
+            for name, emoji, summary in HELP_TOPICS
+        ]
+        self.select = discord.ui.Select(
+            placeholder="Choose a help category...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.select.callback = self._handle_select
+        self.add_item(self.select)
+
+    def _set_active_topic(self, topic: str) -> None:
+        self.current_topic = topic
+        for option in self.select.options:
+            option.default = option.value == topic
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.author_id is None or interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "❌ Only the person who ran `/help` can switch help topics.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        async with self._edit_lock:
+            await super().on_timeout()
+
+    async def _handle_select(self, interaction: discord.Interaction) -> None:
+        if self._retired or self.is_finished():
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "⏳ This help menu has expired. Please run `/help` again.",
+                    ephemeral=True,
+                )
+            return
+
+        values = list(self.select.values)
+        raw_data = getattr(interaction, "data", None)
+        if not values and isinstance(raw_data, dict):
+            raw_values = raw_data.get("values")
+            if isinstance(raw_values, list):
+                values = [str(v) for v in raw_values]
+
+        if len(values) != 1 or values[0] not in self._valid_topics:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Invalid help topic selection.",
+                    ephemeral=True,
+                )
+            return
+
+        selected_topic = values[0]
+        from bot.ui.embeds import create_help_embed
+
+        async with self._edit_lock:
+            if self._retired or self.is_finished():
+                return
+            previous_topic = self.current_topic
+            self._set_active_topic(selected_topic)
+            embed = create_help_embed(selected_topic)
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.edit_message(embed=embed, view=self)
+                else:
+                    edited = await interaction.edit_original_response(embed=embed, view=self)
+                    if edited is not None:
+                        self.message = edited
+            except BaseException:
+                self._set_active_topic(previous_topic)
+                raise
+
+
+class ProfileCardView(ExpiringView):
+    """Interactive view for /profile with permanent Backloggd links and expiring quick actions."""
+
+    def __init__(
+        self,
+        profile_url: str,
+        *,
+        extra_links: Optional[list[tuple[str, str]]] = None,
+        on_compare: Optional[Callable[[discord.Interaction], Coroutine[Any, Any, None]]] = None,
+        on_roulette: Optional[Callable[[discord.Interaction], Coroutine[Any, Any, None]]] = None,
+        timeout: float = 180,
+    ):
+        super().__init__(timeout=timeout)
+        self.add_item(
+            Button(
+                label=truncate_button_label("View Profile on Backloggd"),
+                url=profile_url,
+                style=discord.ButtonStyle.link,
+            )
+        )
+        if extra_links:
+            for extra_label, extra_url in extra_links:
+                self.add_item(
+                    Button(
+                        label=truncate_button_label(extra_label),
+                        url=extra_url,
+                        style=discord.ButtonStyle.link,
+                    )
+                )
+        if on_compare is not None:
+            compare_btn: Any = Button(
+                label="Compare with me",
+                emoji="⚔️",
+                style=discord.ButtonStyle.primary,
+            )
+            compare_btn.callback = on_compare
+            self.add_item(compare_btn)
+        if on_roulette is not None:
+            roulette_btn: Any = Button(
+                label="Spin their roulette",
+                emoji="🎲",
+                style=discord.ButtonStyle.secondary,
+            )
+            roulette_btn.callback = on_roulette
+            self.add_item(roulette_btn)

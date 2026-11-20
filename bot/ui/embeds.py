@@ -5,7 +5,7 @@ from typing import Any, List, Optional
 
 import discord
 
-from bot.config import COLOR_ERROR, COLOR_GOLD, COLOR_PLAYED, COLOR_PRIMARY
+from bot.config import COLOR_ERROR, COLOR_GOLD, COLOR_PLAYED, COLOR_PLAYING, COLOR_PRIMARY
 from bot.input_validation import escape_display_text
 from bot.ui.helpers import (
     DEFAULT_BACKLOGGD_AVATAR,
@@ -64,6 +64,21 @@ def create_game_embed(
         desc_lines.append(f"**Community Rating:** {stars} **{game.community_rating:.1f}** / 5.0{count_str}")
     else:
         desc_lines.append("**Community Rating:** ☆☆☆☆☆ *No ratings yet*")
+
+    rated = [float(r["rating"]) for r in server_ratings if r["rating"] is not None]
+    if rated:
+        server_avg = sum(rated) / len(rated)
+        server_stars = rating_to_stars(server_avg)
+        rating_word = "rating" if len(rated) == 1 else "ratings"
+        delta_str = ""
+        if game.community_rating:
+            delta = server_avg - float(game.community_rating)
+            if abs(delta) >= 0.05:
+                delta_str = f" ({delta:+.1f} vs Backloggd)"
+        desc_lines.append(
+            f"**Server Average:** {server_stars} **{server_avg:.1f}** / 5.0 "
+            f"({len(rated)} {rating_word}){delta_str}"
+        )
 
     if game.summary:
         clean_summary = re.sub(r"[\r\n]+", " ", str(game.summary)).strip()
@@ -661,4 +676,314 @@ def create_all_ratings_embed(
         chunk = f"{chunk}\n{line}" if chunk else line
     embed.add_field(name="Profile Ratings & Status", value=chunk or "*No ratings*", inline=False)
     embed.set_footer(text=f"Page {current_page} of {total_pages} • Backloggd Discord Bot")
+    return embed
+
+
+def create_playing_embed(
+    games_page: List[dict],
+    *,
+    guild_name: str,
+    total_games: int,
+    total_players: int,
+    page: int = 1,
+    total_pages: int = 1,
+    freshness_note: Optional[str] = None,
+    empty_message: Optional[str] = None,
+) -> discord.Embed:
+    """Construct a paginated embed for /playing showing what server members are currently playing."""
+    embed = discord.Embed(
+        title=f"🎮 Now Playing in {guild_name}"[:256],
+        color=COLOR_PLAYING,
+    )
+
+    if not games_page:
+        embed.description = empty_message or "*No one in this server currently has any games marked as Playing on Backloggd.*"
+        append_freshness_note(embed, freshness_note)
+        embed.set_footer(text="Based on synced Backloggd Playing lists • Use /refresh to update yours")
+        return embed
+
+    current_page = max(1, min(int(page), max(1, int(total_pages))))
+    pages_total = max(1, int(total_pages))
+    game_word = "game" if total_games == 1 else "games"
+    player_word = "linked profile" if total_players == 1 else "linked profiles"
+    lines = [f"**{total_games}** {game_word} currently being played across **{total_players}** {player_word}.\n"]
+
+    max_players_per_line = 6
+    for row in games_page:
+        safe_title = escape_display_text(str(row["title"]))
+        year = row.get("release_year")
+        year_suffix = f" ({year})" if year else ""
+        url = build_backloggd_game_url(row["slug"])
+        raw_players = list(row.get("players") or [])
+        visible_players = [escape_display_text(str(name)) for name in raw_players[:max_players_per_line]]
+        players_text = ", ".join(visible_players)
+        if len(raw_players) > max_players_per_line:
+            players_text += f" *+{len(raw_players) - max_players_per_line} more*"
+        lines.append(f"• **[{safe_title}{year_suffix}]({url})** — {players_text}")
+
+    embed.description = clamp_escaped_text("\n".join(lines), 4096)
+    append_freshness_note(embed, freshness_note)
+
+    footer_parts: list[str] = []
+    if pages_total > 1:
+        footer_parts.append(f"Page {current_page}/{pages_total}")
+    footer_parts.append("Based on synced Backloggd Playing lists • Use /refresh to update yours")
+    embed.set_footer(text=" · ".join(footer_parts)[:2048])
+    return embed
+
+
+HELP_TOPICS: tuple[tuple[str, str, str], ...] = (
+    ("Overview", "📖", "Quick start and command categories"),
+    ("Getting Started", "🚀", "Linking, unlinking, and library sync"),
+    ("Games & Profiles", "🎮", "Game lookup, profiles, /playing, and context menus"),
+    ("Social & Discovery", "✨", "Comparisons, taste twins, roulette, and leaderboards"),
+    ("Activity Feed & Admin", "⚙️", "Feed preferences, admin setup, and cooldowns"),
+)
+_VALID_HELP_TOPICS = {name for name, _, _ in HELP_TOPICS}
+
+
+def create_help_embed(topic: str = "Overview") -> discord.Embed:
+    """Construct an ephemeral categorized help embed for /help [topic]."""
+    selected = topic if topic in _VALID_HELP_TOPICS else "Overview"
+
+    if selected == "Getting Started":
+        embed = discord.Embed(
+            title="🚀 Backloggd Bot — Getting Started",
+            description=(
+                "Connect your public Backloggd profile once and the bot syncs your ratings, "
+                "played games, backlog, and wishlist in the background."
+            ),
+            color=COLOR_PRIMARY,
+        )
+        embed.add_field(
+            name="Account & Library Commands",
+            value=(
+                "• `/link <username>` — Connect your public Backloggd profile and join this server's activity feed.\n"
+                "• `/unlink` — Disconnect your profile (past feed announcements stay as an archive).\n"
+                "• `/refresh [member]` — Request a fresh library sync for yourself or another linked member.\n"
+                "• `/help [topic]` — Open this guide privately in any server or DM."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="How Syncing & Linking Work",
+            value=(
+                "• Library-powered commands (`/playing`, `/roulette`, `/recommend`, `/server-top`, `/taste-twins`) "
+                "become available once your first sync finishes.\n"
+                "• Linking in a DM connects your profile without enabling server feeds; run `/link` or `/feed on` in a server to join its feed.\n"
+                "• Linking is a convenience feature for public profiles, not proof of account ownership."
+            ),
+            inline=False,
+        )
+    elif selected == "Games & Profiles":
+        embed = discord.Embed(
+            title="🎮 Backloggd Bot — Games & Profiles",
+            description="Look up games, inspect Backloggd profiles, and see what your server is playing right now.",
+            color=COLOR_PRIMARY,
+        )
+        embed.add_field(
+            name="Slash Commands",
+            value=(
+                "• `/game <title>` — Search Backloggd for a game, compare Backloggd's community rating "
+                "with your server's average, and see every linked member's score.\n"
+                "• `/profile [user]` — View your profile or any public Backloggd profile (accepts a @mention or username) "
+                "with stats, recent journal activity, latest review, and quick actions.\n"
+                "• `/playing` — See what games linked server members currently have marked as **Playing**."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="User Context Menus (Right-Click a Member → Apps)",
+            value=(
+                "• **View Backloggd Profile** — Open a server member's Backloggd profile card directly.\n"
+                "• **Compare Backloggd Tastes** — Instantly duel your ratings against that server member."
+            ),
+            inline=False,
+        )
+    elif selected == "Social & Discovery":
+        embed = discord.Embed(
+            title="✨ Backloggd Bot — Social & Discovery",
+            description="Compare gaming tastes, break backlog paralysis, and explore server rankings.",
+            color=COLOR_PRIMARY,
+        )
+        embed.add_field(
+            name="Taste Comparisons",
+            value=(
+                "• `/compare <user1> [user2]` — Duel two profiles' ratings, similarity score, shared favorites, "
+                "and biggest disagreements.\n"
+                "• `/taste-twins [member]` — Find your closest taste soulmates and #1 nemesis in this server."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Discovery & Server Rankings",
+            value=(
+                "• `/roulette [member] [pool]` — Spin a random unrated game from a member's Backlog, Wishlist, or both.\n"
+                "• `/recommend [member] [pool]` — Get personalized server recommendations or suggest your favorites to a friend.\n"
+                "• `/server-top [mode] [min_ratings]` — Browse top-50 server rankings across Highest Rated, Most Played, "
+                "Most Polarizing, Hidden Gems, and Backlog Shame List.\n"
+                "• `/server-stats` — See server-wide game totals, average rating, and most-played title.\n"
+                "• `/server-recap [period]` — Summarize the last 7 or 30 days of server activity feed announcements."
+            ),
+            inline=False,
+        )
+    elif selected == "Activity Feed & Admin":
+        embed = discord.Embed(
+            title="⚙️ Backloggd Bot — Activity Feed & Admin",
+            description="Share new ratings, reviews, and Started/Finished milestones automatically in a dedicated channel.",
+            color=COLOR_PRIMARY,
+        )
+        embed.add_field(
+            name="Member Feed Controls",
+            value=(
+                "• `/feed on` / `/feed off` — Opt in or out of this server's activity feed.\n"
+                "• `/feed status` — Check your feed status and any sync or delivery issues privately."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Server Admin Commands (Requires Manage Channels)",
+            value=(
+                "• `/setchannel [channel]` — Choose where this server's activity feed posts.\n"
+                "• `/unsetchannel` — Pause feed announcements without deleting past messages.\n"
+                "• `/feed add <username>` / `/feed remove <username>` — Follow or unfollow any public Backloggd profile.\n"
+                "• `/feed list` — Browse followed profiles and their feed health.\n"
+                "• `/feed filter` — Toggle announced categories (Started, Finished, Replays, Ratings, Reviews) or wrap all review notes in `||spoilers||`.\n"
+                "• `/feed test` — Verify channel permissions by posting a non-persisted sample announcement.\n"
+                "• `/feed digest [cadence] [channel]` — Schedule automatic Weekly or Monthly server activity recaps."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Moderator Cooldown Controls (Administrator, Manage Server, Manage Channels, or Moderate Members)",
+            value=(
+                "• `/cooldown view` — Inspect current per-command cooldown durations in this server.\n"
+                "• `/cooldown set <command> <seconds>` — Customize a command cooldown within safe bounds.\n"
+                "• `/cooldown reset [command]` — Reset one or all server cooldowns back to defaults."
+            ),
+            inline=False,
+        )
+    else:
+        embed = discord.Embed(
+            title="📖 Backloggd Bot — Help & Command Guide",
+            description=(
+                "Bring Backloggd profiles, ratings, taste duels, and live activity feeds into Discord.\n\n"
+                "**Quick 3-Step Setup:**\n"
+                "1. Run `/link <username>` to connect your public Backloggd profile.\n"
+                "2. *(Admins)* Run `/setchannel` to choose a channel for activity announcements.\n"
+                "3. Try `/game`, `/profile`, `/playing`, or `/compare`!"
+            ),
+            color=COLOR_PRIMARY,
+        )
+        category_lines = [
+            f"{emoji} **{name}** — {summary}"
+            for name, emoji, summary in HELP_TOPICS
+            if name != "Overview"
+        ]
+        embed.add_field(
+            name="Browse Categories Below",
+            value="\n".join(category_lines),
+            inline=False,
+        )
+
+    embed.set_footer(text="Use the menu below to switch categories • This message is visible only to you")
+    return embed
+
+
+def create_server_recap_embed(
+    recap: dict[str, Any],
+    *,
+    guild_name: str,
+    period_label: str,
+    empty_message: Optional[str] = None,
+    is_digest: bool = False,
+) -> discord.Embed:
+    """Build an embed summarizing recent server activity feed announcements."""
+    safe_guild = str(guild_name or "Server")
+    title = f"🗓️ {safe_guild} — {period_label} Recap"
+    total = int(recap.get("total_announcements", 0) or 0)
+
+    if total <= 0:
+        description = (
+            empty_message
+            or f"*No feed announcements were recorded in this server during {escape_display_text(period_label.lower())}.*"
+        )
+        embed = discord.Embed(
+            title=title[:256],
+            description=clamp_escaped_text(description, 4096),
+            color=COLOR_PRIMARY,
+        )
+    else:
+        finished = int(recap.get("finished_count", 0) or 0)
+        started = int(recap.get("started_count", 0) or 0)
+        rated = int(recap.get("rated_count", 0) or 0)
+        reviewed = int(recap.get("reviewed_count", 0) or 0)
+        ann_word = "announcement" if total == 1 else "announcements"
+        summary_line = (
+            f"**{total}** {ann_word} · "
+            f"🏆 **{finished}** finished · "
+            f"▶️ **{started}** started · "
+            f"⭐ **{rated}** rated · "
+            f"📝 **{reviewed}** reviewed"
+        )
+        embed = discord.Embed(
+            title=title[:256],
+            description=clamp_escaped_text(summary_line, 4096),
+            color=COLOR_GOLD,
+        )
+
+        def _format_game_ref(item: dict[str, Any]) -> str:
+            safe_title = escape_display_text(str(item.get("title") or "Unknown Game"))
+            slug = str(item.get("slug") or "").strip()
+            if slug:
+                return f"[**{safe_title}**]({build_backloggd_game_url(slug)})"
+            return f"**{safe_title}**"
+
+        top_rated = recap.get("top_rated") or []
+        if top_rated:
+            rated_lines = []
+            for item in top_rated[:5]:
+                safe_user = escape_display_text(str(item.get("username") or "Unknown"))
+                rating_val = float(item.get("rating", 0.0))
+                rated_lines.append(
+                    f"• {_format_game_ref(item)} — **{rating_val:.1f}** / 5.0 by **{safe_user}**"
+                )
+            embed.add_field(
+                name="⭐ Top Newly Rated",
+                value=clamp_escaped_text("\n".join(rated_lines), 1024),
+                inline=False,
+            )
+
+        recently_finished = recap.get("recently_finished") or []
+        if recently_finished:
+            fin_lines = []
+            for item in recently_finished[:5]:
+                safe_user = escape_display_text(str(item.get("username") or "Unknown"))
+                rating_raw = item.get("rating")
+                rating_suffix = f" ({float(rating_raw):.1f}/5.0)" if rating_raw is not None else ""
+                fin_lines.append(f"• {_format_game_ref(item)} — **{safe_user}**{rating_suffix}")
+            embed.add_field(
+                name="🏆 Recently Finished",
+                value=clamp_escaped_text("\n".join(fin_lines), 1024),
+                inline=False,
+            )
+
+        active_players = recap.get("most_active_players") or []
+        if active_players:
+            player_lines = []
+            for item in active_players[:5]:
+                safe_user = escape_display_text(str(item.get("username") or "Unknown"))
+                count = int(item.get("count", 0) or 0)
+                word = "announcement" if count == 1 else "announcements"
+                player_lines.append(f"• **{safe_user}** — {count} {word}")
+            embed.add_field(
+                name="🔥 Most Active Players",
+                value=clamp_escaped_text("\n".join(player_lines), 1024),
+                inline=False,
+            )
+
+    if is_digest:
+        embed.set_footer(text="Automated Server Digest • Configure with /feed digest")
+    else:
+        embed.set_footer(text="Based on delivered Backloggd activity feed announcements")
     return embed

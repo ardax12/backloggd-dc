@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Any, Callable
 
 import discord
 from discord import app_commands
@@ -138,19 +139,20 @@ async def send_private_followup(
     if view is not None:
         send_kwargs["view"] = view
 
-    response = getattr(interaction, "response", None)
+    response: Any = getattr(interaction, "response", None)
     is_done_fn = getattr(response, "is_done", None)
     responded = bool(is_done_fn()) if callable(is_done_fn) else True
 
-    if not responded:
+    if not responded and response is not None:
         try:
             await response.send_message(*send_args, **send_kwargs)
             mark_original_response_resolved(interaction)
             if view is not None and getattr(view, "message", None) is None:
-                original_response = getattr(interaction, "original_response", None)
+                original_response: Callable[..., Any] | None = getattr(interaction, "original_response", None)
                 if callable(original_response):
                     try:
-                        view.message = await original_response()
+                        view_ref: Any = view
+                        view_ref.message = await original_response()
                     except discord.HTTPException:
                         pass
             return True
@@ -164,8 +166,8 @@ async def send_private_followup(
             )
             return False
 
-    edit_original = getattr(interaction, "edit_original_response", None)
-    delete_original = getattr(interaction, "delete_original_response", None)
+    edit_original: Callable[..., Any] | None = getattr(interaction, "edit_original_response", None)
+    delete_original: Callable[..., Any] | None = getattr(interaction, "delete_original_response", None)
     resolved_public_placeholder = False
 
     if _is_unresolved_public_defer(interaction) and callable(edit_original):
@@ -200,7 +202,8 @@ async def send_private_followup(
         sent_message = await interaction.followup.send(*send_args, **followup_kwargs)
         mark_original_response_resolved(interaction)
         if view is not None and getattr(view, "message", None) is None:
-            view.message = sent_message
+            view_ref_followup: Any = view
+            view_ref_followup.message = sent_message
     except discord.HTTPException as send_error:
         target_logger.warning(
             "Failed to send error reply for command %r: %s",

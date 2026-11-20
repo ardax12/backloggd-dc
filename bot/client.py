@@ -6,7 +6,7 @@ import math
 import socket
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 import discord
@@ -15,7 +15,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot.command_errors import handle_app_command_error
-from bot.config import DATABASE_PATH, DEV_GUILD_ID
+from bot.config import ALERT_OWNER_DM, ALERT_WEBHOOK_URL, DATABASE_PATH, DEV_GUILD_ID
 from bot.db import Database
 from bot.services.cooldowns import GuildCooldownService
 from bot.services.guild_membership import GuildMembershipService
@@ -36,7 +36,7 @@ def _retry_after_seconds(error: Exception) -> Optional[float]:
         response = getattr(error, "response", None)
         headers = getattr(response, "headers", None) or getattr(error, "headers", None) or {}
         value = headers.get("Retry-After", headers.get("retry-after"))
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return None
     try:
         seconds = float(value)
@@ -60,6 +60,8 @@ class BackloggdBot(commands.Bot):
         command_sync_retry_delays: tuple[float, ...] = _DEFAULT_COMMAND_SYNC_RETRY_DELAYS,
         command_sync_retry_budget: float = _DEFAULT_COMMAND_SYNC_RETRY_BUDGET,
         monotonic_clock: Optional[Callable[[], float]] = None,
+        alert_webhook_url: Optional[str] = None,
+        alert_owner_dm: Optional[bool] = None,
     ):
         intents = discord.Intents.default()
         intents.members = True          # Required for server-specific member queries
@@ -81,7 +83,15 @@ class BackloggdBot(commands.Bot):
         self.library_sync = LibrarySyncService(max_workers=2)
         self.guild_membership = GuildMembershipService()
         self.cooldowns = GuildCooldownService(db_provider=lambda: self.db)
-        self.session_health = UpstreamSessionHealth()
+        self._alert_webhook_url: str = (
+            ALERT_WEBHOOK_URL if alert_webhook_url is None else str(alert_webhook_url).strip()
+        )
+        self._alert_owner_dm: bool = (
+            ALERT_OWNER_DM if alert_owner_dm is None else bool(alert_owner_dm)
+        )
+        self.session_health = UpstreamSessionHealth(
+            alert_callback=self._dispatch_session_health_alert,
+        )
         self._close_task: Optional[asyncio.Task] = None
         self._command_sync_task: Optional[asyncio.Task] = None
         self._closing: bool = False
@@ -201,6 +211,7 @@ class BackloggdBot(commands.Bot):
 
         # 2. Load Cogs
         initial_extensions = [
+            "bot.cogs.general",
             "bot.cogs.account",
             "bot.cogs.games",
             "bot.cogs.users",
@@ -229,14 +240,16 @@ class BackloggdBot(commands.Bot):
 
             async def _shutdown() -> None:
                 errors: list[Exception] = []
-                stages: list[tuple[str, object]] = [
+                stages: list[tuple[str, Any]] = [
                     ("command_sync", self._close_command_sync),
                 ]
                 for cog_name in ("Feed", "Stats", "Account", "Social"):
                     cog = self.get_cog(cog_name)
-                    if cog is not None and callable(getattr(cog, "close", None)):
-                        stages.append((f"cog:{cog_name}", cog.close))
+                    close_fn: Any = getattr(cog, "close", None)
+                    if cog is not None and callable(close_fn):
+                        stages.append((f"cog:{cog_name}", close_fn))
                 stages.extend([
+                    ("session_health", self.session_health.close),
                     ("guild_membership", self.guild_membership.close),
                     ("library_sync", self.library_sync.close),
                     ("backloggd", self.backloggd.close),
@@ -262,6 +275,69 @@ class BackloggdBot(commands.Bot):
 
         await await_owned_task(self._close_task)
 
+    async def _dispatch_session_health_alert(self, event: str, details: dict) -> None:
+        """Send a one-shot, redacted alert via optional webhook and/or owner DM."""
+        if self._closing:
+            return
+        webhook_url = self._alert_webhook_url
+        owner_dm = self._alert_owner_dm
+        if not webhook_url and not owner_dm:
+            return
+
+        kind = str(details.get("kind") or "upstream")
+        if event == "recovered":
+            failures = int(details.get("failure_count") or 0)
+            message = (
+                f"✅ **Backloggd bot recovered:** upstream scraping health returned to normal "
+                f"(previous state: `{kind}`, {failures} error(s))."
+            )
+        else:
+            error_type = str(details.get("error_type") or "Error")
+            hint = (
+                " Check or refresh `BACKLOGGD_SESSION` if this persists."
+                if details.get("is_cookie_issue")
+                else " Feed polling will retry automatically after backoff."
+            )
+            message = (
+                f"⚠️ **Backloggd bot upstream degraded (`{kind}`):** "
+                f"detected `{error_type}`.{hint}"
+            )
+
+        if webhook_url:
+            try:
+                timeout = aiohttp.ClientTimeout(total=5.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(webhook_url, json={"content": message}) as resp:
+                        if resp.status >= 400:
+                            logger.warning(
+                                "Session health alert webhook returned HTTP %d",
+                                resp.status,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Could not send session health alert webhook: %s",
+                    type(error).__name__,
+                )
+
+        if owner_dm:
+            try:
+                app_info = await self.application_info()
+                owner = getattr(app_info, "owner", None)
+                team = getattr(app_info, "team", None)
+                if owner is None and team is not None:
+                    owner = getattr(team, "owner", None)
+                if owner is not None:
+                    await owner.send(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Could not send session health owner DM alert: %s",
+                    type(error).__name__,
+                )
+
     def get_readiness_status(self) -> tuple[int, str, bool]:
         """Return (http_status, state_name, ready) from local bot and DB state."""
         if self._closing or self.is_closed():
@@ -281,9 +357,10 @@ class BackloggdBot(commands.Bot):
         """Triggered when connection is established and cache is ready."""
         self._has_been_ready = True
         self._disconnected_since = None
-        logger.info("Logged in as %s (ID: %d)", self.user.name, self.user.id)
-        feed_cog = self.get_cog("Feed")
-        if feed_cog:
+        if self.user is not None:
+            logger.info("Logged in as %s (ID: %d)", self.user.name, self.user.id)
+        feed_cog: Any = self.get_cog("Feed")
+        if feed_cog is not None:
             await feed_cog.pipeline.reconcile_legacy_enrollments()
         activity = discord.Activity(
             type=discord.ActivityType.watching,
@@ -299,3 +376,39 @@ class BackloggdBot(commands.Bot):
     async def on_resumed(self) -> None:
         """Restore readiness when an existing Discord session resumes."""
         self._disconnected_since = None
+
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """Pause feed polling and evict in-memory caches when the bot leaves a server."""
+        guild_id = getattr(guild, "id", None)
+        if guild_id is None:
+            return
+        cooldowns = getattr(self, "cooldowns", None)
+        if cooldowns is not None and callable(getattr(cooldowns, "invalidate_guild", None)):
+            cooldowns.invalidate_guild(guild_id)
+        membership = getattr(self, "guild_membership", None)
+        if membership is not None and callable(getattr(membership, "evict_guild", None)):
+            membership.evict_guild(guild_id)
+        feed_cog = self.get_cog("Feed")
+        pipeline = getattr(feed_cog, "pipeline", None)
+        if pipeline is not None and callable(getattr(pipeline, "forget_guild", None)):
+            pipeline.forget_guild(guild_id)
+        db = getattr(self, "db", None)
+        if db is None or not getattr(db, "is_connected", False):
+            return
+        try:
+            paused = await db.unset_feed_channel(guild_id)
+            digest_removed = False
+            if hasattr(db, "unset_guild_digest"):
+                digest_removed = await db.unset_guild_digest(guild_id)
+            logger.info(
+                "Removed from guild %d; feed paused=%s digest_removed=%s",
+                guild_id,
+                bool(paused),
+                bool(digest_removed),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to pause feed subscriptions after removal from guild %d",
+                guild_id,
+                exc_info=True,
+            )

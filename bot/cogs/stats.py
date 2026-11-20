@@ -2,8 +2,8 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import List, Literal, Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, List, Literal, Optional, Sequence
 
 import discord
 from discord import app_commands
@@ -22,8 +22,13 @@ from bot.services.guild_membership import (
 )
 from bot.services.library_sync import parse_sync_timestamp
 from bot.services.task_lifecycle import TaskDrainGroup
-from bot.ui.embeds import create_server_stats_embed, create_server_top_embed
-from bot.ui.views import ServerTopView
+from bot.ui.embeds import (
+    create_playing_embed,
+    create_server_recap_embed,
+    create_server_stats_embed,
+    create_server_top_embed,
+)
+from bot.ui.views import PaginatedEmbedView, ServerTopView
 
 logger = logging.getLogger("backloggd.cogs.stats")
 
@@ -34,6 +39,7 @@ LeaderboardMode = Literal[
     "Hidden Gems",
     "Server Backlog Shame List"
 ]
+RecapPeriod = Literal["7 days", "30 days"]
 
 _LEADERBOARD_MODES: tuple[tuple[str, str, str, str], ...] = (
     ("Highest Rated", "highest_rated", "⭐ Highest Rated Games", "⭐"),
@@ -120,7 +126,9 @@ class StatsCog(commands.Cog, name="Stats"):
         count = valid_played_count(getattr(public_profile, "played_count", None))
         if count is not None:
             return count
-        counts_method = getattr(self.bot.backloggd, "get_user_collection_counts", None)
+        counts_method: Optional[Callable[..., Any]] = getattr(
+            self.bot.backloggd, "get_user_collection_counts", None
+        )
         if callable(counts_method):
             collection_counts = await counts_method(username)
             if isinstance(collection_counts, dict):
@@ -135,11 +143,14 @@ class StatsCog(commands.Cog, name="Stats"):
         timeout: Optional[float] = None,
     ) -> dict:
         """Sum public profile Played-tab totals, reusing fresh stored observations."""
-        if profiles is None:
-            profiles = await self.bot.db.get_guild_linked_profiles(member_ids)
+        resolved_profiles: Sequence[dict] = (
+            profiles
+            if profiles is not None
+            else (await self.bot.db.get_guild_linked_profiles(member_ids) or ())
+        )
         deduped_profiles: list[tuple[str, dict]] = []
         seen_keys: set[str] = set()
-        for row in profiles:
+        for row in resolved_profiles:
             username = row["display_username"]
             profile_key = str(row.get("profile_key") or username).strip().lower()
             if not profile_key or profile_key in seen_keys:
@@ -229,7 +240,9 @@ class StatsCog(commands.Cog, name="Stats"):
             await asyncio.gather(*workers, return_exceptions=True)
             raise
 
-        updater = getattr(self.bot.db, "update_profiles_played_counts", None)
+        updater: Optional[Callable[..., Any]] = getattr(
+            self.bot.db, "update_profiles_played_counts", None
+        )
         if newly_observed and callable(updater):
             try:
                 await updater(newly_observed.items(), observed_at=current_now)
@@ -419,6 +432,162 @@ class StatsCog(commands.Cog, name="Stats"):
             freshness_note=freshness_note,
         )
         await send_public_followup(interaction, embed=embed)
+
+    @app_commands.command(
+        name="playing",
+        description="See what server members are currently playing on Backloggd",
+    )
+    @app_commands.guild_only()
+    @guild_cooldown("playing")
+    async def playing(self, interaction: discord.Interaction):
+        await defer_interaction(interaction)
+
+        if not interaction.guild:
+            await send_private_followup(
+                interaction,
+                "❌ This command must be run inside a Discord server.",
+                log=logger,
+            )
+            return
+
+        guild_member_ids = await resolve_guild_member_ids(self.bot, interaction.guild)
+        if guild_member_ids is None:
+            await send_private_followup(interaction, GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE, log=logger)
+            return
+
+        guild_name = interaction.guild.name
+        context = await self.bot.db.get_guild_stats_context(guild_member_ids)
+        profile_keys = context["profile_keys"]
+        profiles = context["profiles"]
+
+        if not profile_keys:
+            embed = create_playing_embed(
+                [],
+                guild_name=guild_name,
+                total_games=0,
+                total_players=0,
+                empty_message="*No one in this server has linked a Backloggd profile yet. Use `/link` to get started!*",
+            )
+            await send_public_followup(interaction, embed=embed)
+            return
+
+        freshness_note = await resolve_guild_aggregate_freshness(
+            self.bot,
+            guild_member_ids,
+            now=self.clock(),
+            profiles=profiles,
+            profiles_are_linked=True,
+            require_subscribed=True,
+        )
+
+        entries = await self.bot.db.get_server_currently_playing_for_profiles(profile_keys, limit=50)
+        if not entries:
+            if profiles and all(p.get("last_synced_at") is None for p in profiles):
+                empty_msg = (
+                    "*Linked Backloggd libraries are still syncing for the first time. "
+                    "Check back in a moment or run `/refresh`.*"
+                )
+            else:
+                empty_msg = (
+                    "*No one in this server currently has any games marked as Playing on Backloggd.*"
+                )
+            embed = create_playing_embed(
+                [],
+                guild_name=guild_name,
+                total_games=0,
+                total_players=0,
+                freshness_note=freshness_note,
+                empty_message=empty_msg,
+            )
+            await send_public_followup(interaction, embed=embed)
+            return
+
+        distinct_players = {
+            str(player).lower()
+            for entry in entries
+            for player in entry.get("players", ())
+        }
+        total_games = len(entries)
+        total_players = len(distinct_players)
+        page_size = 10
+        total_pages = max(1, (total_games + page_size - 1) // page_size)
+        pages = [
+            create_playing_embed(
+                entries[(page_num - 1) * page_size : page_num * page_size],
+                guild_name=guild_name,
+                total_games=total_games,
+                total_players=total_players,
+                page=page_num,
+                total_pages=total_pages,
+                freshness_note=freshness_note,
+            )
+            for page_num in range(1, total_pages + 1)
+        ]
+
+        if total_pages > 1:
+            author_id = getattr(getattr(interaction, "user", None), "id", None)
+            view = PaginatedEmbedView(author_id=author_id, pages=pages, command_name="/playing")
+            view.message = await send_public_followup(interaction, embed=pages[0], view=view, wait=True)
+        else:
+            await send_public_followup(interaction, embed=pages[0])
+
+    @app_commands.command(
+        name="server-recap",
+        description="View a recap of recent Backloggd activity announced in this server",
+    )
+    @app_commands.describe(period="Time window to summarize (default: 7 days)")
+    @app_commands.guild_only()
+    @guild_cooldown("server-stats")
+    async def server_recap(
+        self,
+        interaction: discord.Interaction,
+        period: RecapPeriod = "7 days",
+    ):
+        await defer_interaction(interaction)
+
+        if not interaction.guild:
+            await send_private_followup(
+                interaction,
+                "❌ This command must be run inside a Discord server.",
+                log=logger,
+            )
+            return
+
+        days = 30 if period == "30 days" else 7
+        now = self.clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        since_utc = now.astimezone(timezone.utc) - timedelta(days=days)
+
+        recap = await self.bot.db.get_guild_activity_recap(
+            interaction.guild.id,
+            since_utc=since_utc,
+        )
+        empty_message: Optional[str] = None
+        if int(recap.get("total_announcements", 0) or 0) == 0:
+            feed_channel = (
+                await self.bot.db.get_feed_channel(interaction.guild.id)
+                if hasattr(self.bot.db, "get_feed_channel")
+                else None
+            )
+            if feed_channel is None:
+                empty_message = (
+                    "*No activity feed channel is configured for this server yet. "
+                    "An admin can run `/setchannel` to start recording community recaps.*"
+                )
+            else:
+                empty_message = (
+                    f"*No feed announcements were recorded in this server in the last {period}.*"
+                )
+
+        embed = create_server_recap_embed(
+            recap,
+            guild_name=interaction.guild.name,
+            period_label=f"Last {period}",
+            empty_message=empty_message,
+        )
+        await send_public_followup(interaction, embed=embed)
+
 
 async def setup(bot):
     await bot.add_cog(StatsCog(bot))

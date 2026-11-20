@@ -247,7 +247,7 @@ def _plan_decision_for_entry(
                 allowed_from = ("eligible", "held_ambiguous")
         elif decision == "eligible":
             previous_payload = json.loads(chosen["payload"])
-            if event.activity_id in uncertain_reasons:
+            if uncertain_reasons and event.activity_id in uncertain_reasons:
                 decision, reason = "held_uncertain", uncertain_reasons[event.activity_id]
             elif event.played_date and event.played_date != previous_payload.get("played_date"):
                 discovery_time = parse_utc_datetime(chosen["observed_at"]) or now

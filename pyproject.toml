@@ -17,3 +17,15 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["bot"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["bot", "main.py"]
+exclude = [
+    "tests",
+    "tasks",
+    "verify_all.py",
+    "data",
+    ".venv",
+]

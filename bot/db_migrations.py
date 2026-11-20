@@ -9,6 +9,8 @@ from typing import Any
 Execute = Callable[[str, tuple | list], Awaitable[Any]]
 FetchOne = Callable[[str, tuple | list], Awaitable[Any]]
 
+LATEST_SCHEMA_VERSION = 15
+
 
 async def _migrate_profile_schema(execute: Execute, fetchone: FetchOne) -> None:
     """Move legacy per-member library rows to a normalized shared profile."""
@@ -561,6 +563,66 @@ async def _migrate_guild_feed_filters(execute: Execute, fetchone: FetchOne) -> N
     """, ())
 
 
+async def _migrate_guild_feed_spoiler_reviews(execute: Execute, fetchone: FetchOne) -> None:
+    """Add per-guild spoiler_reviews toggle to guild_feed_filters."""
+    row = await fetchone(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guild_feed_filters'",
+        (),
+    )
+    table_sql = (row["sql"] or "") if row else ""
+    if not re.search(r"\bspoiler_reviews\b", table_sql):
+        await execute(
+            "ALTER TABLE guild_feed_filters ADD COLUMN spoiler_reviews BOOLEAN NOT NULL DEFAULT 0",
+            (),
+        )
+
+
+async def _migrate_feed_recap_and_digests(execute: Execute, fetchone: FetchOne) -> None:
+    """Add indexed delivery timestamps to profile_feed_messages and create guild_digest_settings."""
+    msg_row = await fetchone(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'profile_feed_messages'",
+        (),
+    )
+    msg_sql = (msg_row["sql"] or "") if msg_row else ""
+    if not re.search(r"\brecorded_at\b", msg_sql):
+        await execute(
+            "ALTER TABLE profile_feed_messages ADD COLUMN recorded_at TIMESTAMP",
+            (),
+        )
+
+    await execute(
+        """CREATE INDEX IF NOT EXISTS idx_profile_feed_messages_guild_state_time
+           ON profile_feed_messages(guild_id, delivery_state, recorded_at)""",
+        (),
+    )
+
+    await execute(
+        """UPDATE profile_feed_messages
+           SET recorded_at = (
+               SELECT d.observed_at
+               FROM profile_feed_decisions AS d
+               WHERE d.guild_id = profile_feed_messages.guild_id
+                 AND d.profile_key = profile_feed_messages.profile_key
+                 AND d.event_id = profile_feed_messages.event_id
+               LIMIT 1
+           )
+           WHERE delivery_state = 'sent'
+             AND recorded_at IS NULL""",
+        (),
+    )
+
+    await execute(
+        """CREATE TABLE IF NOT EXISTS guild_digest_settings (
+               guild_id INTEGER PRIMARY KEY,
+               channel_id INTEGER NOT NULL,
+               cadence TEXT NOT NULL,
+               last_sent_at TIMESTAMP,
+               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+           )""",
+        (),
+    )
+
+
 async def run_migrations(database) -> None:
     """Apply every pending migration atomically on SQLite or libSQL."""
     await database._execute("""
@@ -612,3 +674,9 @@ async def run_migrations(database) -> None:
         if version < 13:
             await _migrate_guild_feed_filters(tx.execute, tx.fetchone)
             await tx.execute("INSERT INTO schema_migrations (version) VALUES (13)")
+        if version < 14:
+            await _migrate_guild_feed_spoiler_reviews(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (14)")
+        if version < 15:
+            await _migrate_feed_recap_and_digests(tx.execute, tx.fetchone)
+            await tx.execute("INSERT INTO schema_migrations (version) VALUES (15)")

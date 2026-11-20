@@ -2,7 +2,8 @@
 
 import asyncio
 import logging
-from typing import Optional
+from datetime import timedelta, timezone
+from typing import Literal, Optional
 
 import discord
 from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
@@ -15,7 +16,8 @@ from bot.command_errors import (
     send_ephemeral_error,
     send_private_followup,
 )
-from bot.feed_policy import DEFAULT_GUILD_FEED_FILTERS
+from bot.feed_models import FeedEvent
+from bot.feed_policy import DEFAULT_GUILD_FEED_SETTINGS
 from bot.input_validation import (
     InvalidUsernameError,
     escape_display_text,
@@ -24,10 +26,14 @@ from bot.input_validation import (
 from bot.services.feed_pipeline import FeedPipeline
 from bot.services.library_sync import parse_sync_timestamp
 from bot.services.task_lifecycle import TaskDrainGroup
+from bot.ui.embeds import create_server_recap_embed
+from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, format_health_error_excerpt
 from bot.ui.views import FeedListView
 
 logger = logging.getLogger("backloggd.cogs.feed")
+
+DigestCadenceChoice = Literal["View", "Weekly", "Monthly", "Off"]
 
 _FEED_FILTER_LABELS: tuple[tuple[str, str], ...] = (
     ("allow_started", "Started"),
@@ -58,19 +64,22 @@ class FeedCog(commands.Cog, name="Feed"):
         return self._drain_group._draining_task
 
     async def cog_load(self):
-        # Start loop when cog is loaded and bot event loop is active
+        # Start background loops when cog is loaded and bot event loop is active
         if not self._closing and not self.journal_feed_loop.is_running():
             self.journal_feed_loop.start()
+        if not self._closing and not self.digest_loop.is_running():
+            self.digest_loop.start()
 
     async def close(self) -> None:
-        """Stop accepting polls, cancel the loop and wait for its work to unwind."""
+        """Stop accepting polls/digests, cancel background loops, and wait for work to unwind."""
         async def _drain_feed(caller: asyncio.Task | None) -> None:
             drain_task = asyncio.current_task()
-            task = self.journal_feed_loop.get_task()
-            if task is not None and task is not caller and task is not drain_task:
-                if not task.done() and not task.cancelling():
-                    self.journal_feed_loop.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            for loop in (self.journal_feed_loop, self.digest_loop):
+                task = loop.get_task()
+                if task is not None and task is not caller and task is not drain_task:
+                    if not task.done() and not task.cancelling():
+                        loop.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             await self.pipeline.close(exclude_task=caller)
 
         await self._drain_group.close(before_drain=_drain_feed)
@@ -407,41 +416,154 @@ class FeedCog(commands.Cog, name="Feed"):
             message = "Your participation is off, but this profile remains in this server's feed through another linked member."
         await send_private_followup(interaction, message, log=logger)
 
-    @feed.command(name="status", description="Show your profile's feed participation in this server")
-    async def feed_status(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        await defer_interaction(interaction, ephemeral=True)
-        linked = await self.bot.db.get_linked_user(interaction.user.id)
-        if not linked:
-            await send_private_followup(
-                interaction,
-                "No Backloggd profile is linked to your Discord account. Use `/link` first.",
-                log=logger,
+    @staticmethod
+    def _format_pending_continuity_line(status: dict) -> Optional[str]:
+        if not status.get("pending_reconciliation"):
+            return None
+        pending_continuity = status.get("pending_continuity")
+        had_admin = (
+            bool(pending_continuity.get("had_admin_source"))
+            if isinstance(pending_continuity, dict)
+            else False
+        )
+        candidate_count = (
+            int(pending_continuity.get("candidate_member_count") or 0)
+            if isinstance(pending_continuity, dict)
+            else 0
+        )
+        if had_admin and candidate_count > 0:
+            return (
+                f"Continuity unverified: awaiting a complete member snapshot to check prior admin and {candidate_count} candidate member source(s); neither continuity nor a reset has been confirmed."
             )
-            return
-        profile_key = linked["profile_key"]
-        username = linked["backloggd_username"]
-        enabled = await self.bot.db.get_guild_feed_preference(interaction.guild_id, interaction.user.id)
-        channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
-        member_ids = await self.pipeline.authoritative_member_ids(interaction.guild)
-        sources = (
-            await self.bot.db.get_guild_profile_member_sources(
-                interaction.guild_id, profile_key, member_ids
-            ) if member_ids is not None else []
+        if had_admin:
+            return (
+                "Continuity unverified: awaiting a complete member snapshot to check a prior admin follow; neither continuity nor a reset has been confirmed."
+            )
+        if candidate_count > 0:
+            return (
+                f"Continuity unverified: awaiting a complete member snapshot to check {candidate_count} prior member candidate(s); neither continuity nor a reset has been confirmed."
+            )
+        return (
+            "Continuity unverified: awaiting a complete member snapshot; no prior member candidates remain, pending final snapshot confirmation."
         )
-        admin_source = await self.bot.db.has_guild_admin_follow(
-            interaction.guild_id, profile_key
-        )
-        status = await self.bot.db.get_guild_profile_feed_status(interaction.guild_id, profile_key)
-        is_candidate = bool(sources or admin_source) if member_ids is not None else bool(enabled or admin_source)
-        _, _, target_issue = self.pipeline.inspect_target_channel(
-            interaction.guild_id,
-            channel_id,
-            guild=interaction.guild,
-            require_channel_lookup=False,
-        )
+
+    def _format_feed_source_health_lines(self, status: dict) -> list[str]:
+        initialized = set(status.get("initialized_sources") or [])
+        health_by_source = {row["source"]: row for row in (status.get("source_health") or [])}
+        recipient_gap = status.get("recipient_gap")
+        has_attributed_recipient_gaps = bool(status.get("has_attributed_recipient_gaps"))
+        source_lines = []
+        for source_name, display_name in (("activity", "Activity"), ("journal", "Journal")):
+            marker = f"{source_name}-display-v1"
+            baselined = "Initialized" if marker in initialized else "Pending baseline"
+            row = health_by_source.get(source_name)
+            if not row:
+                line = f"**{display_name}:** {baselined} · Last check: Never"
+                if source_name == "activity" and recipient_gap is not None:
+                    rg_since = self._format_rel_timestamp(recipient_gap.get("gap_since"))
+                    line += f" · Recipient gap: {rg_since} \u2192 present"
+                    if recipient_gap.get("last_error"):
+                        err = format_health_error_excerpt(recipient_gap["last_error"], max_length=120)
+                        line += f" · Error: {err}"
+                source_lines.append(line)
+                continue
+            last_ok = self._format_rel_timestamp(row["last_success_at"])
+            cov = str(row["coverage"] or "unknown").replace("`", "")
+            line = f"**{display_name}:** {baselined} · Last OK: {last_ok} · Coverage: `{cov}`"
+            health_keys = row.keys()
+            gap_since_raw = row["unresolved_gap_since"]
+            gap_until_raw = (
+                row["unresolved_gap_until"]
+                if "unresolved_gap_until" in health_keys else None
+            )
+            gap_reason = row["gap_reason"] if "gap_reason" in health_keys else None
+            is_recipient_reason = gap_reason in {"unavailable_feed_target", "delivery_failure"}
+            mask_shared_recipient_gap = (
+                source_name == "activity"
+                and recipient_gap is None
+                and has_attributed_recipient_gaps
+                and is_recipient_reason
+            )
+            if mask_shared_recipient_gap:
+                gap_since_raw = None
+                gap_until_raw = None
+                gap_reason = None
+            gap_since_at = parse_sync_timestamp(gap_since_raw)
+            gap_until_at = parse_sync_timestamp(gap_until_raw)
+            last_boundary_at = (
+                row["last_continuous_boundary_at"]
+                if "last_continuous_boundary_at" in health_keys else None
+            )
+            if gap_since_at and gap_until_at and gap_until_at < gap_since_at:
+                line += " · Gap bounds conflict; extent unknown"
+            elif gap_since_raw:
+                gap_label = {
+                    "unavailable_feed_target": "Recipient gap",
+                    "delivery_failure": "Recipient gap",
+                    "source_failure": "Continuity gap",
+                }.get(gap_reason or "", "Coverage gap")
+                gap_since = self._format_rel_timestamp(gap_since_raw)
+                gap_until = self._format_rel_timestamp(gap_until_raw) if gap_until_raw else "present"
+                line += f" · {gap_label}: {gap_since} \u2192 {gap_until}"
+            elif gap_reason or cov in {"limited", "unsupported"}:
+                line += " · Coverage extent unknown (no continuous boundary)"
+            if (
+                cov in {"limited", "unsupported"}
+                and last_boundary_at is None
+                and gap_since_raw
+            ):
+                line += " · Source extent unknown (no continuous boundary)"
+            if (
+                source_name == "activity"
+                and recipient_gap is not None
+                and not (gap_since_raw and is_recipient_reason)
+            ):
+                rg_since = self._format_rel_timestamp(recipient_gap.get("gap_since"))
+                line += f" · Recipient gap: {rg_since} \u2192 present"
+            if row["last_error"]:
+                err = format_health_error_excerpt(row["last_error"], max_length=120)
+                line += f" · Error: {err}"
+            elif source_name == "activity" and recipient_gap is not None and recipient_gap.get("last_error"):
+                err = format_health_error_excerpt(recipient_gap["last_error"], max_length=120)
+                line += f" · Error: {err}"
+            source_lines.append(line)
+        return source_lines
+
+    @staticmethod
+    def _format_feed_policy_summary(status: dict, disabled_filter_labels: list[str]) -> str:
+        suppressions = status.get("suppression_counts") or {}
+        deliveries = status.get("delivery_counts") or {}
+        policy_parts = [
+            f"Old (>7d): {suppressions.get('suppressed_old', 0)}",
+            f"Pre-activation: {suppressions.get('suppressed_pre_activation', 0)}",
+            f"Uncertain time: {suppressions.get('held_uncertain', 0)}",
+            f"Future-dated: {suppressions.get('held_future', 0)}",
+            f"Ambiguous edits: {suppressions.get('held_ambiguous', 0)}",
+        ]
+        filtered_count = suppressions.get("filtered", 0)
+        if filtered_count or disabled_filter_labels:
+            policy_parts.append(f"Filtered: {filtered_count}")
+        unknown_deliveries = deliveries.get("unknown", 0)
+        pending_deliveries = deliveries.get("pending", 0)
+        if unknown_deliveries or pending_deliveries:
+            policy_parts.append(f"Unknown send outcomes: {unknown_deliveries}")
+            policy_parts.append(f"Pending sends: {pending_deliveries}")
+        return " · ".join(policy_parts)
+
+    def _build_feed_status_embed(
+        self,
+        *,
+        username: str,
+        enabled: bool,
+        channel_id: Optional[int],
+        member_ids,
+        sources,
+        admin_source: bool,
+        status: dict,
+        is_candidate: bool,
+        target_issue: Optional[str],
+        guild_filters: dict[str, bool],
+    ) -> discord.Embed:
         effective_state = self._describe_profile_feed_state(
             channel_id=channel_id,
             status=status,
@@ -500,35 +622,18 @@ class FeedCog(commands.Cog, name="Feed"):
             desc_lines.append("An admin follow keeps this public profile active in this server's feed.")
         elif sources and not enabled:
             desc_lines.append("Another linked server member keeps this public profile active in this server's feed.")
-        if status.get("pending_reconciliation"):
-            pending_continuity = status.get("pending_continuity")
-            had_admin = bool(pending_continuity.get("had_admin_source")) if isinstance(pending_continuity, dict) else False
-            candidate_count = int(pending_continuity.get("candidate_member_count") or 0) if isinstance(pending_continuity, dict) else 0
-            if had_admin and candidate_count > 0:
-                desc_lines.append(
-                    f"Continuity unverified: awaiting a complete member snapshot to check prior admin and {candidate_count} candidate member source(s); neither continuity nor a reset has been confirmed."
-                )
-            elif had_admin:
-                desc_lines.append(
-                    "Continuity unverified: awaiting a complete member snapshot to check a prior admin follow; neither continuity nor a reset has been confirmed."
-                )
-            elif candidate_count > 0:
-                desc_lines.append(
-                    f"Continuity unverified: awaiting a complete member snapshot to check {candidate_count} prior member candidate(s); neither continuity nor a reset has been confirmed."
-                )
-            else:
-                desc_lines.append(
-                    "Continuity unverified: awaiting a complete member snapshot; no prior member candidates remain, pending final snapshot confirmation."
-                )
+        pending_line = self._format_pending_continuity_line(status)
+        if pending_line:
+            desc_lines.append(pending_line)
 
-        if hasattr(self.bot.db, "get_guild_feed_filters"):
-            guild_filters = await self.bot.db.get_guild_feed_filters(interaction.guild_id)
-        else:
-            guild_filters = dict(DEFAULT_GUILD_FEED_FILTERS)
         disabled_filter_labels = self._disabled_feed_filter_labels(guild_filters)
         if disabled_filter_labels:
             desc_lines.append(
                 f"**Server filters:** Excluding {', '.join(disabled_filter_labels)}"
+            )
+        if guild_filters.get("spoiler_reviews", False):
+            desc_lines.append(
+                "**Review spoilers:** Wrapping all announced review notes in `||spoilers||`"
             )
 
         embed = discord.Embed(
@@ -536,115 +641,73 @@ class FeedCog(commands.Cog, name="Feed"):
             description=clamp_escaped_text("\n".join(desc_lines), 4096),
             color=discord.Color.blurple(),
         )
-
-        initialized = set(status.get("initialized_sources") or [])
-        health_by_source = {row["source"]: row for row in (status.get("source_health") or [])}
-        recipient_gap = status.get("recipient_gap")
-        has_attributed_recipient_gaps = bool(status.get("has_attributed_recipient_gaps"))
-        source_lines = []
-        for source_name, display_name in (("activity", "Activity"), ("journal", "Journal")):
-            marker = f"{source_name}-display-v1"
-            baselined = "Initialized" if marker in initialized else "Pending baseline"
-            row = health_by_source.get(source_name)
-            if not row:
-                line = f"**{display_name}:** {baselined} · Last check: Never"
-                if source_name == "activity" and recipient_gap is not None:
-                    rg_since = self._format_rel_timestamp(recipient_gap.get("gap_since"))
-                    line += f" · Recipient gap: {rg_since} \u2192 present"
-                    if recipient_gap.get("last_error"):
-                        err = format_health_error_excerpt(recipient_gap["last_error"], max_length=120)
-                        line += f" · Error: {err}"
-                source_lines.append(line)
-                continue
-            last_ok = self._format_rel_timestamp(row["last_success_at"])
-            cov = str(row["coverage"] or "unknown").replace("`", "")
-            line = f"**{display_name}:** {baselined} · Last OK: {last_ok} · Coverage: `{cov}`"
-            health_keys = row.keys()
-            gap_since_raw = row["unresolved_gap_since"]
-            gap_until_raw = (
-                row["unresolved_gap_until"]
-                if "unresolved_gap_until" in health_keys else None
-            )
-            gap_reason = row["gap_reason"] if "gap_reason" in health_keys else None
-            is_recipient_reason = gap_reason in {"unavailable_feed_target", "delivery_failure"}
-            mask_shared_recipient_gap = (
-                source_name == "activity"
-                and recipient_gap is None
-                and has_attributed_recipient_gaps
-                and is_recipient_reason
-            )
-            if mask_shared_recipient_gap:
-                gap_since_raw = None
-                gap_until_raw = None
-                gap_reason = None
-            gap_since_at = parse_sync_timestamp(gap_since_raw)
-            gap_until_at = parse_sync_timestamp(gap_until_raw)
-            last_boundary_at = (
-                row["last_continuous_boundary_at"]
-                if "last_continuous_boundary_at" in health_keys else None
-            )
-            if gap_since_at and gap_until_at and gap_until_at < gap_since_at:
-                line += " · Gap bounds conflict; extent unknown"
-            elif gap_since_raw:
-                gap_label = {
-                    "unavailable_feed_target": "Recipient gap",
-                    "delivery_failure": "Recipient gap",
-                    "source_failure": "Continuity gap",
-                }.get(gap_reason, "Coverage gap")
-                gap_since = self._format_rel_timestamp(gap_since_raw)
-                gap_until = self._format_rel_timestamp(gap_until_raw) if gap_until_raw else "present"
-                line += f" · {gap_label}: {gap_since} \u2192 {gap_until}"
-            elif gap_reason or cov in {"limited", "unsupported"}:
-                line += " · Coverage extent unknown (no continuous boundary)"
-            if (
-                cov in {"limited", "unsupported"}
-                and last_boundary_at is None
-                and gap_since_raw
-            ):
-                line += " · Source extent unknown (no continuous boundary)"
-            if (
-                source_name == "activity"
-                and recipient_gap is not None
-                and not (gap_since_raw and is_recipient_reason)
-            ):
-                rg_since = self._format_rel_timestamp(recipient_gap.get("gap_since"))
-                line += f" · Recipient gap: {rg_since} \u2192 present"
-            if row["last_error"]:
-                err = format_health_error_excerpt(row["last_error"], max_length=120)
-                line += f" · Error: {err}"
-            elif source_name == "activity" and recipient_gap is not None and recipient_gap.get("last_error"):
-                err = format_health_error_excerpt(recipient_gap["last_error"], max_length=120)
-                line += f" · Error: {err}"
-            source_lines.append(line)
         embed.add_field(
             name="Source Health & Coverage",
-            value=clamp_escaped_text("\n".join(source_lines), 1024),
+            value=clamp_escaped_text("\n".join(self._format_feed_source_health_lines(status)), 1024),
             inline=False,
         )
-
-        suppressions = status.get("suppression_counts") or {}
-        deliveries = status.get("delivery_counts") or {}
-        policy_parts = [
-            f"Old (>7d): {suppressions.get('suppressed_old', 0)}",
-            f"Pre-activation: {suppressions.get('suppressed_pre_activation', 0)}",
-            f"Uncertain time: {suppressions.get('held_uncertain', 0)}",
-            f"Future-dated: {suppressions.get('held_future', 0)}",
-            f"Ambiguous edits: {suppressions.get('held_ambiguous', 0)}",
-        ]
-        filtered_count = suppressions.get("filtered", 0)
-        if filtered_count or disabled_filter_labels:
-            policy_parts.append(f"Filtered: {filtered_count}")
-        unknown_deliveries = deliveries.get("unknown", 0)
-        pending_deliveries = deliveries.get("pending", 0)
-        if unknown_deliveries or pending_deliveries:
-            policy_parts.append(f"Unknown send outcomes: {unknown_deliveries}")
-            policy_parts.append(f"Pending sends: {pending_deliveries}")
         embed.add_field(
             name="Suppressed & Held Items",
-            value=clamp_escaped_text(" · ".join(policy_parts), 1024),
+            value=clamp_escaped_text(
+                self._format_feed_policy_summary(status, disabled_filter_labels), 1024
+            ),
             inline=False,
         )
         embed.set_footer(text="Feed source health is separate from library cache freshness (/profile, /refresh).")
+        return embed
+
+    @feed.command(name="status", description="Show your profile's feed participation in this server")
+    async def feed_status(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        await defer_interaction(interaction, ephemeral=True)
+        linked = await self.bot.db.get_linked_user(interaction.user.id)
+        if not linked:
+            await send_private_followup(
+                interaction,
+                "No Backloggd profile is linked to your Discord account. Use `/link` first.",
+                log=logger,
+            )
+            return
+        profile_key = linked["profile_key"]
+        username = linked["backloggd_username"]
+        enabled = await self.bot.db.get_guild_feed_preference(interaction.guild_id, interaction.user.id)
+        channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
+        member_ids = await self.pipeline.authoritative_member_ids(interaction.guild)
+        sources = (
+            await self.bot.db.get_guild_profile_member_sources(
+                interaction.guild_id, profile_key, member_ids
+            ) if member_ids is not None else []
+        )
+        admin_source = await self.bot.db.has_guild_admin_follow(
+            interaction.guild_id, profile_key
+        )
+        status = await self.bot.db.get_guild_profile_feed_status(interaction.guild_id, profile_key)
+        is_candidate = bool(sources or admin_source) if member_ids is not None else bool(enabled or admin_source)
+        _, _, target_issue = self.pipeline.inspect_target_channel(
+            interaction.guild.id,
+            channel_id,
+            guild=interaction.guild,
+            require_channel_lookup=False,
+        )
+        if hasattr(self.bot.db, "get_guild_feed_filters"):
+            guild_filters = await self.bot.db.get_guild_feed_filters(interaction.guild_id)
+        else:
+            guild_filters = dict(DEFAULT_GUILD_FEED_SETTINGS)
+
+        embed = self._build_feed_status_embed(
+            username=username,
+            enabled=enabled,
+            channel_id=channel_id,
+            member_ids=member_ids,
+            sources=sources,
+            admin_source=admin_source,
+            status=status,
+            is_candidate=is_candidate,
+            target_issue=target_issue,
+            guild_filters=guild_filters,
+        )
         await send_private_followup(interaction, embed=embed, log=logger)
 
     def _feed_list_pages(self, candidates, channel_id):
@@ -805,7 +868,7 @@ class FeedCog(commands.Cog, name="Feed"):
             return
         channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
         _, _, target_issue = self.pipeline.inspect_target_channel(
-            interaction.guild_id,
+            interaction.guild.id,
             channel_id,
             guild=interaction.guild,
             require_channel_lookup=False,
@@ -845,6 +908,15 @@ class FeedCog(commands.Cog, name="Feed"):
             icon = "✅" if enabled else "❌"
             state = "Enabled" if enabled else "Disabled"
             lines.append(f"{icon} **{label}** — {state}")
+        spoiler_enabled = bool(filters.get("spoiler_reviews", False))
+        spoiler_icon = "🫣" if spoiler_enabled else "🔓"
+        spoiler_state = (
+            "Enabled (wrapping all review notes in `||spoilers||`)"
+            if spoiler_enabled
+            else "Disabled (only Backloggd spoiler-flagged reviews)"
+        )
+        lines.append("")
+        lines.append(f"{spoiler_icon} **Spoiler all reviews** — {spoiler_state}")
         return "\n".join(lines)
 
     @feed.command(
@@ -857,6 +929,7 @@ class FeedCog(commands.Cog, name="Feed"):
         replays="Announce replay playthrough logs",
         ratings="Announce explicit ratings and rating changes",
         reviews="Announce written reviews",
+        spoiler_reviews="Wrap all announced review notes in Discord spoiler tags (||...||)",
     )
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_channels=True)
@@ -868,6 +941,7 @@ class FeedCog(commands.Cog, name="Feed"):
         replays: Optional[bool] = None,
         ratings: Optional[bool] = None,
         reviews: Optional[bool] = None,
+        spoiler_reviews: Optional[bool] = None,
     ):
         if interaction.guild is None:
             await interaction.response.send_message(
@@ -877,7 +951,7 @@ class FeedCog(commands.Cog, name="Feed"):
         await defer_interaction(interaction, ephemeral=True)
         has_changes = any(
             value is not None
-            for value in (started, finished, replays, ratings, reviews)
+            for value in (started, finished, replays, ratings, reviews, spoiler_reviews)
         )
         if has_changes:
             filters = await self.bot.db.set_guild_feed_filters(
@@ -887,6 +961,7 @@ class FeedCog(commands.Cog, name="Feed"):
                 allow_replays=replays,
                 allow_ratings=ratings,
                 allow_reviews=reviews,
+                spoiler_reviews=spoiler_reviews,
             )
             title = "Updated Server Feed Filters"
             note = (
@@ -897,8 +972,8 @@ class FeedCog(commands.Cog, name="Feed"):
             filters = await self.bot.db.get_guild_feed_filters(interaction.guild_id)
             title = "Server Feed Filters"
             note = (
-                "Use `/feed filter` options (for example `started:False`) to toggle "
-                "categories for this server."
+                "Use `/feed filter` options (for example `started:False` or `spoiler_reviews:True`) "
+                "to toggle categories and review formatting for this server."
             )
 
         disabled = self._disabled_feed_filter_labels(filters)
@@ -912,12 +987,245 @@ class FeedCog(commands.Cog, name="Feed"):
         )
         await send_private_followup(interaction, embed=embed, log=logger)
 
+    @feed.command(
+        name="test",
+        description="Post a sample announcement to verify this server's feed channel and permissions",
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_channels=True)
+    async def feed_test(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        await defer_interaction(interaction, ephemeral=True)
+        channel_id = await self.bot.db.get_feed_channel(interaction.guild_id)
+        if channel_id is None:
+            await send_private_followup(
+                interaction,
+                (
+                    "❌ No activity feed channel is configured for this server yet. "
+                    "Run `/setchannel` first."
+                ),
+                log=logger,
+            )
+            return
+
+        channel, _reason_code, summary = self.pipeline.inspect_target_channel(
+            interaction.guild.id,
+            channel_id,
+            guild=interaction.guild,
+            require_channel_lookup=True,
+        )
+        if channel is None:
+            await send_private_followup(
+                interaction,
+                (
+                    f"❌ Cannot post to the configured feed channel: "
+                    f"{summary or f'Configured channel <#{channel_id}> is unavailable'}. "
+                    "Check channel permissions or run `/setchannel` to choose another text channel."
+                ),
+                log=logger,
+            )
+            return
+
+        if hasattr(self.bot.db, "get_guild_feed_filters"):
+            guild_filters = await self.bot.db.get_guild_feed_filters(interaction.guild_id)
+        else:
+            guild_filters = dict(DEFAULT_GUILD_FEED_SETTINGS)
+
+        now = self.pipeline.clock()
+        sample_event = FeedEvent(
+            activity_id="feed_test_sample",
+            game_title="Test Announcement (Sample Game)",
+            game_slug="hades",
+            cover_url=None,
+            action_type="completed",
+            action_text="completed",
+            rating=4.5,
+            review_notes=(
+                "Sample review note verifying your server's activity feed channel, "
+                "embed permissions, and review spoiler settings."
+            ),
+            date_str=now.strftime("%b %d, %Y"),
+            occurred_at=now.isoformat(),
+            played_date=now.date().isoformat(),
+            is_replay=False,
+            session_labels=("Finished",),
+            source="test",
+            event_ids=("feed_test_sample",),
+        )
+        embed = create_journal_feed_embed(
+            "BackloggdTest",
+            None,
+            sample_event,
+            now=now,
+            force_spoiler_reviews=bool(guild_filters.get("spoiler_reviews", False)),
+        )
+        embed.set_footer(
+            text="Test announcement sent by /feed test • No real feed history was affected"
+        )
+
+        try:
+            sent_message = await channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            await send_private_followup(
+                interaction,
+                (
+                    f"❌ Discord rejected sending to <#{channel.id}> (`Missing Permissions`). "
+                    "Verify **View Channel**, **Send Messages**, and **Embed Links**."
+                ),
+                log=logger,
+            )
+            return
+        except discord.HTTPException as exc:
+            await send_private_followup(
+                interaction,
+                (
+                    f"❌ Failed to send test announcement to <#{channel.id}> "
+                    f"(Discord HTTP error `{getattr(exc, 'status', 'unknown')}`)."
+                ),
+                log=logger,
+            )
+            return
+
+        jump_url = getattr(sent_message, "jump_url", None)
+        jump_suffix = f" ([Jump to message]({jump_url}))" if jump_url else ""
+        await send_private_followup(
+            interaction,
+            f"✅ Sent a test announcement to <#{channel.id}>{jump_suffix}.",
+            log=logger,
+        )
+
+    @feed.command(
+        name="digest",
+        description="Configure an optional scheduled Weekly or Monthly server activity digest",
+    )
+    @app_commands.describe(
+        cadence="View current schedule, enable Weekly or Monthly digests, or turn Off",
+        channel="Optional text channel for digests (defaults to this server's feed channel)",
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_channels=True)
+    async def feed_digest(
+        self,
+        interaction: discord.Interaction,
+        cadence: DigestCadenceChoice = "View",
+        channel: Optional[discord.TextChannel] = None,
+    ):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        await defer_interaction(interaction, ephemeral=True)
+
+        if cadence == "View":
+            current = await self.bot.db.get_guild_digest(interaction.guild_id)
+            if not current:
+                embed = discord.Embed(
+                    title="Scheduled Server Digest",
+                    description=(
+                        "Scheduled server digests are currently **Off**.\n\n"
+                        "Use `/feed digest cadence:Weekly` or `/feed digest cadence:Monthly` "
+                        "(optionally with a `channel`) to post automatic activity recaps."
+                    ),
+                    color=discord.Color.blurple(),
+                )
+            else:
+                cadence_label = current["cadence"].capitalize()
+                window_days = 30 if current["cadence"] == "monthly" else 7
+                last_dt = parse_sync_timestamp(current.get("last_sent_at"))
+                last_text = self._format_rel_timestamp(current.get("last_sent_at"))
+                next_line = ""
+                if last_dt is not None:
+                    next_ts = int((last_dt + timedelta(days=window_days)).timestamp())
+                    next_line = f"\n**Next window ends:** <t:{next_ts}:R>"
+                embed = discord.Embed(
+                    title="Scheduled Server Digest",
+                    description=(
+                        f"**Status:** Enabled (**{cadence_label}**)\n"
+                        f"**Channel:** <#{current['channel_id']}>\n"
+                        f"**Last window marker:** {last_text}{next_line}\n\n"
+                        "Empty windows are skipped quietly. Run `/feed digest cadence:Off` to disable."
+                    ),
+                    color=discord.Color.blurple(),
+                )
+            await send_private_followup(interaction, embed=embed, log=logger)
+            return
+
+        if cadence == "Off":
+            removed = await self.bot.db.unset_guild_digest(interaction.guild_id)
+            if removed:
+                msg = "✅ Disabled scheduled server digests for this server."
+            else:
+                msg = "ℹ️ Scheduled server digests are already disabled for this server."
+            await send_private_followup(interaction, msg, log=logger)
+            return
+
+        target_channel_id = (
+            channel.id
+            if channel is not None
+            else await self.bot.db.get_feed_channel(interaction.guild_id)
+        )
+        if target_channel_id is None:
+            await send_private_followup(
+                interaction,
+                (
+                    "❌ No target channel specified and no feed channel is configured yet. "
+                    "Pass a `channel` option or run `/setchannel` first."
+                ),
+                log=logger,
+            )
+            return
+
+        checked_channel, _reason_code, summary = self.pipeline.inspect_target_channel(
+            interaction.guild.id,
+            target_channel_id,
+            guild=interaction.guild,
+            require_channel_lookup=True,
+        )
+        if checked_channel is None:
+            await send_private_followup(
+                interaction,
+                (
+                    f"❌ Cannot schedule digests in <#{target_channel_id}>: "
+                    f"{summary or 'Channel is unavailable'}."
+                ),
+                log=logger,
+            )
+            return
+
+        saved = await self.bot.db.set_guild_digest(
+            interaction.guild_id,
+            checked_channel.id,
+            cadence.lower(),
+            now=self.pipeline.clock(),
+        )
+        window_days = 30 if saved["cadence"] == "monthly" else 7
+        cadence_label = saved["cadence"].capitalize()
+        await send_private_followup(
+            interaction,
+            (
+                f"✅ Enabled **{cadence_label}** server digests in <#{saved['channel_id']}>. "
+                f"Digests post automatically every {window_days} days when there is new feed activity "
+                "(empty windows are skipped quietly)."
+            ),
+            log=logger,
+        )
+
     @setchannel.error
     @unsetchannel.error
     @feed_add.error
     @feed_remove.error
     @feed_list.error
     @feed_filter.error
+    @feed_test.error
+    @feed_digest.error
     async def channel_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
             reply = "❌ You need the **Manage Channels** permission to configure or manage the server activity feed."
@@ -928,8 +1236,79 @@ class FeedCog(commands.Cog, name="Feed"):
         mark_interaction_error_handled(interaction)
         await send_ephemeral_error(interaction, reply, log=logger)
 
+    async def run_due_digests(self) -> int:
+        """Check scheduled server digests and post any that are due with non-empty activity."""
+        if self._closing or not hasattr(self.bot.db, "get_all_guild_digests"):
+            return 0
+        now = self.pipeline.clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+
+        digests = await self.bot.db.get_all_guild_digests()
+        posted = 0
+        for row in digests:
+            if self._closing:
+                break
+            guild_id = int(row["guild_id"])
+            channel_id = int(row["channel_id"])
+            cadence = str(row.get("cadence") or "weekly").strip().lower()
+            window_days = 30 if cadence == "monthly" else 7
+            period_label = "Monthly" if cadence == "monthly" else "Weekly"
+
+            last_sent_dt = parse_sync_timestamp(row.get("last_sent_at"))
+            if last_sent_dt is not None and (now - last_sent_dt) < timedelta(days=window_days):
+                continue
+
+            channel, reason_code, _summary = self.pipeline.inspect_target_channel(
+                guild_id,
+                channel_id,
+                require_channel_lookup=True,
+            )
+            if channel is None:
+                logger.debug(
+                    "Skipping scheduled %s digest for guild %d: %s",
+                    cadence,
+                    guild_id,
+                    reason_code or "channel_unavailable",
+                )
+                continue
+
+            since_utc = now - timedelta(days=window_days)
+            recap = await self.bot.db.get_guild_activity_recap(guild_id, since_utc=since_utc)
+            if int(recap.get("total_announcements", 0) or 0) <= 0:
+                await self.bot.db.mark_guild_digest_sent(guild_id, sent_at=now)
+                continue
+
+            guild_name = getattr(getattr(channel, "guild", None), "name", None) or "Server"
+            embed = create_server_recap_embed(
+                recap,
+                guild_name=guild_name,
+                period_label=period_label,
+                is_digest=True,
+            )
+            try:
+                await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "Failed to post scheduled %s digest for guild %d in channel %d: %s",
+                    cadence,
+                    guild_id,
+                    channel_id,
+                    exc,
+                )
+                continue
+
+            await self.bot.db.mark_guild_digest_sent(guild_id, sent_at=now)
+            posted += 1
+
+        return posted
+
     # =========================================================================
-    # Background Polling Task Loop (Filmlinkd-style)
+    # Background Polling Task Loops (Filmlinkd-style + Scheduled Digests)
     # =========================================================================
 
     @tasks.loop(minutes=5.0)
@@ -940,6 +1319,20 @@ class FeedCog(commands.Cog, name="Feed"):
     @journal_feed_loop.before_loop
     async def before_feed_loop(self):
         """Wait until bot is fully logged in before running the background feed."""
+        try:
+            await self.bot.wait_until_ready()
+        except RuntimeError:
+            # Raised if testing offline without bot.start()
+            pass
+
+    @tasks.loop(hours=1.0)
+    async def digest_loop(self):
+        if not self._closing:
+            await self.run_due_digests()
+
+    @digest_loop.before_loop
+    async def before_digest_loop(self):
+        """Wait until bot is fully logged in before running scheduled server digests."""
         try:
             await self.bot.wait_until_ready()
         except RuntimeError:

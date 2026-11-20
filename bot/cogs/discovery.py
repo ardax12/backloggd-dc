@@ -98,10 +98,8 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         user: Optional[discord.Member] = None,
         pool: RoulettePool = "Both",
     ):
-        pool_spec = _ROULETTE_POOLS.get(pool.strip().lower()) if isinstance(pool, str) else None
-        if pool_spec is None:
+        if not isinstance(pool, str) or pool.strip().lower() not in _ROULETTE_POOLS:
             raise ValueError(f"Unsupported roulette pool: {pool!r}")
-        pool_key, pool_label, pool_empty_label = pool_spec
 
         await defer_interaction(interaction)
 
@@ -119,6 +117,32 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
 
         username = linked["backloggd_username"]
         profile_key = self._linked_profile_key(linked)
+        await self._execute_roulette_for_profile(
+            interaction,
+            profile_key=profile_key,
+            username=username,
+            pool=pool,
+            discord_id=target_discord_id,
+        )
+
+    async def _execute_roulette_for_profile(
+        self,
+        interaction: discord.Interaction,
+        *,
+        profile_key: str,
+        username: str,
+        pool: RoulettePool = "Both",
+        discord_id: Optional[int] = None,
+    ) -> None:
+        pool_spec = _ROULETTE_POOLS.get(pool.strip().lower()) if isinstance(pool, str) else None
+        if pool_spec is None:
+            raise ValueError(f"Unsupported roulette pool: {pool!r}")
+        pool_key, pool_label, pool_empty_label = pool_spec
+
+        is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+        if not (callable(is_done) and is_done()):
+            await defer_interaction(interaction)
+
         statuses = await ensure_profiles_fresh(
             self.bot,
             [(profile_key, username)],
@@ -127,7 +151,10 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
         )
         status = statuses.get(profile_key)
 
-        backlog_games = await self.bot.db.get_user_backlog(target_discord_id, pool=pool_key)
+        if discord_id is not None:
+            backlog_games = await self.bot.db.get_user_backlog(discord_id, pool=pool_key)
+        else:
+            backlog_games = await self.bot.db.get_profile_backlog(profile_key, pool=pool_key)
 
         if not backlog_games:
             if status is not None and status.missing:
@@ -227,253 +254,314 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
     # /recommend (Taste-Matched Server Recommendations)
     # =========================================================================
 
-    @app_commands.command(
-        name="recommend",
-        description="Get taste-matched recommendations or recommend your top games to a friend"
-    )
-    @app_commands.describe(
-        user="Optional server member to recommend your games to (defaults to recommendations for you)",
-        pool="Optional: Filter to Backlog, Wishlist, or Backlog & Wishlist (defaults to Any Unplayed)",
-    )
-    @app_commands.guild_only()
-    @guild_cooldown("recommend")
-    async def recommend(
+    @staticmethod
+    def _build_friend_recommend_embed(
+        *,
+        caller_username: str,
+        friend_username: str,
+        friend_display_name: str,
+        friend_linked: bool,
+        allowed_pool_statuses,
+        pool_label: str,
+        taste_pct: Optional[int],
+        top_picks: list[tuple[str, float]],
+        cached_meta: dict,
+        caller_status,
+        friend_status,
+    ) -> discord.Embed:
+        safe_caller = escape_display_text(caller_username)
+        safe_friend = escape_display_text(friend_username)
+        comp_str = f" • `{taste_pct}%` taste compatibility" if taste_pct is not None else ""
+        caller_url = build_backloggd_user_url(caller_username)
+        if allowed_pool_statuses is not None:
+            desc = (
+                f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library "
+                f"matching **{safe_friend}**'s {pool_label}{comp_str}:"
+            )
+        else:
+            desc = f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library{comp_str}:"
+        if not friend_linked:
+            safe_member_name = escape_display_text(friend_display_name)
+            desc += f"\n*(Note: {safe_member_name} hasn't linked Backloggd yet, showing your all-time highest ratings)*"
+
+        embed = discord.Embed(
+            title=f"💡 Recommendations for {friend_username}"[:256],
+            description=clamp_escaped_text(desc, 4096),
+            color=COLOR_PLAYED,
+        )
+
+        for slug, rating in top_picks:
+            title = resolve_display_title(slug, cached_meta)
+            url = build_backloggd_game_url(slug)
+            stars = rating_to_stars(rating)
+            embed.add_field(
+                name=f"🎮 {title}"[:256],
+                value=clamp_escaped_text(
+                    (
+                        f"• {safe_caller}'s Rating: {stars} (`{rating:.1f}`)\n"
+                        f"• [View on Backloggd]({url})"
+                    ),
+                    1024,
+                ),
+                inline=False,
+            )
+
+        freshness_lines = [format_profile_freshness_line(caller_status, label=safe_caller)]
+        if friend_linked:
+            freshness_lines.append(
+                format_profile_freshness_line(friend_status, label=safe_friend)
+            )
+        append_freshness_note(embed, " · ".join(line for line in freshness_lines if line))
+
+        embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot"[:2048])
+        return embed
+
+    @staticmethod
+    def _build_caller_recommend_embed(
+        *,
+        caller_username: str,
+        allowed_pool_statuses,
+        pool_label: str,
+        recommendations: list[dict],
+        caller_status,
+        other_statuses: dict,
+    ) -> discord.Embed:
+        if allowed_pool_statuses is not None:
+            mode1_desc = (
+                f"Hand-picked games from your {pool_label} recommended by server profiles that share your taste:\n"
+            )
+        else:
+            mode1_desc = "Hand-picked games from different server profiles that share your taste:\n"
+
+        embed = discord.Embed(
+            title=f"💡 Recommendations for {caller_username}"[:256],
+            description=mode1_desc,
+            color=COLOR_PLAYED,
+        )
+
+        for rec in recommendations:
+            url = build_backloggd_game_url(rec["slug"])
+            stars = rating_to_stars(rec["rating"])
+            safe_recommender = escape_display_text(rec["recommender"])
+            embed.add_field(
+                name=f"🎮 {rec['title']}"[:256],
+                value=clamp_escaped_text(
+                    (
+                        f"• Recommended by **{safe_recommender}** ({rec['match_pct']}% taste match)\n"
+                        f"• Their Rating: {stars} (`{rec['rating']:.1f}`)\n"
+                        f"• [View on Backloggd]({url})"
+                    ),
+                    1024,
+                ),
+                inline=False,
+            )
+
+        contributing = ([caller_status] if caller_status is not None else []) + list(other_statuses.values())
+        freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
+        append_freshness_note(embed, freshness_note)
+
+        embed.set_footer(text="Diverse recommendations curated across your server taste matches")
+        return embed
+
+    async def _recommend_to_friend(
         self,
         interaction: discord.Interaction,
-        user: Optional[discord.Member] = None,
-        pool: RecommendPool = "Any Unplayed",
-    ):
-        pool_spec = _RECOMMEND_POOLS.get(pool.strip().lower()) if isinstance(pool, str) else None
-        if pool_spec is None:
-            raise ValueError(f"Unsupported recommendation pool: {pool!r}")
-        allowed_pool_statuses, pool_label, pool_empty_label = pool_spec
-
-        await defer_interaction(interaction)
-
-        if not interaction.guild:
-            await send_private_followup(interaction, "❌ This command must be run inside a Discord server.", log=logger)
+        user: discord.Member,
+        caller_link,
+        *,
+        now,
+        allowed_pool_statuses,
+        pool_label: str,
+        pool_empty_label: str,
+    ) -> None:
+        if not caller_link:
+            await send_private_followup(
+                interaction,
+                "❌ You haven't linked your Backloggd account yet! Use `/link <username>` to recommend your games to others.",
+                log=logger,
+            )
             return
 
-        caller_discord_id = interaction.user.id
-        caller_link = await self.bot.db.get_linked_user(caller_discord_id)
-        now = self.clock()
+        caller_username = caller_link["backloggd_username"]
+        caller_key = self._linked_profile_key(caller_link)
+        friend_discord_id = user.id
+        friend_link = await self.bot.db.get_linked_user(friend_discord_id)
+        if friend_link and self._linked_profile_key(friend_link) == caller_key:
+            await send_private_followup(
+                interaction,
+                "ℹ️ Both Discord members link to the same Backloggd profile, so there is no separate profile to recommend to.",
+                log=logger,
+            )
+            return
 
-        # =====================================================================
-        # MODE 2: Recommend caller's games to a specific friend (/recommend @Friend)
-        # =====================================================================
-        if user and user.id != caller_discord_id:
-            if not caller_link:
+        if allowed_pool_statuses is not None and not friend_link:
+            safe_member_name = escape_display_text(user.display_name)
+            await send_private_followup(
+                interaction,
+                clamp_escaped_text(
+                    f"❌ Filtering recommendations to **{safe_member_name}**'s {pool_empty_label} requires them to link their Backloggd account with `/link` first.",
+                    2000,
+                ),
+                log=logger,
+            )
+            return
+
+        check_profiles = [(caller_key, caller_username)]
+        if friend_link:
+            check_profiles.append((self._linked_profile_key(friend_link), friend_link["backloggd_username"]))
+        statuses = await ensure_profiles_fresh(
+            self.bot, check_profiles, now=now, require_subscribed=True
+        )
+        caller_status = statuses.get(caller_key)
+
+        caller_ratings = await self.bot.db.get_profile_ratings_dict(caller_key)
+        safe_caller = escape_display_text(caller_username)
+        if not caller_ratings:
+            if caller_status is not None and caller_status.missing:
                 await send_private_followup(
                     interaction,
-                    "❌ You haven't linked your Backloggd account yet! Use `/link <username>` to recommend your games to others.",
+                    format_fetching_library_message(caller_username, caller_status),
                     log=logger,
                 )
-                return
-
-            caller_username = caller_link["backloggd_username"]
-            caller_key = self._linked_profile_key(caller_link)
-            friend_discord_id = user.id
-            friend_link = await self.bot.db.get_linked_user(friend_discord_id)
-            if friend_link and self._linked_profile_key(friend_link) == caller_key:
-                await send_private_followup(
-                    interaction,
-                    "ℹ️ Both Discord members link to the same Backloggd profile, so there is no separate profile to recommend to.",
-                    log=logger,
-                )
-                return
-
-            if allowed_pool_statuses is not None and not friend_link:
-                safe_member_name = escape_display_text(user.display_name)
+            else:
                 await send_private_followup(
                     interaction,
                     clamp_escaped_text(
-                        f"❌ Filtering recommendations to **{safe_member_name}**'s {pool_empty_label} requires them to link their Backloggd account with `/link` first.",
+                        f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library first.",
+                        2000,
+                    ),
+                    log=logger,
+                )
+            return
+
+        friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
+        safe_friend = escape_display_text(friend_username)
+        friend_key = self._linked_profile_key(friend_link) if friend_link else None
+        friend_status = statuses.get(friend_key) if friend_key else None
+        friend_ratings = (
+            await self.bot.db.get_profile_ratings_dict(friend_key) if friend_link else {}
+        )
+        get_entries = getattr(self.bot.db, "get_profile_library_entries", None)
+        friend_entries = (
+            await get_entries(friend_key) if (friend_link and get_entries is not None) else None
+        )
+        friend_excluded_slugs = (
+            excluded_recommendation_slugs(friend_entries)
+            if friend_entries is not None
+            else set(friend_ratings.keys())
+        )
+
+        # Optional compatibility score if friend is linked and has ratings
+        taste_pct = compute_taste_compatibility(
+            caller_ratings, friend_ratings, similarity_fn=calculate_similarity_raw
+        )
+
+        # Pick caller's top-rated games (rated >= 4.0) not played, started, unknown, or rated by friend
+        qualifying_games = qualifying_high_rated_games(caller_ratings)
+        if not qualifying_games:
+            await send_private_followup(
+                interaction,
+                "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
+                log=logger,
+            )
+            return
+
+        friend_pool_slugs: Optional[set[str]] = None
+        if allowed_pool_statuses is not None:
+            if not friend_entries and friend_status is not None and friend_status.missing:
+                await send_private_followup(
+                    interaction,
+                    format_fetching_library_message(friend_username, friend_status),
+                    log=logger,
+                )
+                return
+            friend_pool_slugs = eligible_pool_slugs(friend_entries, allowed_pool_statuses)
+            if not friend_pool_slugs:
+                await send_private_followup(
+                    interaction,
+                    clamp_escaped_text(
+                        f"ℹ️ **{safe_friend}** has no unrated games in {pool_empty_label} in the local cache. Try `/refresh` to sync their library.",
                         2000,
                     ),
                     log=logger,
                 )
                 return
 
-            check_profiles = [(caller_key, caller_username)]
-            if friend_link:
-                check_profiles.append((self._linked_profile_key(friend_link), friend_link["backloggd_username"]))
-            statuses = await ensure_profiles_fresh(
-                self.bot, check_profiles, now=now, require_subscribed=True
-            )
-            caller_status = statuses.get(caller_key)
+        top_picks = select_friend_recommendations(
+            qualifying_games,
+            excluded_slugs=friend_excluded_slugs,
+            pool_slugs=friend_pool_slugs,
+            limit=5,
+        )
 
-            caller_ratings = await self.bot.db.get_profile_ratings_dict(caller_key)
-            safe_caller = escape_display_text(caller_username)
-            if not caller_ratings:
-                if caller_status is not None and caller_status.missing:
+        if not top_picks:
+            if allowed_pool_statuses is not None:
+                await send_private_followup(
+                    interaction,
+                    clamp_escaped_text(
+                        f"ℹ️ None of your 4.0+ rated games are currently unrated in **{safe_friend}**'s {pool_empty_label}.",
+                        2000,
+                    ),
+                    log=logger,
+                )
+            elif friend_link:
+                if has_uncertain_library_exclusion(caller_ratings, friend_entries):
                     await send_private_followup(
                         interaction,
-                        format_fetching_library_message(caller_username, caller_status),
+                        clamp_escaped_text(
+                            (
+                                f"ℹ️ No eligible 4.0+ recommendations were found for **{safe_friend}** "
+                                "(matching games with an unknown status in their library were conservatively excluded)."
+                            ),
+                            2000,
+                        ),
                         log=logger,
                     )
                 else:
                     await send_private_followup(
                         interaction,
                         clamp_escaped_text(
-                            f"❌ **{safe_caller}** has no cached ratings yet. Use `/refresh` to sync your library first.",
+                            f"🎉 **{safe_friend}** has already played, started, or rated all of your 4.0+ rated games.",
                             2000,
                         ),
                         log=logger,
                     )
-                return
-
-            friend_username = friend_link["backloggd_username"] if friend_link else user.display_name
-            safe_friend = escape_display_text(friend_username)
-            friend_key = self._linked_profile_key(friend_link) if friend_link else None
-            friend_status = statuses.get(friend_key) if friend_key else None
-            friend_ratings = (
-                await self.bot.db.get_profile_ratings_dict(friend_key) if friend_link else {}
-            )
-            get_entries = getattr(self.bot.db, "get_profile_library_entries", None)
-            friend_entries = (
-                await get_entries(friend_key) if (friend_link and get_entries is not None) else None
-            )
-            friend_excluded_slugs = (
-                excluded_recommendation_slugs(friend_entries)
-                if friend_entries is not None
-                else set(friend_ratings.keys())
-            )
-
-            # Optional compatibility score if friend is linked and has ratings
-            taste_pct = compute_taste_compatibility(
-                caller_ratings, friend_ratings, similarity_fn=calculate_similarity_raw
-            )
-
-            # Pick caller's top-rated games (rated >= 4.0) not played, started, unknown, or rated by friend
-            qualifying_games = qualifying_high_rated_games(caller_ratings)
-            if not qualifying_games:
+            else:
                 await send_private_followup(
                     interaction,
                     "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
                     log=logger,
                 )
-                return
-
-            friend_pool_slugs: Optional[set[str]] = None
-            if allowed_pool_statuses is not None:
-                if not friend_entries and friend_status is not None and friend_status.missing:
-                    await send_private_followup(
-                        interaction,
-                        format_fetching_library_message(friend_username, friend_status),
-                        log=logger,
-                    )
-                    return
-                friend_pool_slugs = eligible_pool_slugs(friend_entries, allowed_pool_statuses)
-                if not friend_pool_slugs:
-                    await send_private_followup(
-                        interaction,
-                        clamp_escaped_text(
-                            f"ℹ️ **{safe_friend}** has no unrated games in {pool_empty_label} in the local cache. Try `/refresh` to sync their library.",
-                            2000,
-                        ),
-                        log=logger,
-                    )
-                    return
-
-            top_picks = select_friend_recommendations(
-                qualifying_games,
-                excluded_slugs=friend_excluded_slugs,
-                pool_slugs=friend_pool_slugs,
-                limit=5,
-            )
-
-            if not top_picks:
-                if allowed_pool_statuses is not None:
-                    await send_private_followup(
-                        interaction,
-                        clamp_escaped_text(
-                            f"ℹ️ None of your 4.0+ rated games are currently unrated in **{safe_friend}**'s {pool_empty_label}.",
-                            2000,
-                        ),
-                        log=logger,
-                    )
-                elif friend_link:
-                    if has_uncertain_library_exclusion(caller_ratings, friend_entries):
-                        await send_private_followup(
-                            interaction,
-                            clamp_escaped_text(
-                                (
-                                    f"ℹ️ No eligible 4.0+ recommendations were found for **{safe_friend}** "
-                                    "(matching games with an unknown status in their library were conservatively excluded)."
-                                ),
-                                2000,
-                            ),
-                            log=logger,
-                        )
-                    else:
-                        await send_private_followup(
-                            interaction,
-                            clamp_escaped_text(
-                                f"🎉 **{safe_friend}** has already played, started, or rated all of your 4.0+ rated games.",
-                                2000,
-                            ),
-                            log=logger,
-                        )
-                else:
-                    await send_private_followup(
-                        interaction,
-                        "ℹ️ You do not have any games rated 4.0 or above in your cached library to recommend.",
-                        log=logger,
-                    )
-                return
-
-            cand_slugs = [slug for slug, _ in top_picks]
-            cached_meta = await self.bot.db.get_games_by_slugs(cand_slugs) if cand_slugs else {}
-
-            comp_str = f" • `{taste_pct}%` taste compatibility" if taste_pct is not None else ""
-            caller_url = build_backloggd_user_url(caller_username)
-            if allowed_pool_statuses is not None:
-                desc = (
-                    f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library "
-                    f"matching **{safe_friend}**'s {pool_label}{comp_str}:"
-                )
-            else:
-                desc = f"Hand-picked games from **[{safe_caller}]({caller_url})**'s library{comp_str}:"
-            if not friend_link:
-                safe_member_name = escape_display_text(user.display_name)
-                desc += f"\n*(Note: {safe_member_name} hasn't linked Backloggd yet, showing your all-time highest ratings)*"
-
-            embed = discord.Embed(
-                title=f"💡 Recommendations for {friend_username}"[:256],
-                description=clamp_escaped_text(desc, 4096),
-                color=COLOR_PLAYED
-            )
-
-            for slug, rating in top_picks:
-                title = resolve_display_title(slug, cached_meta)
-                url = build_backloggd_game_url(slug)
-                stars = rating_to_stars(rating)
-                embed.add_field(
-                    name=f"🎮 {title}"[:256],
-                    value=clamp_escaped_text(
-                        (
-                            f"• {safe_caller}'s Rating: {stars} (`{rating:.1f}`)\n"
-                            f"• [View on Backloggd]({url})"
-                        ),
-                        1024,
-                    ),
-                    inline=False
-                )
-
-            freshness_lines = [format_profile_freshness_line(caller_status, label=safe_caller)]
-            if friend_link and friend_key:
-                freshness_lines.append(
-                    format_profile_freshness_line(statuses.get(friend_key), label=safe_friend)
-                )
-            append_freshness_note(embed, " · ".join(line for line in freshness_lines if line))
-
-            embed.set_footer(text=f"Recommended by {caller_username} via Backloggd Discord Bot"[:2048])
-            await send_public_followup(interaction, embed=embed)
             return
 
-        # =====================================================================
-        # MODE 1: Discover recommendations from distinct server profiles with similar taste.
-        # =====================================================================
+        cand_slugs = [slug for slug, _ in top_picks]
+        cached_meta = await self.bot.db.get_games_by_slugs(cand_slugs) if cand_slugs else {}
+        embed = self._build_friend_recommend_embed(
+            caller_username=caller_username,
+            friend_username=friend_username,
+            friend_display_name=user.display_name,
+            friend_linked=bool(friend_link),
+            allowed_pool_statuses=allowed_pool_statuses,
+            pool_label=pool_label,
+            taste_pct=taste_pct,
+            top_picks=top_picks,
+            cached_meta=cached_meta,
+            caller_status=caller_status,
+            friend_status=friend_status,
+        )
+        await send_public_followup(interaction, embed=embed)
+
+    async def _recommend_for_caller(
+        self,
+        interaction: discord.Interaction,
+        caller_discord_id: int,
+        caller_link,
+        *,
+        now,
+        allowed_pool_statuses,
+        pool_label: str,
+        pool_empty_label: str,
+    ) -> None:
         if not caller_link:
             await send_private_followup(
                 interaction,
@@ -644,42 +732,68 @@ class DiscoveryCog(commands.Cog, name="Discovery"):
             for slug, rating, other_name, match_pct in raw_candidates
         ]
 
-        if allowed_pool_statuses is not None:
-            mode1_desc = (
-                f"Hand-picked games from your {pool_label} recommended by server profiles that share your taste:\n"
-            )
-        else:
-            mode1_desc = "Hand-picked games from different server profiles that share your taste:\n"
-
-        embed = discord.Embed(
-            title=f"💡 Recommendations for {caller_username}"[:256],
-            description=mode1_desc,
-            color=COLOR_PLAYED
+        embed = self._build_caller_recommend_embed(
+            caller_username=caller_username,
+            allowed_pool_statuses=allowed_pool_statuses,
+            pool_label=pool_label,
+            recommendations=recommendations,
+            caller_status=caller_status,
+            other_statuses=other_statuses,
         )
-
-        for rec in recommendations:
-            url = build_backloggd_game_url(rec["slug"])
-            stars = rating_to_stars(rec["rating"])
-            safe_recommender = escape_display_text(rec["recommender"])
-            embed.add_field(
-                name=f"🎮 {rec['title']}"[:256],
-                value=clamp_escaped_text(
-                    (
-                        f"• Recommended by **{safe_recommender}** ({rec['match_pct']}% taste match)\n"
-                        f"• Their Rating: {stars} (`{rec['rating']:.1f}`)\n"
-                        f"• [View on Backloggd]({url})"
-                    ),
-                    1024,
-                ),
-                inline=False
-            )
-
-        contributing = ([caller_status] if caller_status is not None else []) + list(other_statuses.values())
-        freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
-        append_freshness_note(embed, freshness_note)
-
-        embed.set_footer(text="Diverse recommendations curated across your server taste matches")
         await send_public_followup(interaction, embed=embed)
+
+    @app_commands.command(
+        name="recommend",
+        description="Get taste-matched recommendations or recommend your top games to a friend"
+    )
+    @app_commands.describe(
+        user="Optional server member to recommend your games to (defaults to recommendations for you)",
+        pool="Optional: Filter to Backlog, Wishlist, or Backlog & Wishlist (defaults to Any Unplayed)",
+    )
+    @app_commands.guild_only()
+    @guild_cooldown("recommend")
+    async def recommend(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        pool: RecommendPool = "Any Unplayed",
+    ):
+        pool_spec = _RECOMMEND_POOLS.get(pool.strip().lower()) if isinstance(pool, str) else None
+        if pool_spec is None:
+            raise ValueError(f"Unsupported recommendation pool: {pool!r}")
+        allowed_pool_statuses, pool_label, pool_empty_label = pool_spec
+
+        await defer_interaction(interaction)
+
+        if not interaction.guild:
+            await send_private_followup(interaction, "❌ This command must be run inside a Discord server.", log=logger)
+            return
+
+        caller_discord_id = interaction.user.id
+        caller_link = await self.bot.db.get_linked_user(caller_discord_id)
+        now = self.clock()
+
+        if user and user.id != caller_discord_id:
+            await self._recommend_to_friend(
+                interaction,
+                user,
+                caller_link,
+                now=now,
+                allowed_pool_statuses=allowed_pool_statuses,
+                pool_label=pool_label,
+                pool_empty_label=pool_empty_label,
+            )
+            return
+
+        await self._recommend_for_caller(
+            interaction,
+            caller_discord_id,
+            caller_link,
+            now=now,
+            allowed_pool_statuses=allowed_pool_statuses,
+            pool_label=pool_label,
+            pool_empty_label=pool_empty_label,
+        )
 
 async def setup(bot):
     await bot.add_cog(DiscoveryCog(bot))

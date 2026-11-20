@@ -30,19 +30,24 @@ Multiple members may connect the same public Backloggd profile. The bot counts t
 
 | Command | What it does |
 | --- | --- |
+| `/help [topic]` | Browse commands, onboarding steps, and admin tips privately by category. |
 | `/game` | Search for a game and see its details and server ratings. |
 | `/profile [user]` | Show your profile or another public Backloggd profile. |
+| `/playing` | See which games linked server members are currently playing on Backloggd. |
 | `/compare` | Compare two profiles' ratings and shared favorites. |
 | `/taste-twins` | Find the server members whose game tastes are closest to yours. |
 | `/roulette [member] [pool]` | Pick an unrated game from a linked member's backlog, wishlist, or both (e.g. `/roulette pool:Backlog`). |
 | `/recommend [member] [pool]` | Find games you might enjoy, or suggest your favorites to a member (optionally filtered to Backlog/Wishlist). |
 | `/server-top [mode] [min_ratings]` | Browse paginated server rankings (up to top 50) across highest-rated, most-played, polarizing, hidden-gem, and backlog modes. |
 | `/server-stats` | See community totals and how recently the libraries were updated. |
+| `/server-recap [period]` | Summarize the last 7 or 30 days of delivered server activity feed announcements. |
 | `/link` | Connect a Backloggd profile and join the current server's feed. |
 | `/unlink` | Disconnect your profile. Existing announcements remain as an archive. |
 | `/refresh [member]` | Request a library update for yourself or another linked member. |
 | `/feed on` / `/feed off` | Change your feed participation in this server. |
 | `/feed status` | Check your feed setup and any collection or delivery problems privately. |
+
+You can also right-click any server member and choose **Apps → View Backloggd Profile** or **Apps → Compare Backloggd Tastes**.
 
 Admins with **Manage Channels** can also use:
 
@@ -52,7 +57,9 @@ Admins with **Manage Channels** can also use:
 | `/unsetchannel` | Pause the server's feed without deleting old announcements. |
 | `/feed add` / `/feed remove` | Follow or unfollow any public Backloggd profile. |
 | `/feed list` | Browse followed profiles and their feed status. |
-| `/feed filter` | View or toggle which activity categories (started, finished, replays, ratings, reviews) this server announces. |
+| `/feed filter` | View or toggle announced activity categories (started, finished, replays, ratings, reviews) and `spoiler_reviews` (wrap all review notes in `||spoilers||`). |
+| `/feed test` | Post a non-persisted sample announcement to verify channel permissions and spoiler formatting. |
+| `/feed digest [cadence] [channel]` | View, enable (`Weekly` / `Monthly`), or disable automatic scheduled server activity recaps. |
 
 Moderators with **Administrator**, **Manage Server**, **Manage Channels**, or **Moderate Members** can also use:
 
@@ -132,6 +139,8 @@ Treat the cookie like a password. Keep `.env` private and never include it in a 
 
 For a test server, optionally set `DEV_GUILD_ID` to that server's ID. Otherwise commands are registered globally and may take time to appear.
 
+For optional upstream session health alerts (fired once when Backloggd auth/challenge/rate-limit issues begin and once on recovery), you can also set `ALERT_WEBHOOK_URL` (a Discord or compatible webhook URL) and/or `ALERT_OWNER_DM=true` to DM the bot application owner.
+
 ### 5. Start
 
 ```shell
@@ -157,6 +166,8 @@ docker run -d --name backloggd-dc --restart unless-stopped --env-file .env -v ba
 
 The container runs as a non-root user. If you use a host directory instead of the named volume, make it writable by UID/GID `10001:10001` on Linux. Check startup messages with `docker logs backloggd-dc`.
 
+The image includes a port-aware Docker `HEALTHCHECK`: when `PORT` is set to a numeric value, it probes `http://127.0.0.1:$PORT/health` every 30 seconds and reports healthy only on HTTP `200`. When `PORT` is unset (the default for headless worker deployments), the check passes immediately without starting an HTTP server.
+
 ## Database and backups
 
 **Local SQLite is the default.** No hosted database account is needed. The bot creates `data/backloggd.db`; keep this file on persistent storage so links, preferences, and feed history survive restarts.
@@ -172,7 +183,7 @@ Use the connection URL and access token supplied by your database host. The endp
 
 **Back up before updating the bot.** For SQLite, stop the bot cleanly and copy the database together with any matching `-wal` and `-shm` files. With Docker, back up the database inside the mounted volume. For a remote database, use your host's snapshot or export tools.
 
-Database upgrades run automatically on startup (currently schema versions 1-13). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
+Database upgrades run automatically on startup (currently schema versions 1-15). To return to an older release, stop the bot and restore its matching pre-upgrade database backup before restarting the old version. Downgrading the code alone is not a supported rollback. The migration details live in [bot/db_migrations.py](bot/db_migrations.py).
 
 ## How updates and announcements work
 
@@ -182,7 +193,7 @@ Database upgrades run automatically on startup (currently schema versions 1-13).
 
 **Feed setup:** The first successful activity and journal checks establish a starting point silently. The bot checks journal page 1 every five minutes, including at setup and after an outage. Backdated entries, edits, or missed entries that stay on later pages may go unnoticed.
 
-**What gets announced:** Started/Finished milestones, identifiable replays, explicit ratings, rating changes, and written reviews. Ordinary daily sessions, backlog/wishlist changes, likes, follows, comments, badges, and lists are hidden. Related events are combined where they can be matched safely. Server admins can use `/feed filter` to disable specific categories for new events without affecting in-place edits of already-posted messages or backfilling history if re-enabled later.
+**What gets announced:** Started/Finished milestones, identifiable replays, explicit ratings, rating changes, and written reviews. Ordinary daily sessions, backlog/wishlist changes, likes, follows, comments, badges, and lists are hidden. Related events are combined where they can be matched safely. Server admins can use `/feed filter` to disable specific categories for new events (without affecting in-place edits of already-posted messages or backfilling history if re-enabled later), enable `spoiler_reviews` to wrap all announced review notes in Discord spoiler tags, test permissions with `/feed test`, or opt in to scheduled Weekly/Monthly recaps with `/feed digest` (empty windows are skipped quietly).
 
 **Backdated entries:** Newly discovered playthrough milestones more than seven UTC calendar days old are suppressed. Recent backdated milestones keep Started/Finished in the title and show the played date. A new rating or review can still be announced independently of an older milestone.
 

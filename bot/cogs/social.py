@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, Optional, cast
 
 import discord
 from backloggd.analytics import calculate_similarity_raw
@@ -43,6 +43,7 @@ from bot.services.guild_membership import (
     GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
     resolve_guild_member_ids,
 )
+from bot.services.session_health import report_upstream_failure, report_upstream_success
 from bot.services.task_lifecycle import TaskDrainGroup
 from bot.ui.embeds import create_compare_embed, create_taste_twins_embed
 from bot.ui.helpers import build_backloggd_user_url
@@ -92,6 +93,17 @@ class SocialCog(commands.Cog, name="Social"):
         # Retired generations may still be unwinding after their last waiter leaves.
         self._drain_group = TaskDrainGroup()
         self._tracked_live_tasks: set[asyncio.Task] = self._drain_group.tasks
+        self._compare_context_menu = app_commands.ContextMenu(
+            name="Compare Backloggd Tastes",
+            callback=self._context_compare_tastes,
+        )
+        app_commands.guild_only()(self._compare_context_menu)
+        guild_cooldown("compare")(self._compare_context_menu)
+
+    async def cog_load(self) -> None:
+        tree = getattr(self.bot, "tree", None)
+        if tree is not None:
+            tree.add_command(self._compare_context_menu, override=True)
 
     @property
     def _closing(self) -> bool:
@@ -109,7 +121,13 @@ class SocialCog(commands.Cog, name="Social"):
         )
 
     async def cog_unload(self) -> None:
-        """Drain active live fetches when the cog is unloaded."""
+        """Unregister context menu and drain active live fetches when the cog is unloaded."""
+        tree = getattr(self.bot, "tree", None)
+        if tree is not None:
+            tree.remove_command(
+                self._compare_context_menu.name,
+                type=self._compare_context_menu.type,
+            )
         await self.close()
 
     async def _resolve_username(self, interaction: discord.Interaction, target: Optional[str]) -> Optional[str]:
@@ -136,8 +154,14 @@ class SocialCog(commands.Cog, name="Social"):
         return False
 
     async def _fetch_live_library_snapshot(self, username: str) -> _LibraryRatingSnapshot:
-        async with self._live_library_semaphore:
-            lib = await self.bot.backloggd.get_user_library(username)
+        try:
+            async with self._live_library_semaphore:
+                lib = await self.bot.backloggd.get_user_library(username)
+        except Exception as error:
+            if not isinstance(error, (UserNotFoundError, ResourceNotFoundError)):
+                report_upstream_failure(self.bot, error)
+            raise
+        report_upstream_success(self.bot)
         ratings = lib.to_ratings_dict()
         titles = {}
         games = getattr(lib, "games", None)
@@ -211,6 +235,29 @@ class SocialCog(commands.Cog, name="Social"):
                 if not gen.task.done():
                     gen.task.cancel()
 
+    async def _context_compare_tastes(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+    ) -> None:
+        if getattr(member, "bot", False):
+            msg = "🤖 Bots don't have Backloggd profiles to compare."
+            is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+            if callable(is_done) and is_done():
+                await send_private_followup(interaction, msg, log=logger)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+        if member.id == interaction.user.id:
+            msg = "ℹ️ Both inputs resolve to the same Backloggd profile, so there is no separate profile to compare."
+            is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+            if callable(is_done) and is_done():
+                await send_private_followup(interaction, msg, log=logger)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+        await self._execute_compare(interaction, f"<@{member.id}>", None)
+
     @app_commands.command(name="compare", description="Compare video game tastes and ratings between two Backloggd users")
     @app_commands.describe(
         user1="First user (Backloggd username or @mention)",
@@ -223,7 +270,17 @@ class SocialCog(commands.Cog, name="Social"):
         user1: str,
         user2: Optional[str] = None
     ):
-        await defer_interaction(interaction)
+        await self._execute_compare(interaction, user1, user2)
+
+    async def _execute_compare(
+        self,
+        interaction: discord.Interaction,
+        user1: str,
+        user2: Optional[str] = None,
+    ):
+        is_done = getattr(getattr(interaction, "response", None), "is_done", None)
+        if not (callable(is_done) and is_done()):
+            await defer_interaction(interaction)
 
         # Target resolution
         caller_profile_key = None
@@ -250,9 +307,15 @@ class SocialCog(commands.Cog, name="Social"):
             return
 
         if not u1_name or not u2_name:
+            if (not u1_name and parse_discord_member_id(user1) is not None) or (
+                not u2_name and user2 is not None and parse_discord_member_id(user2) is not None
+            ):
+                missing_msg = "❌ That user has not linked their Backloggd account yet."
+            else:
+                missing_msg = "❌ Could not resolve one or both users. Please check usernames or mentions."
             await send_private_followup(
                 interaction,
-                "❌ Could not resolve one or both users. Please check usernames or mentions.",
+                missing_msg,
                 log=logger,
             )
             return
@@ -296,12 +359,12 @@ class SocialCog(commands.Cog, name="Social"):
                 _load_ratings(u2_name, sub2, s2),
                 return_exceptions=True,
             )
-            for item in loaded:
-                if isinstance(item, BaseException):
-                    if isinstance(item, asyncio.CancelledError):
-                        raise item
-                    raise item
-            snapshot1, snapshot2 = loaded
+            snapshot1_raw, snapshot2_raw = loaded
+            if isinstance(snapshot1_raw, BaseException):
+                raise snapshot1_raw
+            if isinstance(snapshot2_raw, BaseException):
+                raise snapshot2_raw
+            snapshot1, snapshot2 = snapshot1_raw, snapshot2_raw
             ratings1, ratings2 = snapshot1.ratings, snapshot2.ratings
 
             if not ratings1 or not ratings2:
@@ -354,12 +417,15 @@ class SocialCog(commands.Cog, name="Social"):
                 return
 
             # Calculate similarity score using backloggd-py
-            final_score, library_score, rating_score = calculate_similarity_raw(rated1, rated2)
+            final_score, library_score, rating_score = calculate_similarity_raw(
+                cast(dict[str, Optional[float]], rated1),
+                cast(dict[str, Optional[float]], rated2),
+            )
             match_pct = final_score / 100.0
 
             # Find common rated games
             common_slugs = sorted(shared_rated_slugs)
-            slug_lookup = getattr(self.bot.db, "get_games_by_slugs", None)
+            slug_lookup: Optional[Callable[..., Any]] = getattr(self.bot.db, "get_games_by_slugs", None)
             cached_meta = (
                 await slug_lookup(common_slugs)
                 if common_slugs and callable(slug_lookup)
@@ -416,6 +482,314 @@ class SocialCog(commands.Cog, name="Social"):
     # /taste-twins (Server Taste Twins & Nemesis Finder)
     # =========================================================================
 
+    async def _resolve_taste_twins_target(
+        self,
+        interaction: discord.Interaction,
+        user: Optional[str],
+    ) -> Optional[tuple[str, Optional[int], Optional[str]]]:
+        if user:
+            member_id = parse_discord_member_id(user)
+            if member_id is not None:
+                linked = await self.bot.db.get_linked_user(member_id)
+                if not linked:
+                    await send_private_followup(
+                        interaction,
+                        "❌ That user has not linked their Backloggd account yet.",
+                        log=logger,
+                    )
+                    return None
+                return linked["backloggd_username"], member_id, linked["avatar_url"]
+            try:
+                clean_name = normalize_backloggd_username(user)
+            except InvalidUsernameError as err:
+                await send_private_followup(interaction, f"❌ {err}", log=logger)
+                return None
+            profile = await self.bot.db.get_profile(clean_name)
+            if profile:
+                return profile["display_username"], None, profile["avatar_url"]
+            return clean_name, None, None
+
+        target_discord_id = interaction.user.id
+        linked = await self.bot.db.get_linked_user(target_discord_id)
+        if not linked:
+            await send_private_followup(
+                interaction,
+                "❌ You haven't linked your Backloggd account yet! Use `/link <username>` first.",
+                log=logger,
+            )
+            return None
+        return linked["backloggd_username"], target_discord_id, linked["avatar_url"]
+
+    async def _load_taste_twins_target_ratings(
+        self,
+        interaction: discord.Interaction,
+        *,
+        target_username: str,
+        safe_target: str,
+        target_discord_id: Optional[int],
+        target_subscribed: bool,
+        target_status,
+    ) -> Optional[dict[str, float]]:
+        if target_discord_id or target_subscribed:
+            my_ratings = await self.bot.db.get_profile_ratings_dict(target_username)
+        else:
+            my_ratings = await self._get_or_fetch_ratings(target_username)
+
+        if not my_ratings:
+            if target_subscribed and target_status is not None and target_status.missing:
+                await send_private_followup(
+                    interaction,
+                    format_fetching_library_message(target_username, target_status),
+                    log=logger,
+                )
+            else:
+                is_caller = target_discord_id == interaction.user.id
+                has_synced_library = bool(
+                    target_subscribed
+                    or (target_status is not None and not target_status.missing)
+                )
+                if has_synced_library:
+                    empty_message = (
+                        "Your synced Backloggd library contains no logged games yet."
+                        if is_caller
+                        else f"**{safe_target}**'s synced Backloggd library contains no logged games yet."
+                    )
+                elif is_caller:
+                    empty_message = "Your live Backloggd library contains no logged games yet."
+                else:
+                    empty_message = (
+                        f"A live Backloggd fetch found no logged games in **{safe_target}**'s library."
+                    )
+                await send_private_followup(
+                    interaction,
+                    f"❌ {empty_message}",
+                    log=logger,
+                )
+            return None
+
+        my_numeric_ratings = numeric_ratings(my_ratings)
+        if not my_numeric_ratings:
+            empty_ratings_message = (
+                "Your library has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity."
+                if target_discord_id == interaction.user.id
+                else f"**{safe_target}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity."
+            )
+            await send_private_followup(
+                interaction,
+                f"ℹ️ {empty_ratings_message}",
+                log=logger,
+            )
+            return None
+        return my_numeric_ratings
+
+    def _build_taste_twins_duel_callback(
+        self,
+        *,
+        initiator_id: int,
+        target_username: str,
+        safe_target: str,
+        target_subscribed: bool,
+        target_status,
+        my_numeric_ratings: dict[str, float],
+        twins: list[dict],
+        all_other_ratings: dict,
+        cached_meta: dict,
+        other_statuses: dict,
+        top_twin_name: str,
+    ):
+        async def on_compare(btn_interaction: discord.Interaction):
+            if btn_interaction.user.id != initiator_id:
+                await send_private_followup(
+                    btn_interaction,
+                    "❌ Only the member who initiated `/taste-twins` can duel with their twin!",
+                    log=logger,
+                )
+                return
+            try:
+                await defer_interaction(btn_interaction)
+                t1_ratings = my_numeric_ratings
+                t2_key = twins[0]["profile_key"]
+                t2_ratings = numeric_ratings(all_other_ratings.get(t2_key, {}))
+                final_s, _, _ = calculate_similarity_raw(
+                    cast(dict[str, Optional[float]], my_numeric_ratings),
+                    cast(dict[str, Optional[float]], t2_ratings),
+                )
+                c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
+                duel_meta = dict(cached_meta)
+                missing_slugs = sorted(s for s in c_slugs if s not in duel_meta)
+                slug_lookup: Optional[Callable[..., Any]] = getattr(self.bot.db, "get_games_by_slugs", None)
+                if missing_slugs and callable(slug_lookup):
+                    extra_meta = await slug_lookup(missing_slugs)
+                    if extra_meta:
+                        duel_meta.update(extra_meta)
+                c_loves, c_dis = build_comparison_highlights(
+                    my_numeric_ratings, t2_ratings, duel_meta
+                )
+                l1 = format_profile_freshness_line(
+                    target_status, label=safe_target, unlinked_live=not target_subscribed
+                )
+                l2 = format_profile_freshness_line(
+                    other_statuses.get(t2_key), label=escape_display_text(top_twin_name)
+                )
+                duel_freshness = " · ".join(line for line in (l1, l2) if line) or None
+                comp_embed = create_compare_embed(
+                    user1=target_username,
+                    user2=top_twin_name,
+                    match_score=final_s / 100.0,
+                    shared_loves=c_loves,
+                    disagreements=c_dis,
+                    freshness_note=duel_freshness,
+                )
+                comp_view = LinkButtonView(
+                    label=f"View {top_twin_name}'s Profile",
+                    url=build_backloggd_user_url(top_twin_name),
+                )
+                await send_public_followup(btn_interaction, embed=comp_embed, view=comp_view)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await handle_component_error(
+                    btn_interaction,
+                    error,
+                    component_name="taste-twins duel",
+                    user_message=(
+                        f"❌ Could not complete the duel between **{safe_target}** and "
+                        f"**{escape_display_text(top_twin_name)}**. Please try again later."
+                    ),
+                    log=logger,
+                )
+
+        return on_compare
+
+    def _build_taste_twins_response(
+        self,
+        *,
+        initiator_id: int,
+        guild_name: str,
+        target_username: str,
+        safe_target: str,
+        target_avatar: Optional[str],
+        target_subscribed: bool,
+        target_status,
+        my_numeric_ratings: dict[str, float],
+        twins: list[dict],
+        nemesis: Optional[dict],
+        server_avg_match: float,
+        all_other_ratings: dict,
+        cached_meta: dict,
+        other_statuses: dict,
+    ) -> tuple[discord.Embed, TasteTwinsView]:
+        top_twin_name = twins[0]["username"] if twins else None
+        on_compare = (
+            self._build_taste_twins_duel_callback(
+                initiator_id=initiator_id,
+                target_username=target_username,
+                safe_target=safe_target,
+                target_subscribed=target_subscribed,
+                target_status=target_status,
+                my_numeric_ratings=my_numeric_ratings,
+                twins=twins,
+                all_other_ratings=all_other_ratings,
+                cached_meta=cached_meta,
+                other_statuses=other_statuses,
+                top_twin_name=top_twin_name,
+            )
+            if top_twin_name
+            else None
+        )
+
+        contributing = (
+            ([target_status] if (target_subscribed and target_status is not None) else [])
+            + list(other_statuses.values())
+        )
+        freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
+        if not target_subscribed and freshness_note:
+            freshness_note = f"{safe_target}: Fetched live · {freshness_note}"
+
+        embed = create_taste_twins_embed(
+            username=target_username,
+            avatar_url=target_avatar,
+            guild_name=guild_name,
+            twins=twins,
+            nemesis=nemesis,
+            server_avg_match=server_avg_match,
+            freshness_note=freshness_note,
+        )
+        view = TasteTwinsView(
+            user_url=build_backloggd_user_url(target_username),
+            top_twin_name=top_twin_name,
+            on_compare=on_compare,
+        )
+        return embed, view
+
+    async def _load_taste_twin_candidates(
+        self,
+        interaction: discord.Interaction,
+        *,
+        target_discord_id: Optional[int],
+        target_key: str,
+        my_numeric_ratings: dict[str, float],
+        now,
+    ):
+        guild_member_ids = await resolve_guild_member_ids(
+            self.bot, interaction.guild, exclude_member_id=target_discord_id
+        )
+        if guild_member_ids is None:
+            await send_private_followup(
+                interaction,
+                GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+                log=logger,
+            )
+            return None
+        other_linked = await self.bot.db.get_guild_linked_profiles(
+            guild_member_ids, exclude_profile_key=target_key
+        )
+        if not other_linked:
+            await send_private_followup(
+                interaction,
+                "ℹ️ No other distinct Backloggd profiles are linked in this server yet. Invite members to use `/link`.",
+                log=logger,
+            )
+            return None
+
+        other_statuses = await ensure_profiles_fresh(
+            self.bot,
+            other_linked,
+            now=now,
+            require_subscribed=True,
+        )
+
+        other_profile_keys = [o["profile_key"] for o in other_linked]
+        all_other_ratings = await self.bot.db.get_multi_profile_ratings_dict(other_profile_keys)
+
+        candidates, slugs_to_lookup, enough_rated_profiles = compute_taste_twin_candidates(
+            my_numeric_ratings,
+            other_linked,
+            all_other_ratings,
+            similarity_fn=calculate_similarity_raw,
+        )
+        if not candidates:
+            if enough_rated_profiles:
+                reason = "No other profile shares at least two numeric ratings with this profile."
+            else:
+                reason = "Other profiles need at least five numeric ratings before we can compare taste."
+            await send_private_followup(
+                interaction,
+                f"ℹ️ {reason} Unrated backlog and wishlist entries do not count toward similarity.",
+                log=logger,
+            )
+            return None
+
+        cached_meta = await self.bot.db.get_games_by_slugs(list(slugs_to_lookup)) if slugs_to_lookup else {}
+        for c in candidates:
+            c["top_fav"] = resolve_display_title(c["top_fav_slug"], cached_meta) if c["top_fav_slug"] else None
+            c["top_disagree"] = (
+                resolve_display_title(c["top_disagree_slug"], cached_meta)
+                if c["top_disagree_slug"]
+                else None
+            )
+        return candidates, other_statuses, all_other_ratings, cached_meta
+
     @app_commands.command(
         name="taste-twins",
         description="Find your closest gaming taste twins (and arch-nemesis) in this server"
@@ -440,52 +814,12 @@ class SocialCog(commands.Cog, name="Social"):
             )
             return
 
-        # 1. Target resolution
-        target_username = None
-        target_discord_id = None
-        target_avatar = None
-
-        if user:
-            member_id = parse_discord_member_id(user)
-            if member_id is not None:
-                target_discord_id = member_id
-                linked = await self.bot.db.get_linked_user(target_discord_id)
-                if not linked:
-                    await send_private_followup(
-                        interaction,
-                        "❌ That user has not linked their Backloggd account yet.",
-                        log=logger,
-                    )
-                    return
-                target_username = linked["backloggd_username"]
-                target_avatar = linked["avatar_url"]
-            else:
-                try:
-                    clean_name = normalize_backloggd_username(user)
-                except InvalidUsernameError as err:
-                    await send_private_followup(interaction, f"❌ {err}", log=logger)
-                    return
-                profile = await self.bot.db.get_profile(clean_name)
-                if profile:
-                    target_username = profile["display_username"]
-                    target_avatar = profile["avatar_url"]
-                else:
-                    target_username = clean_name
-                    target_avatar = None
-        else:
-            target_discord_id = interaction.user.id
-            linked = await self.bot.db.get_linked_user(target_discord_id)
-            if not linked:
-                await send_private_followup(
-                    interaction,
-                    "❌ You haven't linked your Backloggd account yet! Use `/link <username>` first.",
-                    log=logger,
-                )
-                return
-            target_username = linked["backloggd_username"]
-            target_avatar = linked["avatar_url"]
-
+        resolved = await self._resolve_taste_twins_target(interaction, user)
+        if resolved is None:
+            return
+        target_username, target_discord_id, target_avatar = resolved
         safe_target = escape_display_text(target_username)
+
         try:
             now = self.clock()
             target_key = target_username.lower()
@@ -498,198 +832,45 @@ class SocialCog(commands.Cog, name="Social"):
             )
             target_status = target_statuses.get(target_key)
 
-            # 2. Get target ratings
-            if target_discord_id or target_subscribed:
-                my_ratings = await self.bot.db.get_profile_ratings_dict(target_username)
-            else:
-                my_ratings = await self._get_or_fetch_ratings(target_username)
-
-            if not my_ratings:
-                if target_subscribed and target_status is not None and target_status.missing:
-                    await send_private_followup(
-                        interaction,
-                        format_fetching_library_message(target_username, target_status),
-                        log=logger,
-                    )
-                else:
-                    is_caller = target_discord_id == interaction.user.id
-                    has_synced_library = bool(
-                        target_subscribed
-                        or (target_status is not None and not target_status.missing)
-                    )
-                    if has_synced_library:
-                        empty_message = (
-                            "Your synced Backloggd library contains no logged games yet."
-                            if is_caller
-                            else f"**{safe_target}**'s synced Backloggd library contains no logged games yet."
-                        )
-                    elif is_caller:
-                        empty_message = "Your live Backloggd library contains no logged games yet."
-                    else:
-                        empty_message = (
-                            f"A live Backloggd fetch found no logged games in **{safe_target}**'s library."
-                        )
-                    await send_private_followup(
-                        interaction,
-                        f"❌ {empty_message}",
-                        log=logger,
-                    )
-                return
-
-            my_numeric_ratings = numeric_ratings(my_ratings)
-            if not my_numeric_ratings:
-                empty_ratings_message = (
-                    "Your library has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity."
-                    if target_discord_id == interaction.user.id
-                    else f"**{safe_target}** has no numeric ratings yet. Unrated backlog and wishlist entries do not count toward similarity."
-                )
-                await send_private_followup(
-                    interaction,
-                    f"ℹ️ {empty_ratings_message}",
-                    log=logger,
-                )
-                return
-
-            # 3. Fetch distinct candidate profiles in this guild, excluding every link to the target.
-            guild_member_ids = await resolve_guild_member_ids(
-                self.bot, interaction.guild, exclude_member_id=target_discord_id
+            my_numeric_ratings = await self._load_taste_twins_target_ratings(
+                interaction,
+                target_username=target_username,
+                safe_target=safe_target,
+                target_discord_id=target_discord_id,
+                target_subscribed=target_subscribed,
+                target_status=target_status,
             )
-            if guild_member_ids is None:
-                await send_private_followup(
-                    interaction,
-                    GUILD_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-                    log=logger,
-                )
-                return
-            other_linked = await self.bot.db.get_guild_linked_profiles(
-                guild_member_ids, exclude_profile_key=target_key
-            )
-
-            if not other_linked:
-                await send_private_followup(
-                    interaction,
-                    "ℹ️ No other distinct Backloggd profiles are linked in this server yet. Invite members to use `/link`.",
-                    log=logger,
-                )
+            if my_numeric_ratings is None:
                 return
 
-            other_statuses = await ensure_profiles_fresh(
-                self.bot,
-                other_linked,
+            loaded = await self._load_taste_twin_candidates(
+                interaction,
+                target_discord_id=target_discord_id,
+                target_key=target_key,
+                my_numeric_ratings=my_numeric_ratings,
                 now=now,
-                require_subscribed=True,
             )
-
-            # 4. Batch fetch ratings once per candidate profile.
-            other_profile_keys = [o["profile_key"] for o in other_linked]
-            all_other_ratings = await self.bot.db.get_multi_profile_ratings_dict(other_profile_keys)
-
-            candidates, slugs_to_lookup, enough_rated_profiles = compute_taste_twin_candidates(
-                my_numeric_ratings,
-                other_linked,
-                all_other_ratings,
-                similarity_fn=calculate_similarity_raw,
-            )
-
-            if not candidates:
-                if enough_rated_profiles:
-                    reason = "No other profile shares at least two numeric ratings with this profile."
-                else:
-                    reason = "Other profiles need at least five numeric ratings before we can compare taste."
-                await send_private_followup(
-                    interaction,
-                    f"ℹ️ {reason} Unrated backlog and wishlist entries do not count toward similarity.",
-                    log=logger,
-                )
+            if loaded is None:
                 return
+            candidates, other_statuses, all_other_ratings, cached_meta = loaded
 
-            # 5. Batch resolve authentic game titles from cache
-            cached_meta = await self.bot.db.get_games_by_slugs(list(slugs_to_lookup)) if slugs_to_lookup else {}
-            for c in candidates:
-                c["top_fav"] = resolve_display_title(c["top_fav_slug"], cached_meta) if c["top_fav_slug"] else None
-                c["top_disagree"] = (
-                    resolve_display_title(c["top_disagree_slug"], cached_meta)
-                    if c["top_disagree_slug"]
-                    else None
-                )
-
-            # 6. Rank candidates and derive twins, optional nemesis, and server average
             twins, nemesis, server_avg_match = summarize_taste_twins(candidates)
-            top_twin_name = twins[0]["username"] if twins else None
-
-            # Interactive duel callback
-            async def on_compare(btn_interaction: discord.Interaction):
-                if btn_interaction.user.id != interaction.user.id:
-                    await send_private_followup(
-                        btn_interaction,
-                        "❌ Only the member who initiated `/taste-twins` can duel with their twin!",
-                        log=logger,
-                    )
-                    return
-                try:
-                    await defer_interaction(btn_interaction)
-                    t1_ratings = my_numeric_ratings
-                    t2_key = twins[0]["profile_key"]
-                    t2_ratings = numeric_ratings(all_other_ratings.get(t2_key, {}))
-                    final_s, _, _ = calculate_similarity_raw(my_numeric_ratings, t2_ratings)
-                    c_slugs = set(t1_ratings.keys()) & set(t2_ratings.keys())
-                    duel_meta = dict(cached_meta)
-                    missing_slugs = sorted(s for s in c_slugs if s not in duel_meta)
-                    slug_lookup = getattr(self.bot.db, "get_games_by_slugs", None)
-                    if missing_slugs and callable(slug_lookup):
-                        extra_meta = await slug_lookup(missing_slugs)
-                        if extra_meta:
-                            duel_meta.update(extra_meta)
-                    c_loves, c_dis = build_comparison_highlights(
-                        my_numeric_ratings, t2_ratings, duel_meta
-                    )
-                    l1 = format_profile_freshness_line(target_status, label=safe_target, unlinked_live=not target_subscribed)
-                    l2 = format_profile_freshness_line(other_statuses.get(t2_key), label=escape_display_text(top_twin_name))
-                    duel_freshness = " · ".join(line for line in (l1, l2) if line) or None
-                    comp_embed = create_compare_embed(
-                        user1=target_username,
-                        user2=top_twin_name,
-                        match_score=final_s / 100.0,
-                        shared_loves=c_loves,
-                        disagreements=c_dis,
-                        freshness_note=duel_freshness,
-                    )
-                    comp_view = LinkButtonView(label=f"View {top_twin_name}'s Profile", url=build_backloggd_user_url(top_twin_name))
-                    await send_public_followup(btn_interaction, embed=comp_embed, view=comp_view)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    await handle_component_error(
-                        btn_interaction,
-                        error,
-                        component_name="taste-twins duel",
-                        user_message=(
-                            f"❌ Could not complete the duel between **{safe_target}** and "
-                            f"**{escape_display_text(top_twin_name)}**. Please try again later."
-                        ),
-                        log=logger,
-                    )
-
-            contributing = ([target_status] if (target_subscribed and target_status is not None) else []) + list(other_statuses.values())
-            freshness_note = format_aggregate_freshness(summarize_aggregate_freshness(contributing))
-            if not target_subscribed and freshness_note:
-                freshness_note = f"{safe_target}: Fetched live · {freshness_note}"
-
-            embed = create_taste_twins_embed(
-                username=target_username,
-                avatar_url=target_avatar,
+            embed, view = self._build_taste_twins_response(
+                initiator_id=interaction.user.id,
                 guild_name=interaction.guild.name,
+                target_username=target_username,
+                safe_target=safe_target,
+                target_avatar=target_avatar,
+                target_subscribed=target_subscribed,
+                target_status=target_status,
+                my_numeric_ratings=my_numeric_ratings,
                 twins=twins,
                 nemesis=nemesis,
                 server_avg_match=server_avg_match,
-                freshness_note=freshness_note,
+                all_other_ratings=all_other_ratings,
+                cached_meta=cached_meta,
+                other_statuses=other_statuses,
             )
-            view = TasteTwinsView(
-                user_url=build_backloggd_user_url(target_username),
-                top_twin_name=top_twin_name,
-                on_compare=on_compare if top_twin_name else None
-            )
-
             view.message = await send_public_followup(interaction, embed=embed, view=view, wait=True)
 
         except (UserNotFoundError, ResourceNotFoundError):

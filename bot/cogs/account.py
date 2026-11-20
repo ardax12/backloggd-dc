@@ -476,7 +476,7 @@ class AccountCog(commands.Cog, name="Account"):
         self,
         interaction: discord.Interaction,
         command: CooldownCommandName,
-        seconds: app_commands.Range[int, 5, 3600],
+        seconds: app_commands.Range[int, 3, 3600],
     ):
         if interaction.guild_id is None:
             await send_private_followup(interaction, "This command can only be used in a server.", log=logger)
