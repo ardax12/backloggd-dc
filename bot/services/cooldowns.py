@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
@@ -111,12 +113,15 @@ class GuildCooldownService:
         db: Optional[Any] = None,
         *,
         db_provider: Optional[Callable[[], Any]] = None,
+        max_component_buckets: int = 2048,
     ):
         self._db = db
         self._db_provider = db_provider
         self._cache: dict[int, dict[str, int]] = {}
         self._generations: dict[int, int] = {}
         self._load_locks: dict[int, asyncio.Lock] = {}
+        self._max_component_buckets = max(1, int(max_component_buckets))
+        self._component_last_used: OrderedDict[tuple[Any, ...], float] = OrderedDict()
 
     def _resolve_db(self, db_override: Any = None) -> Any:
         if db_override is not None:
@@ -124,6 +129,23 @@ class GuildCooldownService:
         if self._db_provider is not None:
             return self._db_provider()
         return self._db
+
+    def _prune_component_buckets_for_guild(
+        self,
+        guild_id: int,
+        *,
+        keep_generation: Optional[int] = None,
+    ) -> None:
+        stale_keys = [
+            key
+            for key in self._component_last_used
+            if len(key) >= 4
+            and key[0] in ("guild", "member")
+            and key[1] == guild_id
+            and (keep_generation is None or key[-1] != keep_generation)
+        ]
+        for key in stale_keys:
+            self._component_last_used.pop(key, None)
 
     def get_generation(self, guild_id: Optional[int]) -> int:
         if guild_id is None:
@@ -133,6 +155,10 @@ class GuildCooldownService:
     def invalidate_guild(self, guild_id: int) -> None:
         self._cache.pop(guild_id, None)
         self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+        self._prune_component_buckets_for_guild(guild_id)
+        lock = self._load_locks.get(guild_id)
+        if lock is not None and not lock.locked():
+            self._load_locks.pop(guild_id, None)
 
     async def _load_guild_locked(self, guild_id: int, *, db: Any = None) -> dict[str, int]:
         cached = self._cache.get(guild_id)
@@ -216,7 +242,9 @@ class GuildCooldownService:
             await self._load_guild_locked(guild_id, db=active_db)
             await active_db.set_guild_command_cooldown(guild_id, spec.command_name, validated)
             self._cache.setdefault(guild_id, {})[spec.command_name] = validated
-            self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+            new_gen = self._generations.get(guild_id, 0) + 1
+            self._generations[guild_id] = new_gen
+            self._prune_component_buckets_for_guild(guild_id, keep_generation=new_gen)
         return validated
 
     async def reset_cooldown(
@@ -239,7 +267,9 @@ class GuildCooldownService:
                     self._cache[guild_id].clear()
                 else:
                     self._cache[guild_id].pop(target_name, None)
-            self._generations[guild_id] = self._generations.get(guild_id, 0) + 1
+            new_gen = self._generations.get(guild_id, 0) + 1
+            self._generations[guild_id] = new_gen
+            self._prune_component_buckets_for_guild(guild_id, keep_generation=new_gen)
         return int(removed)
 
     async def check_component_cooldown(
@@ -253,8 +283,6 @@ class GuildCooldownService:
 
         Returns remaining seconds when rate-limited, or None when allowed.
         """
-        import time
-
         spec = get_cooldown_spec(command_name)
         guild_id = getattr(interaction, "guild_id", None)
         user_id = getattr(getattr(interaction, "user", None), "id", 0)
@@ -264,13 +292,10 @@ class GuildCooldownService:
         created_at = getattr(interaction, "created_at", None)
         now_ts = created_at.timestamp() if created_at is not None else time.monotonic()
 
-        bucket_map: dict[tuple, float] | None = getattr(self, "_component_last_used", None)
-        if bucket_map is None:
-            bucket_map = {}
-            self._component_last_used = bucket_map
+        bucket_map = self._component_last_used
 
         if guild_id is None:
-            key = ("dm", user_id, spec.command_name, 0)
+            key: tuple[Any, ...] = ("dm", user_id, spec.command_name, 0)
         elif spec.per_guild:
             key = ("guild", guild_id, spec.command_name, generation)
         else:
@@ -280,14 +305,18 @@ class GuildCooldownService:
         if last_ts is not None:
             elapsed = now_ts - last_ts
             if 0 <= elapsed < seconds:
+                bucket_map.move_to_end(key)
                 return float(seconds - elapsed)
 
-        if len(bucket_map) >= 2048:
+        if key not in bucket_map and len(bucket_map) >= self._max_component_buckets:
             cutoff = now_ts - 3600.0
             for stale_key in [k for k, ts in bucket_map.items() if ts < cutoff]:
                 bucket_map.pop(stale_key, None)
+            while len(bucket_map) >= self._max_component_buckets:
+                bucket_map.popitem(last=False)
 
         bucket_map[key] = now_ts
+        bucket_map.move_to_end(key)
         return None
 
 

@@ -31,6 +31,7 @@ from bot.services.library_sync import (
     seed_profile_sync_state,
     sync_profile_library,
 )
+from bot.services.session_health import report_upstream_failure, report_upstream_success
 from bot.services.task_lifecycle import TaskDrainGroup
 from bot.ui.helpers import build_backloggd_user_url, clamp_escaped_text, clean_image_url
 
@@ -247,6 +248,9 @@ class AccountCog(commands.Cog, name="Account"):
             return
 
         safe_clean = escape_display_text(clean_user)
+        cache = getattr(self.bot.backloggd, "cache", None)
+        get_cached_profile = getattr(cache, "get_profile", None)
+        was_cached = callable(get_cached_profile) and get_cached_profile(clean_user) is not None
         try:
             profile = await self.bot.backloggd.get_user_profile(clean_user)
             if not profile or not profile.username:
@@ -256,6 +260,8 @@ class AccountCog(commands.Cog, name="Account"):
                     log=logger,
                 )
                 return
+            if not was_cached:
+                report_upstream_success(self.bot)
         except (UserNotFoundError, ResourceNotFoundError):
             await send_private_followup(
                 interaction,
@@ -264,6 +270,7 @@ class AccountCog(commands.Cog, name="Account"):
             )
             return
         except Exception as e:
+            report_upstream_failure(self.bot, e)
             logger.error("Failed to verify user %s: %s", clean_user, e)
             await send_private_followup(
                 interaction,

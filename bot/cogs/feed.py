@@ -25,6 +25,7 @@ from bot.input_validation import (
 )
 from bot.services.feed_pipeline import FeedPipeline
 from bot.services.library_sync import parse_sync_timestamp
+from bot.services.session_health import report_upstream_failure, report_upstream_success
 from bot.services.task_lifecycle import TaskDrainGroup
 from bot.ui.embeds import create_server_recap_embed
 from bot.ui.feed_embed import create_journal_feed_embed
@@ -744,6 +745,9 @@ class FeedCog(commands.Cog, name="Feed"):
             await send_private_followup(interaction, f"❌ {error}", log=logger)
             return
         safe_requested = escape_display_text(requested)
+        cache = getattr(self.bot.backloggd, "cache", None)
+        get_cached_profile = getattr(cache, "get_profile", None)
+        was_cached = callable(get_cached_profile) and get_cached_profile(requested) is not None
         try:
             profile = await self.bot.backloggd.get_user_profile(requested)
         except (UserNotFoundError, ResourceNotFoundError):
@@ -754,6 +758,7 @@ class FeedCog(commands.Cog, name="Feed"):
             )
             return
         except Exception as error:
+            report_upstream_failure(self.bot, error)
             logger.warning("Could not validate feed profile %s: %s", requested, error)
             await send_private_followup(
                 interaction,
@@ -768,6 +773,8 @@ class FeedCog(commands.Cog, name="Feed"):
                 log=logger,
             )
             return
+        if not was_cached:
+            report_upstream_success(self.bot)
         member_ids = await self.pipeline.authoritative_member_ids(interaction.guild)
         created = await self.bot.db.add_guild_admin_follow(
             interaction.guild_id,
@@ -1238,72 +1245,97 @@ class FeedCog(commands.Cog, name="Feed"):
 
     async def run_due_digests(self) -> int:
         """Check scheduled server digests and post any that are due with non-empty activity."""
-        if self._closing or not hasattr(self.bot.db, "get_all_guild_digests"):
+        if self._closing:
+            return 0
+        db = getattr(self.bot, "db", None)
+        if (
+            db is None
+            or not getattr(db, "is_connected", True)
+            or not hasattr(db, "get_all_guild_digests")
+        ):
             return 0
         now = self.pipeline.clock()
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         now = now.astimezone(timezone.utc)
 
-        digests = await self.bot.db.get_all_guild_digests()
+        try:
+            digests = await db.get_all_guild_digests()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Failed to load scheduled server digests", exc_info=True)
+            return 0
+
         posted = 0
         for row in digests:
             if self._closing:
                 break
-            guild_id = int(row["guild_id"])
-            channel_id = int(row["channel_id"])
-            cadence = str(row.get("cadence") or "weekly").strip().lower()
-            window_days = 30 if cadence == "monthly" else 7
-            period_label = "Monthly" if cadence == "monthly" else "Weekly"
-
-            last_sent_dt = parse_sync_timestamp(row.get("last_sent_at"))
-            if last_sent_dt is not None and (now - last_sent_dt) < timedelta(days=window_days):
-                continue
-
-            channel, reason_code, _summary = self.pipeline.inspect_target_channel(
-                guild_id,
-                channel_id,
-                require_channel_lookup=True,
-            )
-            if channel is None:
-                logger.debug(
-                    "Skipping scheduled %s digest for guild %d: %s",
-                    cadence,
-                    guild_id,
-                    reason_code or "channel_unavailable",
-                )
-                continue
-
-            since_utc = now - timedelta(days=window_days)
-            recap = await self.bot.db.get_guild_activity_recap(guild_id, since_utc=since_utc)
-            if int(recap.get("total_announcements", 0) or 0) <= 0:
-                await self.bot.db.mark_guild_digest_sent(guild_id, sent_at=now)
-                continue
-
-            guild_name = getattr(getattr(channel, "guild", None), "name", None) or "Server"
-            embed = create_server_recap_embed(
-                recap,
-                guild_name=guild_name,
-                period_label=period_label,
-                is_digest=True,
-            )
+            guild_id = None
             try:
-                await channel.send(
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                logger.warning(
-                    "Failed to post scheduled %s digest for guild %d in channel %d: %s",
-                    cadence,
+                guild_id = int(row["guild_id"])
+                channel_id = int(row["channel_id"])
+                cadence = str(row.get("cadence") or "weekly").strip().lower()
+                window_days = 30 if cadence == "monthly" else 7
+                period_label = "Monthly" if cadence == "monthly" else "Weekly"
+
+                last_sent_dt = parse_sync_timestamp(row.get("last_sent_at"))
+                if last_sent_dt is not None and (now - last_sent_dt) < timedelta(days=window_days):
+                    continue
+
+                channel, reason_code, _summary = self.pipeline.inspect_target_channel(
                     guild_id,
                     channel_id,
-                    exc,
+                    require_channel_lookup=True,
+                )
+                if channel is None:
+                    logger.debug(
+                        "Skipping scheduled %s digest for guild %d: %s",
+                        cadence,
+                        guild_id,
+                        reason_code or "channel_unavailable",
+                    )
+                    continue
+
+                since_utc = now - timedelta(days=window_days)
+                recap = await db.get_guild_activity_recap(guild_id, since_utc=since_utc)
+                if int(recap.get("total_announcements", 0) or 0) <= 0:
+                    await db.mark_guild_digest_sent(guild_id, sent_at=now)
+                    continue
+
+                guild_name = getattr(getattr(channel, "guild", None), "name", None) or "Server"
+                embed = create_server_recap_embed(
+                    recap,
+                    guild_name=guild_name,
+                    period_label=period_label,
+                    is_digest=True,
+                )
+                try:
+                    await channel.send(
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning(
+                        "Failed to post scheduled %s digest for guild %d in channel %d: %s",
+                        cadence,
+                        guild_id,
+                        channel_id,
+                        exc,
+                    )
+                    continue
+
+                await db.mark_guild_digest_sent(guild_id, sent_at=now)
+                posted += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Unexpected error processing scheduled digest for guild %s",
+                    guild_id,
+                    exc_info=True,
                 )
                 continue
-
-            await self.bot.db.mark_guild_digest_sent(guild_id, sent_at=now)
-            posted += 1
 
         return posted
 
@@ -1338,6 +1370,12 @@ class FeedCog(commands.Cog, name="Feed"):
         except RuntimeError:
             # Raised if testing offline without bot.start()
             pass
+
+    @digest_loop.error
+    async def on_digest_loop_error(self, error: BaseException):
+        if isinstance(error, asyncio.CancelledError):
+            raise error
+        logger.error("Unhandled error in scheduled digest loop", exc_info=error)
 
 async def setup(bot):
     await bot.add_cog(FeedCog(bot))

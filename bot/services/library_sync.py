@@ -64,14 +64,58 @@ class LibrarySyncService:
         max_workers: int = 2,
         automatic_debounce_seconds: float = 300,
         failure_backoff_seconds: float = 300,
+        max_tracked_profiles: int = 2000,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.automatic_debounce_seconds = automatic_debounce_seconds
         self.failure_backoff_seconds = failure_backoff_seconds
+        self._max_tracked_profiles = max(1, int(max_tracked_profiles))
         self._clock = clock or time.monotonic
         self._semaphore = asyncio.Semaphore(max(1, max_workers))
         self._profiles: dict[str, _ProfileState] = {}
         self._closed = False
+
+    def evict_profile(self, profile_key: str) -> bool:
+        """Remove an idle tracked profile entry without disturbing active refreshes."""
+        normalized = profile_key.strip().lower()
+        target_key = normalized if normalized in self._profiles else profile_key
+        state = self._profiles.get(target_key)
+        if state is None:
+            return False
+        if state.task is not None and not state.task.done():
+            return False
+        self._profiles.pop(target_key, None)
+        return True
+
+    def _prune_idle_profiles(self, *, exclude_key: Optional[str] = None) -> int:
+        """Evict expired idle profile entries when tracked state exceeds max_tracked_profiles."""
+        if len(self._profiles) <= self._max_tracked_profiles:
+            return 0
+        now = self._clock()
+        retention = max(
+            float(self.automatic_debounce_seconds),
+            float(self.failure_backoff_seconds),
+            3600.0,
+        )
+        evictable: list[str] = []
+        for key, state in self._profiles.items():
+            if key == exclude_key:
+                continue
+            if state.task is not None and not state.task.done():
+                continue
+            if state.dirty_operation is not None:
+                continue
+            timestamps = [
+                ts
+                for ts in (state.last_attempt_at, state.last_success_at, state.last_failure_at)
+                if ts is not None
+            ]
+            latest = max(timestamps) if timestamps else None
+            if latest is None or (now - latest) >= retention:
+                evictable.append(key)
+        for key in evictable:
+            self._profiles.pop(key, None)
+        return len(evictable)
 
     def seed_success(self, profile_key: str, *, age_seconds: float, game_count: int) -> None:
         """Seed cooldown state from a persisted successful snapshot."""
@@ -88,6 +132,7 @@ class LibrarySyncService:
         state.last_failure_at = None
         state.last_error = None
         state.game_count = game_count
+        self._prune_idle_profiles(exclude_key=profile_key)
 
     def seed_failure(
         self, profile_key: str, *, age_seconds: float, error: Optional[str] = None
@@ -103,6 +148,7 @@ class LibrarySyncService:
         state.last_failure_at = failed_at
         if error:
             state.last_error = error
+        self._prune_idle_profiles(exclude_key=profile_key)
 
     def seed_from_sync_info(self, info, *, now=None, profile_key: Optional[str] = None) -> None:
         """Seed in-memory coordinator state from a DB profile sync row."""
@@ -166,6 +212,7 @@ class LibrarySyncService:
         if self._closed:
             raise RuntimeError("Library sync service is closed")
         state = self._profiles.setdefault(profile_key, _ProfileState())
+        self._prune_idle_profiles(exclude_key=profile_key)
         if state.task and not state.task.done():
             if dirty:
                 state.dirty_operation = operation
@@ -241,6 +288,7 @@ class LibrarySyncService:
             if state.task is asyncio.current_task():
                 state.task = None
                 state.dirty_operation = None
+                self._prune_idle_profiles(exclude_key=profile_key)
 
     async def close(self) -> None:
         """Cancel and wait for all active work before the database closes."""

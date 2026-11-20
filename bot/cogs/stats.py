@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, List, Literal, Optional, Sequence
 
 import discord
+from backloggd.exceptions import ResourceNotFoundError, UserNotFoundError
 from discord import app_commands
 from discord.ext import commands
 
@@ -21,6 +22,7 @@ from bot.services.guild_membership import (
     resolve_guild_member_ids,
 )
 from bot.services.library_sync import parse_sync_timestamp
+from bot.services.session_health import report_upstream_failure, report_upstream_success
 from bot.services.task_lifecycle import TaskDrainGroup
 from bot.ui.embeds import (
     create_playing_embed,
@@ -123,6 +125,7 @@ class StatsCog(commands.Cog, name="Stats"):
         public_profile = await self.bot.backloggd.get_user_profile(username, force_refresh=True)
         if public_profile is None:
             return None
+        report_upstream_success(self.bot)
         count = valid_played_count(getattr(public_profile, "played_count", None))
         if count is not None:
             return count
@@ -131,6 +134,7 @@ class StatsCog(commands.Cog, name="Stats"):
         )
         if callable(counts_method):
             collection_counts = await counts_method(username)
+            report_upstream_success(self.bot)
             if isinstance(collection_counts, dict):
                 return valid_played_count(collection_counts.get("played"))
         return None
@@ -200,7 +204,7 @@ class StatsCog(commands.Cog, name="Stats"):
         stop_pulling = False
 
         async def worker() -> None:
-            nonlocal next_idx
+            nonlocal next_idx, stop_pulling
             while not stop_pulling:
                 idx = next_idx
                 if idx >= len(fetch_targets):
@@ -218,6 +222,9 @@ class StatsCog(commands.Cog, name="Stats"):
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
+                    if not isinstance(error, (UserNotFoundError, ResourceNotFoundError)):
+                        if report_upstream_failure(self.bot, error) is not None:
+                            stop_pulling = True
                     logger.warning("Could not read Played-tab count for %s: %s", username, type(error).__name__)
 
         worker_count = min(self.profile_count_concurrency, len(fetch_targets))
