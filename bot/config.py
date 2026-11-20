@@ -20,7 +20,9 @@ LIBSQL_DATABASE_URL = os.getenv("LIBSQL_DATABASE_URL", os.getenv("TURSO_DATABASE
 LIBSQL_AUTH_TOKEN = os.getenv("LIBSQL_AUTH_TOKEN", os.getenv("TURSO_AUTH_TOKEN", "")).strip()
 
 # Operational defaults
-def _parse_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+def _parse_int_env(
+    name: str, default: int, *, minimum: int = 0, maximum: int | None = None
+) -> int:
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
@@ -28,7 +30,11 @@ def _parse_int_env(name: str, default: int, *, minimum: int = 0) -> int:
         value = int(raw)
     except ValueError:
         return default
-    return value if value >= minimum else default
+    if value < minimum:
+        return default
+    if maximum is not None and value > maximum:
+        return maximum
+    return value
 
 
 def _parse_bool_env(name: str, default: bool = False) -> bool:
@@ -41,6 +47,7 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
 MISSING_GUILD_PAUSE_HOURS = _parse_int_env("MISSING_GUILD_PAUSE_HOURS", 24, minimum=1)
 HISTORY_RETENTION_DAYS = _parse_int_env("HISTORY_RETENTION_DAYS", 90, minimum=7)
 FEED_ADAPTIVE_POLL_THRESHOLD = _parse_int_env("FEED_ADAPTIVE_POLL_THRESHOLD", 40, minimum=0)
+FEED_DELIVERY_CONCURRENCY = _parse_int_env("FEED_DELIVERY_CONCURRENCY", 2, minimum=1, maximum=5)
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
 ALERT_OWNER_DM = _parse_bool_env("ALERT_OWNER_DM", False)
 

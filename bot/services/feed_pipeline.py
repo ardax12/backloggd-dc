@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from bot.config import (
     FEED_ADAPTIVE_POLL_THRESHOLD,
+    FEED_DELIVERY_CONCURRENCY,
     HISTORY_RETENTION_DAYS,
     MISSING_GUILD_PAUSE_HOURS,
 )
@@ -42,6 +43,9 @@ class FeedPipeline:
         dormant_after_days: int = 7,
         dormant_tick_modulus: int = 3,
         force_adaptive: bool = False,
+        delivery_concurrency: int | None = None,
+        scrape_delay_seconds: float = 1.5,
+        poll_interval_seconds: float = 300.0,
     ):
         self.bot = bot
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -74,14 +78,32 @@ class FeedPipeline:
         self._dormant_after_days = max(1, int(dormant_after_days))
         self._dormant_tick_modulus = max(1, int(dormant_tick_modulus))
         self._force_adaptive = bool(force_adaptive)
+        raw_concurrency = (
+            FEED_DELIVERY_CONCURRENCY
+            if delivery_concurrency is None
+            else int(delivery_concurrency)
+        )
+        self._delivery_concurrency = max(1, min(5, int(raw_concurrency)))
+        self._scrape_delay_seconds = max(0.0, float(scrape_delay_seconds))
+        self._poll_interval_seconds = max(1.0, float(poll_interval_seconds))
         self._poll_tick_index = 0
         self._last_retention_prune_at: float | None = None
         self._last_publish_errors: dict[tuple[int, str], str] = {}
         self._profiles_with_recipient_gaps: set[str] = set()
+        self._channel_send_locks: dict[int, asyncio.Lock] = {}
         self._delivery_cleanup_tasks: set[asyncio.Task] = set()
+        self.last_poll_completed_at: datetime | None = None
+        self.last_poll_duration_seconds: float | None = None
         self._closing = False
 
     _OBSERVATION_STATUS_RANK = feed_sources.OBSERVATION_STATUS_RANK
+
+    def _get_channel_lock(self, channel_id: int) -> asyncio.Lock:
+        lock = self._channel_send_locks.get(channel_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._channel_send_locks[channel_id] = lock
+        return lock
 
     def forget_guild(self, guild_id: int) -> None:
         """Drop in-memory outage tracking for a guild the bot has left or paused."""
@@ -558,6 +580,134 @@ class FeedPipeline:
             self, target, event, history, prepared, now, poll_context=poll_context
         )
 
+    async def _deliver_profile_item(
+        self,
+        profile_key: str,
+        username: str,
+        sources: dict[str, list[FeedEvent]],
+        meta: dict[str, Any] | None,
+        health_now: datetime,
+        active_targets: list[tuple],
+        skipped: list[tuple],
+        *,
+        poll_context: dict[str, Any],
+        stats: dict[str, int],
+    ) -> None:
+        """Persist observations, deliver announcements across target guilds, and update gaps/boundaries."""
+        try:
+            await self._observe_profile_activity(profile_key, username, sources)
+            all_guilds_ok = bool(active_targets) and not skipped
+            skipped_guild_ids = [item[0] for item in skipped]
+            if skipped_guild_ids:
+                await self.bot.db.record_feed_target_gap(
+                    profile_key,
+                    now=health_now,
+                    guild_ids=skipped_guild_ids,
+                    reason="unavailable_feed_target",
+                )
+            succeeded_guild_ids: list[int] = []
+            failed_active: list[tuple[int, str | None]] = []
+            for guild_id, target_username, target_avatar, channel in [*active_targets, *skipped]:
+                try:
+                    channel_id = getattr(channel, "id", None) if channel is not None else None
+                    if channel is not None and isinstance(channel_id, int):
+                        async with self._get_channel_lock(channel_id):
+                            published_ok = await self.publish_sources(
+                                guild_id,
+                                profile_key,
+                                target_username,
+                                target_avatar,
+                                channel,
+                                sources,
+                                deliver=True,
+                                poll_context=poll_context,
+                            )
+                    else:
+                        published_ok = await self.publish_sources(
+                            guild_id,
+                            profile_key,
+                            target_username,
+                            target_avatar,
+                            channel,
+                            sources,
+                            deliver=channel is not None,
+                            poll_context=poll_context,
+                        )
+                    if published_ok is False:
+                        all_guilds_ok = False
+                        if channel is not None:
+                            failed_active.append(
+                                (
+                                    guild_id,
+                                    self._last_publish_errors.pop((guild_id, profile_key), None),
+                                )
+                            )
+                    elif channel is not None:
+                        succeeded_guild_ids.append(guild_id)
+                        self._last_publish_errors.pop((guild_id, profile_key), None)
+                except Exception as e:
+                    all_guilds_ok = False
+                    if channel is not None:
+                        stats["delivery_errors"] += 1
+                        failed_active.append(
+                            (
+                                guild_id,
+                                self._last_publish_errors.pop((guild_id, profile_key), str(e)),
+                            )
+                        )
+                    logger.warning(
+                        "Error publishing activity for %s in guild %d: %s",
+                        target_username,
+                        guild_id,
+                        e,
+                    )
+            had_known_gap = (
+                profile_key in self._profiles_with_recipient_gaps
+                or bool(meta and meta.get("had_unresolved_gap"))
+                or not all_guilds_ok
+                or "activity" not in sources
+            )
+            if succeeded_guild_ids and had_known_gap:
+                await self.bot.db.clear_guild_feed_recipient_gaps(profile_key, succeeded_guild_ids)
+            if skipped_guild_ids or failed_active:
+                self._profiles_with_recipient_gaps.add(profile_key)
+            elif succeeded_guild_ids and "activity" in sources:
+                self._profiles_with_recipient_gaps.discard(profile_key)
+            for failed_gid, failed_err in failed_active:
+                await self.bot.db.record_feed_target_gap(
+                    profile_key,
+                    now=health_now,
+                    guild_id=failed_gid,
+                    reason="delivery_failure",
+                    last_error=failed_err,
+                )
+            if all_guilds_ok and meta and "activity" in sources:
+                await self.bot.db.commit_feed_source_boundary(
+                    profile_key,
+                    "activity",
+                    coverage=meta["coverage"],
+                    boundary_event_id=meta.get("boundary_event_id"),
+                    now=health_now,
+                )
+        except Exception as e:
+            stats["delivery_errors"] += 1
+            logger.warning("Error delivering activity for %s: %s", username, e)
+
+    @staticmethod
+    async def _drain_workers(workers: list[asyncio.Task[Any]]) -> None:
+        """Cancel unfinished delivery workers and wait until all have unwound."""
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        while True:
+            pending = [worker for worker in workers if not worker.done()]
+            if not pending:
+                break
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except asyncio.CancelledError:
+                continue
+
     # ── Periodic poll loop ────────────────────────────────────────────
 
     async def poll(self):
@@ -719,97 +869,83 @@ class FeedPipeline:
             )
             stats["skipped_dormant"] = skipped_dormant
 
-            for profile_key in selected_profile_keys:
-                stats["profiles"] += 1
-                entry = profile_entries.get(profile_key)
-                active_targets = entry["targets"] if entry else []
-                skipped = skipped_targets.get(profile_key, [])
-                username = entry["username"] if entry else skipped[0][1]
+            if selected_profile_keys:
+                worker_count = min(self._delivery_concurrency, len(selected_profile_keys))
+                delivery_queue: asyncio.Queue[tuple[Any, ...] | None] = asyncio.Queue(
+                    maxsize=max(1, self._delivery_concurrency * 2)
+                )
+
+                async def _delivery_worker() -> None:
+                    while True:
+                        item = await delivery_queue.get()
+                        if item is None:
+                            return
+                        await self._deliver_profile_item(
+                            *item,
+                            poll_context=poll_context,
+                            stats=stats,
+                        )
+
+                workers = [asyncio.create_task(_delivery_worker()) for _ in range(worker_count)]
                 try:
-                    sources = await self._fetch_feed_sources(
-                        username, defer_boundary_commit=True, poll_context=poll_context
-                    )
-                    meta = self._activity_snapshot_meta.get(profile_key)
-                    health_now = meta.get("observed_at") if meta else None
-                    if health_now is None:
-                        health_now = self.clock()
-                    await self._observe_profile_activity(profile_key, username, sources)
-                    all_guilds_ok = bool(active_targets) and not skipped
-                    skipped_guild_ids = [item[0] for item in skipped]
-                    if skipped_guild_ids:
-                        await self.bot.db.record_feed_target_gap(
-                            profile_key, now=health_now, guild_ids=skipped_guild_ids,
-                            reason="unavailable_feed_target",
-                        )
-                    succeeded_guild_ids: list[int] = []
-                    failed_active: list[tuple[int, str | None]] = []
-                    for guild_id, target_username, target_avatar, channel in [*active_targets, *skipped]:
+                    last_scrape_finished: float | None = None
+                    for profile_key in selected_profile_keys:
+                        if self._closing:
+                            break
+                        if last_scrape_finished is not None and self._scrape_delay_seconds > 0:
+                            elapsed_since_prev = max(0.0, time.monotonic() - last_scrape_finished)
+                            remaining_delay = self._scrape_delay_seconds - elapsed_since_prev
+                            if remaining_delay > 0:
+                                # Pause between users to stay respectful to Backloggd servers
+                                await asyncio.sleep(remaining_delay)
+                        if self._closing:
+                            break
+
+                        stats["profiles"] += 1
+                        entry = profile_entries.get(profile_key)
+                        active_targets = entry["targets"] if entry else []
+                        skipped = skipped_targets.get(profile_key, [])
+                        username = entry["username"] if entry else skipped[0][1]
                         try:
-                            published_ok = await self.publish_sources(
-                                guild_id,
-                                profile_key,
-                                target_username,
-                                target_avatar,
-                                channel,
-                                sources,
-                                deliver=channel is not None,
-                                poll_context=poll_context,
+                            sources = await self._fetch_feed_sources(
+                                username, defer_boundary_commit=True, poll_context=poll_context
                             )
-                            if published_ok is False:
-                                all_guilds_ok = False
-                                if channel is not None:
-                                    failed_active.append((
-                                        guild_id,
-                                        self._last_publish_errors.pop((guild_id, profile_key), None),
-                                    ))
-                            elif channel is not None:
-                                succeeded_guild_ids.append(guild_id)
-                                self._last_publish_errors.pop((guild_id, profile_key), None)
+                            raw_meta = self._activity_snapshot_meta.get(profile_key)
+                            meta = dict(raw_meta) if isinstance(raw_meta, dict) else raw_meta
+                            health_now = meta.get("observed_at") if isinstance(meta, dict) else None
+                            if health_now is None:
+                                health_now = self.clock()
                         except Exception as e:
-                            all_guilds_ok = False
-                            if channel is not None:
-                                stats["delivery_errors"] += 1
-                                failed_active.append((
-                                    guild_id,
-                                    self._last_publish_errors.pop((guild_id, profile_key), str(e)),
-                                ))
-                            logger.warning("Error publishing activity for %s in guild %d: %s", target_username, guild_id, e)
-                    had_known_gap = (
-                        profile_key in self._profiles_with_recipient_gaps
-                        or bool(meta and meta.get("had_unresolved_gap"))
-                        or not all_guilds_ok
-                        or "activity" not in sources
-                    )
-                    if succeeded_guild_ids and had_known_gap:
-                        await self.bot.db.clear_guild_feed_recipient_gaps(profile_key, succeeded_guild_ids)
-                    if skipped_guild_ids or failed_active:
-                        self._profiles_with_recipient_gaps.add(profile_key)
-                    elif succeeded_guild_ids and "activity" in sources:
-                        self._profiles_with_recipient_gaps.discard(profile_key)
-                    for failed_gid, failed_err in failed_active:
-                        await self.bot.db.record_feed_target_gap(
-                            profile_key, now=health_now, guild_id=failed_gid,
-                            reason="delivery_failure", last_error=failed_err,
+                            stats["source_errors"] += 1
+                            logger.warning("Error polling activity for %s: %s", username, e)
+                            last_scrape_finished = time.monotonic()
+                            if poll_context.get("upstream_aborted"):
+                                break
+                            continue
+
+                        last_scrape_finished = time.monotonic()
+                        await delivery_queue.put(
+                            (profile_key, username, sources, meta, health_now, active_targets, skipped)
                         )
-                    if all_guilds_ok and meta and "activity" in sources:
-                        await self.bot.db.commit_feed_source_boundary(
-                            profile_key,
-                            "activity",
-                            coverage=meta["coverage"],
-                            boundary_event_id=meta.get("boundary_event_id"),
-                            now=health_now,
-                        )
-                except Exception as e:
-                    stats["source_errors"] += 1
-                    logger.warning("Error polling activity for %s: %s", username, e)
+                        if poll_context.get("upstream_aborted"):
+                            break
 
-                if poll_context.get("upstream_aborted"):
-                    break
+                    for _ in workers:
+                        await delivery_queue.put(None)
+                    await asyncio.gather(*workers)
+                except BaseException:
+                    await self._drain_workers(workers)
+                    raise
+                finally:
+                    await self._drain_workers(workers)
+                    for cid in [
+                        cid
+                        for cid, lock in list(self._channel_send_locks.items())
+                        if not lock.locked()
+                    ]:
+                        self._channel_send_locks.pop(cid, None)
 
-                # Pause between users to stay respectful to Backloggd servers
-                await asyncio.sleep(1.5)
-
-            if all_profile_keys and not poll_context.get("upstream_aborted"):
+            if all_profile_keys and not poll_context.get("upstream_aborted") and not self._closing:
                 self._poll_tick_index += 1
 
             await self._maybe_prune_stale_history(poll_start)
@@ -818,6 +954,8 @@ class FeedPipeline:
             logger.error("Error in journal_feed_loop: %s", e, exc_info=True)
         finally:
             elapsed_s = max(0.0, self._monotonic_clock() - poll_start)
+            self.last_poll_completed_at = self.clock()
+            self.last_poll_duration_seconds = elapsed_s
             logger.info(
                 "Feed poll complete: guilds=%d profiles=%d sent=%d edited=%d source_errors=%d delivery_errors=%d skipped_dormant=%d elapsed_s=%.2f",
                 stats["guilds"],
@@ -829,3 +967,19 @@ class FeedPipeline:
                 stats["skipped_dormant"],
                 elapsed_s,
             )
+            if elapsed_s > self._poll_interval_seconds:
+                logger.warning(
+                    "Feed poll overran its %.0fs interval (elapsed_s=%.2f, profiles=%d, guilds=%d).",
+                    self._poll_interval_seconds,
+                    elapsed_s,
+                    stats["profiles"],
+                    stats["guilds"],
+                )
+            elif elapsed_s >= self._poll_interval_seconds * 0.8:
+                logger.warning(
+                    "Feed poll approached its %.0fs interval (elapsed_s=%.2f, profiles=%d, guilds=%d).",
+                    self._poll_interval_seconds,
+                    elapsed_s,
+                    stats["profiles"],
+                    stats["guilds"],
+                )

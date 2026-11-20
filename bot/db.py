@@ -26,6 +26,22 @@ _GUILD_FEED_SETTING_KEYS = db_guilds.GUILD_FEED_SETTING_KEYS
 logger = logging.getLogger("backloggd.db")
 
 
+def _is_readonly_select(query: str) -> bool:
+    """Return True when a SQL statement is a read-only SELECT or WITH query."""
+    stripped = query.lstrip()
+    while stripped.startswith("--") or stripped.startswith("/*"):
+        if stripped.startswith("--"):
+            newline = stripped.find("\n")
+            stripped = "" if newline == -1 else stripped[newline + 1 :].lstrip()
+        else:
+            end = stripped.find("*/")
+            stripped = "" if end == -1 else stripped[end + 2 :].lstrip()
+    parts = stripped.split(None, 1)
+    if not parts:
+        return False
+    return parts[0].upper() in {"SELECT", "WITH"}
+
+
 class Database:
     _CLEAR_UNSENT_FEED_DECISIONS_SQL = db_feed.CLEAR_UNSENT_FEED_DECISIONS_SQL
     _ROULETTE_POOL_STATUSES = db_library.ROULETTE_POOL_STATUSES
@@ -65,8 +81,10 @@ class Database:
             turso_token if turso_token is not None else LIBSQL_AUTH_TOKEN
         ).strip().strip("'\"")
         self._conn: Optional[aiosqlite.Connection] = None
+        self._read_conn: Optional[aiosqlite.Connection] = None
         self._client: Optional[libsql_client.Client] = None
         self._operation_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
         self._lock_owner_task: Optional[asyncio.Task] = None
         self._active_pending_delivery_tokens: dict[tuple[int, str, str], set[str]] = {}
         self._stale_pending_recovery_checked: bool = False
@@ -96,7 +114,8 @@ class Database:
             await run_migrations(self)
             logger.info("Connected to Turso cloud database.")
         else:
-            if str(self.db_path) != ":memory:":
+            is_file_db = str(self.db_path) != ":memory:"
+            if is_file_db:
                 Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = await aiosqlite.connect(self.db_path)
             self._conn.row_factory = aiosqlite.Row
@@ -107,6 +126,18 @@ class Database:
             await self._create_tables()
             from bot.db_migrations import run_migrations
             await run_migrations(self)
+            if is_file_db:
+                read_conn = await aiosqlite.connect(self.db_path)
+                try:
+                    read_conn.row_factory = aiosqlite.Row
+                    await read_conn.execute("PRAGMA query_only = ON;")
+                    await read_conn.execute("PRAGMA busy_timeout = 5000;")
+                    await read_conn.execute("PRAGMA synchronous = NORMAL;")
+                    await read_conn.execute("PRAGMA foreign_keys = ON;")
+                except BaseException:
+                    await read_conn.close()
+                    raise
+                self._read_conn = read_conn
             logger.info("Connected to local SQLite database at %s", self.db_path)
 
     @property
@@ -115,7 +146,11 @@ class Database:
         if self.is_turso:
             is_closed = getattr(self._client, "closed", getattr(self._client, "_closed", False))
             return self._client is not None and not is_closed
-        return self._conn is not None and getattr(self._conn, "_running", False)
+        if self._conn is None or not getattr(self._conn, "_running", False):
+            return False
+        if self._read_conn is not None and not getattr(self._read_conn, "_running", False):
+            return False
+        return True
 
     @asynccontextmanager
     async def _acquire_operation_lock(self):
@@ -141,6 +176,10 @@ class Database:
                 await self._client.close()
                 self._client = None
                 logger.info("Closed Turso client connection.")
+            async with self._read_lock:
+                if self._read_conn:
+                    await self._read_conn.close()
+                    self._read_conn = None
             if self._conn:
                 try:
                     if str(self.db_path) != ":memory:":
@@ -173,6 +212,15 @@ class Database:
 
     async def _fetchone(self, query: str, params: tuple | list = ()) -> Optional[Any]:
         """Fetch a single row."""
+        current = asyncio.current_task()
+        if current is not None and self._lock_owner_task is current:
+            raise RuntimeError("Re-entrant acquisition of non-reentrant Database._operation_lock")
+        if not self.is_turso and self._read_conn is not None and _is_readonly_select(query):
+            async with self._read_lock:
+                if self._read_conn is None:
+                    raise RuntimeError("Database is not connected.")
+                async with self._read_conn.execute(query, params) as cursor:
+                    return await cursor.fetchone()
         async with self._acquire_operation_lock():
             if self.is_turso:
                 if self._client is None:
@@ -186,6 +234,15 @@ class Database:
 
     async def _fetchall(self, query: str, params: tuple | list = ()) -> List[Any]:
         """Fetch all rows."""
+        current = asyncio.current_task()
+        if current is not None and self._lock_owner_task is current:
+            raise RuntimeError("Re-entrant acquisition of non-reentrant Database._operation_lock")
+        if not self.is_turso and self._read_conn is not None and _is_readonly_select(query):
+            async with self._read_lock:
+                if self._read_conn is None:
+                    raise RuntimeError("Database is not connected.")
+                async with self._read_conn.execute(query, params) as cursor:
+                    return list(await cursor.fetchall())
         async with self._acquire_operation_lock():
             if self.is_turso:
                 if self._client is None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Iterable, Optional, Sequence
+from typing import Any, AsyncIterator, Callable, Iterable, Optional, Sequence
 from urllib.parse import urljoin, urlsplit
 
 from libsql_client import LibsqlError
@@ -13,6 +13,25 @@ from libsql_client.http import HttpClient
 from libsql_client.result import Row
 
 logger = logging.getLogger('backloggd.db')
+
+
+MAX_HTTP_PIPELINE_STATEMENTS = 100
+MAX_HTTP_PIPELINE_BYTES = 56 * 1024
+
+
+def _estimate_pipeline_stmt_bytes(sql_bytes: int, row: Sequence[Any]) -> int:
+    """Conservatively estimate JSON payload size for one Hrana pipeline execute request."""
+    total = sql_bytes + len(row) * 24
+    for value in row:
+        if value is None or isinstance(value, bool):
+            total += 16
+        elif isinstance(value, (int, float)):
+            total += 32
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            total += (len(value) * 4) // 3 + 24
+        else:
+            total += len(str(value).encode("utf-8")) + 24
+    return total
 
 
 def normalize_libsql_row(row: Any) -> Any:
@@ -27,17 +46,29 @@ class _HttpTransaction:
     transport and wire codecs while carrying the stream baton ourselves.
     """
 
-    def __init__(self, client: HttpClient, url: str) -> None:
+    def __init__(
+        self,
+        client: HttpClient,
+        url: str,
+        *,
+        max_pipeline_statements: int = MAX_HTTP_PIPELINE_STATEMENTS,
+        max_pipeline_bytes: int = MAX_HTTP_PIPELINE_BYTES,
+    ) -> None:
         self._client = client
         self._base_url = url
         self._baton: str | None = None
+        self._max_pipeline_statements = max(1, int(max_pipeline_statements))
+        self._max_pipeline_bytes = max(1024, int(max_pipeline_bytes))
 
-    async def _execute(self, sql: str, args: Sequence[Any] = (), *, finish: bool = False):
-        requests = [{"type": "execute", "stmt": _stmt_to_proto(sql, list(args))}]
-        if finish:
-            requests.append({"type": "close"})
+    async def _send_pipeline(
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        finish: bool = False,
+    ) -> list[dict[str, Any]]:
         response = await self._client._send(
-            "POST", urljoin(self._base_url.rstrip("/") + "/", "v3/pipeline"),
+            "POST",
+            urljoin(self._base_url.rstrip("/") + "/", "v3/pipeline"),
             {"baton": self._baton, "requests": requests},
         )
         self._baton = response["baton"]
@@ -59,10 +90,39 @@ class _HttpTransaction:
                 raise LibsqlError(error["message"], error.get("code") or "UNKNOWN")
         if not finish and not self._baton:
             raise LibsqlError("Transaction stream closed before commit", "PROTOCOL_ERROR")
+        return results
+
+    async def _execute(self, sql: str, args: Sequence[Any] = (), *, finish: bool = False):
+        requests: list[dict[str, Any]] = [
+            {"type": "execute", "stmt": _stmt_to_proto(sql, list(args))}
+        ]
+        if finish:
+            requests.append({"type": "close"})
+        results = await self._send_pipeline(requests, finish=finish)
         return _result_set_from_proto(results[0]["response"]["result"])
 
     async def execute(self, sql: str, args: Sequence[Any] = ()):
         return await self._execute(sql, args)
+
+    async def executemany(self, sql: str, rows: Sequence[Sequence[Any]]) -> None:
+        if not rows:
+            return
+        sql_bytes = len(sql.encode("utf-8")) + 64
+        batch: list[dict[str, Any]] = []
+        batch_bytes = 128
+        for row in rows:
+            stmt_bytes = _estimate_pipeline_stmt_bytes(sql_bytes, row)
+            if batch and (
+                len(batch) >= self._max_pipeline_statements
+                or batch_bytes + stmt_bytes > self._max_pipeline_bytes
+            ):
+                await self._send_pipeline(batch)
+                batch = []
+                batch_bytes = 128
+            batch.append({"type": "execute", "stmt": _stmt_to_proto(sql, list(row))})
+            batch_bytes += stmt_bytes
+        if batch:
+            await self._send_pipeline(batch)
 
     async def commit(self) -> None:
         await self._execute("COMMIT", finish=True)
@@ -107,6 +167,10 @@ class TransactionAdapter:
         if not materialized:
             return
         if self._tx is not None:
+            tx_executemany: Callable[..., Any] | None = getattr(self._tx, "executemany", None)
+            if callable(tx_executemany):
+                await tx_executemany(query, materialized)
+                return
             for row in materialized:
                 await self._tx.execute(query, list(row))
             return

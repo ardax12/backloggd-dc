@@ -141,6 +141,8 @@ For a test server, optionally set `DEV_GUILD_ID` to that server's ID. Otherwise 
 
 For optional upstream session health alerts (fired once when Backloggd auth/challenge/rate-limit issues begin and once on recovery), you can also set `ALERT_WEBHOOK_URL` (a Discord or compatible webhook URL) and/or `ALERT_OWNER_DM=true` to DM the bot application owner.
 
+For larger multi-server deployments, you can optionally set `FEED_DELIVERY_CONCURRENCY` (default `2`, clamped to `1`–`5`) to control how many profiles deliver Discord feed announcements concurrently while scraping continues.
+
 ### 5. Start
 
 ```shell
