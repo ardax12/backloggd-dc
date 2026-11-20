@@ -19,7 +19,7 @@ attrs==26.1.0
     # via aiohttp
 babel==2.18.0
     # via sphinx
-backloggd-py==0.2.4
+backloggd-py==0.2.5
     # via -r requirements.txt
 beautifulsoup4==4.15.0
     # via backloggd-py
