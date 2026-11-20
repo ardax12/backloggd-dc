@@ -760,8 +760,8 @@ def create_help_embed(topic: str = "Overview") -> discord.Embed:
             value=(
                 "• `/link <username>` — Connect your public Backloggd profile and join this server's activity feed.\n"
                 "• `/unlink` — Disconnect your profile (past feed announcements stay as an archive).\n"
-                "• `/refresh [member]` — Request a fresh library sync for yourself or another linked member.\n"
-                "• `/help [topic]` — Open this guide privately in any server or DM."
+                "• `/refresh [user]` — Request a fresh library sync for yourself (default) or another linked member.\n"
+                "• `/help [topic]` — Open this guide privately in any server or DM (defaults to Overview)."
             ),
             inline=False,
         )
@@ -786,7 +786,7 @@ def create_help_embed(topic: str = "Overview") -> discord.Embed:
             value=(
                 "• `/game <title>` — Search Backloggd for a game, compare Backloggd's community rating "
                 "with your server's average, and see every linked member's score.\n"
-                "• `/profile [user]` — View your profile or any public Backloggd profile (accepts a @mention or username) "
+                "• `/profile [user]` — View your linked profile (no argument) or any public Backloggd profile (@mention or username) "
                 "with stats, recent journal activity, latest review, and quick actions.\n"
                 "• `/playing` — See what games linked server members currently have marked as **Playing**."
             ),
@@ -810,20 +810,19 @@ def create_help_embed(topic: str = "Overview") -> discord.Embed:
             name="Taste Comparisons",
             value=(
                 "• `/compare <user1> [user2]` — Duel two profiles' ratings, similarity score, shared favorites, "
-                "and biggest disagreements.\n"
-                "• `/taste-twins [member]` — Find your closest taste soulmates and #1 nemesis in this server."
+                "and biggest disagreements (omitting `user2` compares against you).\n"
+                "• `/taste-twins [user]` — Find closest taste soulmates and #1 nemesis in this server (defaults to you)."
             ),
             inline=False,
         )
         embed.add_field(
             name="Discovery & Server Rankings",
             value=(
-                "• `/roulette [member] [pool]` — Spin a random unrated game from a member's Backlog, Wishlist, or both.\n"
-                "• `/recommend [member] [pool]` — Get personalized server recommendations or suggest your favorites to a friend.\n"
-                "• `/server-top [mode] [min_ratings]` — Browse top-50 server rankings across Highest Rated, Most Played, "
-                "Most Polarizing, Hidden Gems, and Backlog Shame List.\n"
+                "• `/roulette [user] [pool]` — Spin a random unrated game from Backlog, Wishlist, or Both (defaults to you and Both).\n"
+                "• `/recommend [user] [pool]` — No `user`: recommendations for you from similar members; with `user`: suggest your 4.0+ favorites to them (default pool: Any Unplayed).\n"
+                "• `/server-top [mode] [min_ratings]` — Browse top-50 rankings across 5 modes (defaults to Highest Rated, `min_ratings` 2).\n"
                 "• `/server-stats` — See server-wide game totals, average rating, and most-played title.\n"
-                "• `/server-recap [period]` — Summarize the last 7 or 30 days of server activity feed announcements."
+                "• `/server-recap [period]` — Summarize delivered feed announcements over the last `7 days` (default) or `30 days`."
             ),
             inline=False,
         )
@@ -844,13 +843,13 @@ def create_help_embed(topic: str = "Overview") -> discord.Embed:
         embed.add_field(
             name="Server Admin Commands (Requires Manage Channels)",
             value=(
-                "• `/setchannel [channel]` — Choose where this server's activity feed posts.\n"
+                "• `/setchannel <channel>` — Choose where this server's activity feed posts.\n"
                 "• `/unsetchannel` — Pause feed announcements without deleting past messages.\n"
                 "• `/feed add <username>` / `/feed remove <username>` — Follow or unfollow any public Backloggd profile.\n"
                 "• `/feed list` — Browse followed profiles and their feed health.\n"
-                "• `/feed filter` — Toggle announced categories (Started, Finished, Replays, Ratings, Reviews) or wrap all review notes in `||spoilers||`.\n"
+                "• `/feed filter` — Run with no options to view settings, or toggle categories (Started, Finished, Replays, Ratings, Reviews) and `spoiler_reviews`.\n"
                 "• `/feed test` — Verify channel permissions by posting a non-persisted sample announcement.\n"
-                "• `/feed digest [cadence] [channel]` — Schedule automatic Weekly or Monthly server activity recaps."
+                "• `/feed digest [cadence] [channel]` — View schedule (no args), enable Weekly/Monthly recaps (defaults to feed channel), or turn Off."
             ),
             inline=False,
         )
@@ -859,7 +858,7 @@ def create_help_embed(topic: str = "Overview") -> discord.Embed:
             value=(
                 "• `/cooldown view` — Inspect current per-command cooldown durations in this server.\n"
                 "• `/cooldown set <command> <seconds>` — Customize a command cooldown within safe bounds.\n"
-                "• `/cooldown reset [command]` — Reset one or all server cooldowns back to defaults."
+                "• `/cooldown reset [command]` — Reset one command, or omit `command` to reset all cooldowns to defaults."
             ),
             inline=False,
         )
