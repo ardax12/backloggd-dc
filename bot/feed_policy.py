@@ -53,6 +53,8 @@ def feed_event_allowed_by_filters(event, filters: Mapping[str, bool] | None) -> 
         return True
 
     action = str(getattr(event, "action_type", "") or "").strip().lower()
+    if action == "reviewed" and not bool(filters.get("allow_reviews", True)):
+        return False
     labels = tuple(getattr(event, "session_labels", ()) or ())
     is_replay = bool(getattr(event, "is_replay", False))
     has_rating = getattr(event, "rating", None) is not None

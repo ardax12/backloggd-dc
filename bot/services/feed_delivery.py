@@ -19,6 +19,7 @@ from bot.feed_policy import (
     classify_feed_event,
     feed_event_allowed_by_filters,
 )
+from bot.feed_rules import collapse_cycle_announcements
 from bot.ui.feed_embed import create_journal_feed_embed
 from bot.ui.helpers import build_backloggd_game_url
 from bot.ui.views import LinkButtonView
@@ -622,11 +623,109 @@ async def deliver_event(
     return True
 
 
+async def record_collapsed_sibling_event(
+    pipeline: Any,
+    guild_id: int,
+    profile_key: str,
+    event: FeedEvent,
+    saved: dict,
+) -> None:
+    """Baseline an absorbed same-cycle sibling so future cycles do not repost or overwrite."""
+    aliases = event.event_ids or (event.activity_id,)
+    missing_aliases = [alias for alias in aliases if alias not in saved]
+    if not missing_aliases:
+        return
+    payload = json.dumps(asdict(event), sort_keys=True)
+    await pipeline.bot.db.store_feed_message(
+        guild_id,
+        profile_key,
+        missing_aliases,
+        payload,
+        None,
+        None,
+        delivery_state="baseline",
+    )
+    for alias in missing_aliases:
+        saved[alias] = {
+            "payload": payload,
+            "message_id": None,
+            "channel_id": None,
+            "delivery_state": "baseline",
+        }
+
+
 async def deliver_announcements(
     pipeline: Any, target, history, prepared, now, *, poll_context: dict | None = None
 ) -> bool:
-    target_ok = True
+    if not (
+        hasattr(target, "guild_id")
+        and hasattr(target, "profile_key")
+        and hasattr(history, "saved")
+        and all(isinstance(event, FeedEvent) for event in prepared.events)
+    ):
+        target_ok = True
+        for event in prepared.events:
+            if not await pipeline._deliver_event(target, event, history, prepared, now, poll_context=poll_context):
+                target_ok = False
+        return target_ok
+
+    guild_id, profile_key = target.guild_id, target.profile_key
+    saved = history.saved
+    saved_events: list[FeedEvent] = []
+    unseen_events: list[FeedEvent] = []
     for event in prepared.events:
+        aliases = event.event_ids or (event.activity_id,)
+        record = pipeline._select_delivery_record(saved, prepared.delivered_alias_ids, event, aliases)
+        if record is not None:
+            saved_events.append(event)
+        else:
+            unseen_events.append(event)
+
+    target_ok = True
+    for event in saved_events:
         if not await pipeline._deliver_event(target, event, history, prepared, now, poll_context=poll_context):
             target_ok = False
+
+    if not unseen_events:
+        return target_ok
+
+    effective_poll_context = poll_context if isinstance(poll_context, dict) else {}
+    guild_filters = await pipeline._get_guild_feed_filters(guild_id, effective_poll_context)
+    unseen_allowed: list[FeedEvent] = []
+    for event in unseen_events:
+        if not feed_event_allowed_by_filters(event, guild_filters):
+            aliases = event.event_ids or (event.activity_id,)
+            resolved_event, _ = pipeline._resolve_delivery_event(
+                event, None, history.row_events_by_id, prepared
+            )
+            payload = json.dumps(asdict(resolved_event), sort_keys=True)
+            await pipeline._record_guild_filtered_event(
+                guild_id, profile_key, resolved_event, aliases, payload, now, saved
+            )
+            continue
+        unseen_allowed.append(event)
+
+    for winners, suppressed_siblings in collapse_cycle_announcements(unseen_allowed):
+        any_delivered = False
+        for winner in winners:
+            ok = await pipeline._deliver_event(
+                target, winner, history, prepared, now, poll_context=effective_poll_context
+            )
+            if not ok:
+                target_ok = False
+            winner_aliases = winner.event_ids or (winner.activity_id,)
+            if any(
+                (row := saved.get(alias)) is not None
+                and (
+                    row["message_id"] is not None
+                    or dict(row).get("delivery_state") in {"sent", "unknown"}
+                )
+                for alias in winner_aliases
+            ):
+                any_delivered = True
+        if any_delivered and suppressed_siblings:
+            for sibling in suppressed_siblings:
+                await record_collapsed_sibling_event(pipeline, guild_id, profile_key, sibling, saved)
+
     return target_ok
+

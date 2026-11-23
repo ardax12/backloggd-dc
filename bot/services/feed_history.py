@@ -296,18 +296,29 @@ async def reconcile_changed_event_identities(
             or event.is_replay
             or bool(set(event.session_labels) & {"Started", "Finished"})
         )
-        prior_sessions = [
-            old for old in history
-            if old.game_slug == event.game_slug
-            and (
-                old.action_type in {"playing", "completed", "replay"}
-                or old.is_replay
-                or bool(set(old.session_labels) & {"Started", "Finished"})
-            )
-        ]
-        if is_session and prior_sessions:
-            identity_operations.append(pipeline._build_ambiguous_event_decision(event, now))
-            continue
+        if is_session:
+            event_at = parse_utc_datetime(event.occurred_at)
+            prior_sessions = []
+            for old in history:
+                if old.game_slug != event.game_slug:
+                    continue
+                if not (
+                    old.action_type in {"playing", "completed", "replay"}
+                    or old.is_replay
+                    or bool(set(old.session_labels) & {"Started", "Finished"})
+                ):
+                    continue
+                if old.action_type != event.action_type:
+                    continue
+                if old.reference:
+                    prior_sessions.append(old)
+                    continue
+                old_at = parse_utc_datetime(old.occurred_at)
+                if event_at is None or old_at is None or event_at <= old_at:
+                    prior_sessions.append(old)
+            if prior_sessions:
+                identity_operations.append(pipeline._build_ambiguous_event_decision(event, now))
+                continue
         reconciled.append(event)
     if identity_operations:
         await pipeline.bot.db.persist_feed_identity_decisions(guild_id, profile_key, operations=identity_operations)
@@ -473,6 +484,10 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
         previous = persisted_aliases.get(event.activity_id)
         if previous:
             preserved = {}
+            has_linked_journal = any(
+                str(alias).startswith("journal_")
+                for alias in (previous.event_ids or ())
+            )
             if journal_incomplete:
                 preserved = {
                     "played_date": event.played_date or previous.played_date,
@@ -487,6 +502,13 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
                     "reference": event.reference or previous.reference,
                     "cover_url": event.cover_url or previous.cover_url,
                     "previous_rating": event.previous_rating if event.previous_rating is not None else previous.previous_rating,
+                }
+            elif not has_linked_journal:
+                preserved = {
+                    "played_date": event.played_date or previous.played_date,
+                    "platform": event.platform or previous.platform,
+                    "session_labels": event.session_labels or previous.session_labels,
+                    "is_replay": event.is_replay or previous.is_replay,
                 }
             merged_aliases = tuple(dict.fromkeys((
                 *(previous.event_ids or (previous.activity_id,)),
@@ -668,7 +690,21 @@ async def prepare_announcements(
         events, explicit_actions, saved, now
     )
     baseline_ids = frozenset(event_id for event_id, row in saved.items() if row["delivery_state"] == "baseline")
-    events = merge_ratings_and_reviews(events, baseline_ids=baseline_ids)
+    sent_ids = frozenset(
+        event_id
+        for event_id, row in saved.items()
+        if row["message_id"] is not None
+        or dict(row).get("delivery_state") in {"sent", "deleted", "pending", "unknown"}
+    )
+    saved_action_types = {
+        event_id: row_ev.action_type for event_id, row_ev in history.row_events_by_id.items()
+    }
+    events = merge_ratings_and_reviews(
+        events,
+        baseline_ids=baseline_ids,
+        sent_ids=sent_ids,
+        saved_action_types=saved_action_types,
+    )
     events.sort(key=lambda e: e.occurred_at or calendar_date(e.played_date) or "")
     activity_history_sources: dict[str, FeedEvent] = {
         previous.activity_id: previous

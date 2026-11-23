@@ -146,49 +146,247 @@ def link_backdated_milestones(merged, *, baseline_or_saved_ids=(), uncertain_jou
     return updated, uncertain_reasons
 
 
-def merge_ratings_and_reviews(merged, *, baseline_ids=frozenset()):
+_CYCLE_ACTION_PRIORITY = {
+    "reviewed": 0,
+    "completed": 1,
+    "replay": 2,
+    "playing": 3,
+    "rated": 4,
+}
+
+
+def _inherit_sibling_metadata(winner: FeedEvent, sibling: FeedEvent, *, include_review: bool = False) -> FeedEvent:
+    """Copy non-conflicting metadata from an absorbed sibling onto the winning event."""
+    labels = tuple(dict.fromkeys((*winner.session_labels, *sibling.session_labels)))
+    kwargs = {
+        "rating": winner.rating if winner.rating is not None else sibling.rating,
+        "platform": winner.platform or sibling.platform,
+        "played_date": winner.played_date or sibling.played_date,
+        "is_replay": winner.is_replay or sibling.is_replay,
+        "session_labels": labels,
+    }
+    if include_review:
+        kwargs["review_notes"] = winner.review_notes or sibling.review_notes
+        kwargs["has_spoilers"] = winner.has_spoilers or sibling.has_spoilers
+    return replace(winner, **kwargs)
+
+
+def _should_alias_sibling(winner: FeedEvent, sibling: FeedEvent) -> bool:
+    """Return True when sibling belongs to the same Backloggd log/action as winner."""
+    if winner.reference and winner.reference == sibling.reference:
+        return True
+    if winner.occurred_at and sibling.occurred_at and winner.occurred_at == sibling.occurred_at:
+        return True
+    if sibling.activity_id.startswith(GROUPED_RATING_ID_PREFIX):
+        return True
+    return False
+
+
+def merge_ratings_and_reviews(
+    merged,
+    *,
+    baseline_ids=frozenset(),
+    sent_ids=None,
+    saved_action_types=None,
+):
+    """Merge ratings/reviews into matching milestones.
+
+    When ``sent_ids`` is provided (pipeline mode), only already-sent milestones
+    are merged here so unseen events stay separate for per-guild filtering and
+    single-cycle collapsing.
+    """
     merged = list(merged)
     grouped_rating_counts = Counter(
         (e.game_slug, calendar_date(e.occurred_at))
         for e in merged if e.activity_id.startswith(GROUPED_RATING_ID_PREFIX)
     )
-    result = []
-    for event in merged:
-        if event.action_type in {"rated", "reviewed"}:
+    saved_actions = saved_action_types or {}
+    result_indices: list[int] = []
+    consumed_indices: set[int] = set()
+    replaced_targets: set[int] = set()
+    for idx, event in enumerate(merged):
+        if idx not in replaced_targets and event.action_type in {"rated", "reviewed"}:
+            event_aliases = event.event_ids or (event.activity_id,)
+            if sent_ids is not None and any(alias in baseline_ids for alias in event_aliases):
+                result_indices.append(idx)
+                continue
             is_grouped_rating = event.activity_id.startswith(GROUPED_RATING_ID_PREFIX)
-            matches = [e for e in merged if e.action_type in {"playing", "completed", "replay"}
-                       and e.game_slug == event.game_slug
-                       and ((e.reference and e.reference == event.reference)
-                            or (e.occurred_at and e.occurred_at == event.occurred_at)
-                            or event.activity_id in e.event_ids)]
+            target_actions = {"playing", "completed", "replay"}
+            candidate_indices = [
+                i for i, e in enumerate(merged)
+                if i != idx
+                and i not in consumed_indices
+                and e.action_type in target_actions
+                and e.game_slug == event.game_slug
+                and (
+                    (e.reference and e.reference == event.reference)
+                    or (e.occurred_at and e.occurred_at == event.occurred_at)
+                    or event.activity_id in e.event_ids
+                )
+            ]
+            if not candidate_indices and event.action_type == "rated":
+                candidate_indices = [
+                    i for i, e in enumerate(merged)
+                    if i != idx
+                    and i not in consumed_indices
+                    and e.action_type == "reviewed"
+                    and e.game_slug == event.game_slug
+                    and (
+                        (e.reference and e.reference == event.reference)
+                        or (e.occurred_at and e.occurred_at == event.occurred_at)
+                        or event.activity_id in e.event_ids
+                    )
+                ]
+            if sent_ids is not None:
+                candidate_indices = [
+                    i for i in candidate_indices
+                    if any(alias in sent_ids for alias in (merged[i].event_ids or (merged[i].activity_id,)))
+                ]
             if is_grouped_rating:
-                matches = [e for e in matches if e.activity_id not in baseline_ids]
-            if not matches and is_grouped_rating:
+                candidate_indices = [i for i in candidate_indices if merged[i].activity_id not in baseline_ids]
+            if not candidate_indices and is_grouped_rating and sent_ids is None:
                 day = calendar_date(event.occurred_at)
                 if day and grouped_rating_counts[event.game_slug, day] == 1:
-                    matches = [
-                        e for e in merged
-                        if e.action_type in {"playing", "completed", "replay"}
+                    candidate_indices = [
+                        i for i, e in enumerate(merged)
+                        if i != idx
+                        and i not in consumed_indices
+                        and e.action_type in target_actions
                         and e.game_slug == event.game_slug
                         and e.activity_id not in baseline_ids
                         and calendar_date(e.played_date) == day
                         and (e.source == "journal" or any(alias.startswith("journal_") for alias in e.event_ids))
                     ]
-                    if any(e.rating is not None and e.rating != event.rating for e in matches):
-                        matches = []
-            if len(matches) == 1:
-                index = merged.index(matches[0])
-                combined = replace(matches[0], review_notes=event.review_notes or matches[0].review_notes,
-                                   rating=event.rating if event.rating is not None else matches[0].rating,
-                                   has_spoilers=event.has_spoilers or matches[0].has_spoilers,
-                                   event_ids=tuple(dict.fromkeys((*matches[0].event_ids, *event.event_ids))))
-                merged[index] = combined
+                    if any(merged[i].rating is not None and merged[i].rating != event.rating for i in candidate_indices):
+                        candidate_indices = []
+            if len(candidate_indices) == 1:
+                target_idx = candidate_indices[0]
+                target = merged[target_idx]
+                target_aliases = target.event_ids or (target.activity_id,)
+                saved_action = next(
+                    (saved_actions[alias] for alias in target_aliases if alias in saved_actions),
+                    None,
+                )
+                promote_review = (
+                    event.action_type == "reviewed"
+                    and (sent_ids is None or saved_action == "reviewed")
+                )
+                if promote_review:
+                    combined = _inherit_sibling_metadata(event, target, include_review=False)
+                    combined = replace(
+                        combined,
+                        event_ids=tuple(dict.fromkeys((*event.event_ids, *target.event_ids))),
+                    )
+                else:
+                    combined = replace(
+                        target,
+                        review_notes=event.review_notes or target.review_notes,
+                        rating=event.rating if event.rating is not None else target.rating,
+                        has_spoilers=event.has_spoilers or target.has_spoilers,
+                        event_ids=tuple(dict.fromkeys((*target.event_ids, *event.event_ids))),
+                    )
+                merged[target_idx] = combined
+                consumed_indices.add(idx)
+                if promote_review:
+                    replaced_targets.add(target_idx)
                 continue
-        result.append(event)
-    # Milestones may have been enriched after they were added to result.
-    by_id = {e.activity_id: e for e in merged}
-    return [by_id[e.activity_id] for e in result]
+        result_indices.append(idx)
+    return [merged[i] for i in result_indices]
+
+
+def collapse_cycle_announcements(events: list[FeedEvent]) -> list[tuple[list[FeedEvent], list[FeedEvent]]]:
+    """Collapse unseen events from a single poll cycle per game.
+
+    Rules within one cycle for a given ``game_slug``:
+    - If one or more ``reviewed`` events exist, post every distinct ``reviewed``
+      event and absorb non-review siblings (inheriting their metadata).
+    - Otherwise collapse to one winner by priority:
+      ``completed`` > ``replay`` > ``playing`` > ``rated``.
+    - Same-log siblings (matching reference, exact timestamp, or grouped rating)
+      are aliased onto the winner; other absorbed siblings are returned in the
+      suppressed list to be baselined after delivery succeeds.
+    """
+    groups: dict[str, list[FeedEvent]] = defaultdict(list)
+    for event in events:
+        groups[event.game_slug].append(event)
+
+    collapsed: list[tuple[list[FeedEvent], list[FeedEvent]]] = []
+    for group in groups.values():
+        if len(group) == 1:
+            collapsed.append(([group[0]], []))
+            continue
+
+        reviews = [e for e in group if e.action_type == "reviewed"]
+        if reviews:
+            others = sorted(
+                (e for e in group if e.action_type != "reviewed"),
+                key=lambda e: (
+                    _CYCLE_ACTION_PRIORITY.get(e.action_type, 99),
+                    0 if e.source == "activity" else 1,
+                ),
+            )
+            winners = list(reviews)
+            suppressed: list[FeedEvent] = []
+            for other in others:
+                if len(winners) == 1:
+                    target_idx: int | None = 0
+                else:
+                    matched = [
+                        i for i, rev in enumerate(winners)
+                        if (rev.reference and rev.reference == other.reference)
+                        or (rev.occurred_at and other.occurred_at and rev.occurred_at == other.occurred_at)
+                    ]
+                    target_idx = matched[0] if len(matched) == 1 else None
+
+                if target_idx is None:
+                    suppressed.append(other)
+                    continue
+
+                target = winners[target_idx]
+                updated = _inherit_sibling_metadata(target, other, include_review=False)
+                if _should_alias_sibling(target, other):
+                    updated = replace(
+                        updated,
+                        event_ids=tuple(dict.fromkeys((*updated.event_ids, *other.event_ids))),
+                    )
+                else:
+                    suppressed.append(other)
+                winners[target_idx] = updated
+            collapsed.append((winners, suppressed))
+            continue
+
+        winner_idx = min(
+            range(len(group)),
+            key=lambda i: (
+                _CYCLE_ACTION_PRIORITY.get(group[i].action_type, 99),
+                0 if group[i].source == "activity" else 1,
+                0 if group[i].review_notes else 1,
+                0 if group[i].rating is not None else 1,
+            ),
+        )
+        winner = group[winner_idx]
+        others = sorted(
+            (e for i, e in enumerate(group) if i != winner_idx),
+            key=lambda e: (
+                _CYCLE_ACTION_PRIORITY.get(e.action_type, 99),
+                0 if e.source == "activity" else 1,
+            ),
+        )
+        suppressed = []
+        for other in others:
+            winner = _inherit_sibling_metadata(winner, other, include_review=True)
+            if _should_alias_sibling(winner, other):
+                winner = replace(
+                    winner,
+                    event_ids=tuple(dict.fromkeys((*winner.event_ids, *other.event_ids))),
+                )
+            else:
+                suppressed.append(other)
+        collapsed.append(([winner], suppressed))
+
+    return collapsed
 
 
 def merge_announcements(activities, logs):
     return merge_ratings_and_reviews(merge_milestones(activities, logs))
+
