@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bot.feed_decisions import (
@@ -25,6 +25,8 @@ from bot.feed_rules import (
 )
 
 logger = logging.getLogger("backloggd.services.feed_pipeline")
+
+SAME_ACTION_SESSION_EDIT_WINDOW = timedelta(minutes=30)
 
 
 @dataclass(frozen=True)
@@ -298,7 +300,8 @@ async def reconcile_changed_event_identities(
         )
         if is_session:
             event_at = parse_utc_datetime(event.occurred_at)
-            prior_sessions = []
+            ambiguous_prior = []
+            recent_same_action = []
             for old in history:
                 if old.game_slug != event.game_slug:
                     continue
@@ -311,13 +314,28 @@ async def reconcile_changed_event_identities(
                 if old.action_type != event.action_type:
                     continue
                 if old.reference:
-                    prior_sessions.append(old)
+                    ambiguous_prior.append(old)
                     continue
                 old_at = parse_utc_datetime(old.occurred_at)
                 if event_at is None or old_at is None or event_at <= old_at:
-                    prior_sessions.append(old)
-            if prior_sessions:
+                    ambiguous_prior.append(old)
+                    continue
+                if (event_at - old_at) <= SAME_ACTION_SESSION_EDIT_WINDOW:
+                    recent_same_action.append(old)
+            if ambiguous_prior or len(recent_same_action) > 1:
                 identity_operations.append(pipeline._build_ambiguous_event_decision(event, now))
+                continue
+            if len(recent_same_action) == 1:
+                previous = recent_same_action[0]
+                aliases = tuple(dict.fromkeys((
+                    *(previous.event_ids or (previous.activity_id,)),
+                    previous.activity_id,
+                    event.activity_id,
+                )))
+                resolved = replace(event, event_ids=aliases)
+                if resolved_event_ids is not None:
+                    resolved_event_ids.add(event.activity_id)
+                reconciled.append(resolved)
                 continue
         reconciled.append(event)
     if identity_operations:
@@ -479,7 +497,10 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
     persisted_aliases = history.persisted_aliases
     canonical_activity, canonical_journal = history.canonical_activity, history.canonical_journal
     journal_incomplete = partial_journal or "journal" not in sources
+    current_journal_ids = {log.activity_id for log in sources.get("journal", [])}
     activity = {e.activity_id: e for e in canonical_activity.values()}
+    current_by_alias_action: dict[tuple[str, str], str] = {}
+    min_dt = datetime.min.replace(tzinfo=timezone.utc)
     for event in sources.get("activity", []):
         previous = persisted_aliases.get(event.activity_id)
         if previous:
@@ -503,7 +524,9 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
                     "cover_url": event.cover_url or previous.cover_url,
                     "previous_rating": event.previous_rating if event.previous_rating is not None else previous.previous_rating,
                 }
-            elif not has_linked_journal:
+            elif not has_linked_journal or not any(
+                alias in current_journal_ids for alias in (previous.event_ids or ())
+            ):
                 preserved = {
                     "played_date": event.played_date or previous.played_date,
                     "platform": event.platform or previous.platform,
@@ -514,7 +537,7 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
                 *(previous.event_ids or (previous.activity_id,)),
                 *(event.event_ids or (event.activity_id,)),
             )))
-            activity[event.activity_id] = replace(event, event_ids=merged_aliases, **preserved)
+            candidate = replace(event, event_ids=merged_aliases, **preserved)
         else:
             for alias in event.event_ids:
                 activity.pop(alias, None)
@@ -522,8 +545,11 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
                 (persisted_aliases[alias] for alias in event.event_ids if alias in persisted_aliases),
                 None,
             )
-            if matched_prev and journal_incomplete:
-                activity[event.activity_id] = replace(
+            if matched_prev and (
+                journal_incomplete
+                or not any(alias in current_journal_ids for alias in (event.event_ids or ()))
+            ):
+                candidate = replace(
                     event,
                     played_date=event.played_date or matched_prev.played_date,
                     platform=event.platform or matched_prev.platform,
@@ -531,7 +557,46 @@ def merge_source_events(history: FeedHistory, *, partial_journal: bool = False):
                     is_replay=event.is_replay or matched_prev.is_replay,
                 )
             else:
-                activity[event.activity_id] = event
+                candidate = event
+
+        cand_aliases = candidate.event_ids or (candidate.activity_id,)
+        existing_id = next(
+            (
+                eid
+                for alias in cand_aliases
+                if (eid := current_by_alias_action.get((alias, candidate.action_type))) is not None
+                and eid in activity
+            ),
+            None,
+        )
+        if existing_id is not None and existing_id != candidate.activity_id:
+            existing = activity[existing_id]
+            existing_at = parse_utc_datetime(existing.occurred_at) or min_dt
+            cand_at = parse_utc_datetime(candidate.occurred_at) or min_dt
+            combined_aliases = tuple(dict.fromkeys((
+                *(existing.event_ids or (existing.activity_id,)),
+                *cand_aliases,
+            )))
+            if cand_at > existing_at:
+                activity.pop(existing_id, None)
+                winner = replace(
+                    candidate,
+                    event_ids=combined_aliases,
+                    played_date=candidate.played_date or existing.played_date,
+                    platform=candidate.platform or existing.platform,
+                    session_labels=candidate.session_labels or existing.session_labels,
+                    is_replay=candidate.is_replay or existing.is_replay,
+                )
+                activity[winner.activity_id] = winner
+            else:
+                winner = replace(existing, event_ids=combined_aliases)
+                activity[winner.activity_id] = winner
+        else:
+            winner = candidate
+            activity[winner.activity_id] = winner
+
+        for alias in (winner.event_ids or (winner.activity_id,)):
+            current_by_alias_action[(alias, winner.action_type)] = winner.activity_id
     activities = [replace(e, event_ids=e.event_ids or (e.activity_id,)) for e in activity.values() if e.action_type in VISIBLE_ACTIONS]
     journal = {e.activity_id: e for e in canonical_journal.values()}
     for event in sources.get("journal", []):
